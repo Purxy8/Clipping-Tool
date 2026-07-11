@@ -1,0 +1,966 @@
+using System.Text;
+using ClipForge.Capture;
+using ClipForge.Models;
+
+namespace ClipForge.Services;
+
+/// <summary>
+/// Owns FFmpeg's continuous segment process, prunes its disk-backed ring, and
+/// remuxes a frozen segment snapshot into a user-facing MP4 clip.
+/// </summary>
+public sealed class ReplayBufferService : IAsyncDisposable
+{
+    private const int MaximumDiagnosticLines = 60;
+
+    private readonly FfmpegSetupService _ffmpegSetupService;
+    private readonly string _bufferRoot;
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
+    private readonly SemaphoreSlim _saveGate = new(1, 1);
+    private readonly object _fileGate = new();
+    private readonly object _diagnosticGate = new();
+    private readonly HashSet<string> _protectedSegments = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Queue<string> _diagnosticLines = new();
+    private readonly List<WasapiAudioPipe> _audioPipes = [];
+
+    private Process? _captureProcess;
+    private CancellationTokenSource? _sessionCancellation;
+    private Task? _monitorTask;
+    private Task? _diagnosticTask;
+    private string? _segmentDirectory;
+    private TimeSpan _retention = TimeSpan.FromMinutes(2);
+    private ReplayStateSnapshot _state = new(
+        ReplayState.Stopped,
+        TimeSpan.Zero,
+        TimeSpan.FromMinutes(2),
+        0);
+    private string? _lastSavedPath;
+    private int _isRunning;
+    private int _isSaving;
+    private int _isStopping;
+    private int _disposed;
+
+    public ReplayBufferService(
+        FfmpegSetupService? ffmpegSetupService = null,
+        string? bufferRoot = null)
+    {
+        _ffmpegSetupService = ffmpegSetupService ?? new FfmpegSetupService();
+        _bufferRoot = Path.GetFullPath(bufferRoot ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ClipForge",
+            "Buffer"));
+    }
+
+    public event EventHandler<ReplayStateSnapshot>? StateChanged;
+
+    public bool IsRunning => Volatile.Read(ref _isRunning) != 0;
+
+    public async Task StartAsync(
+        CaptureConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ThrowIfDisposed();
+        await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (IsRunning)
+                {
+                    throw new InvalidOperationException("Instant Replay is already running.");
+                }
+
+                if (_captureProcess is not null || _segmentDirectory is not null)
+                {
+                    await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
+                }
+
+                ValidateConfiguration(configuration);
+                _retention = configuration.Retention;
+                Publish(new ReplayStateSnapshot(
+                    ReplayState.Starting,
+                    TimeSpan.Zero,
+                    _retention,
+                    0,
+                    "Preparing the capture engine…"));
+
+                var ffmpegPath = _ffmpegSetupService.FindExecutable()
+                    ?? throw new InvalidOperationException(
+                        "The capture engine is not installed. Use Install engine and try again.");
+
+                Directory.CreateDirectory(_bufferRoot);
+                CleanupStaleBuffers();
+                _segmentDirectory = Path.Combine(
+                    _bufferRoot,
+                    $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+                Directory.CreateDirectory(_segmentDirectory);
+                _sessionCancellation = new CancellationTokenSource();
+                lock (_diagnosticGate)
+                {
+                    _diagnosticLines.Clear();
+                }
+
+                CreateAudioPipes(configuration);
+                var arguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+                    configuration,
+                    _audioPipes.Select(pipe => pipe.Specification).ToArray(),
+                    _segmentDirectory);
+
+                var captureProcess = CreateProcess(ffmpegPath, arguments, redirectStandardInput: true);
+                try
+                {
+                    if (!captureProcess.Start())
+                    {
+                        throw new InvalidOperationException("Windows could not start the capture engine.");
+                    }
+                }
+                catch
+                {
+                    captureProcess.Dispose();
+                    throw;
+                }
+
+                _captureProcess = captureProcess;
+                captureProcess.StandardInput.AutoFlush = true;
+                _diagnosticTask = PumpDiagnosticsAsync(captureProcess);
+                Volatile.Write(ref _isRunning, 1);
+
+                if (_audioPipes.Count > 0)
+                {
+                    var connectionTasks = _audioPipes
+                        .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
+                        .ToArray();
+                    await Task.WhenAll(connectionTasks)
+                        .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                if (captureProcess.HasExited)
+                {
+                    throw new InvalidOperationException(BuildCaptureFailureMessage());
+                }
+
+                Volatile.Write(ref _isStopping, 0);
+                _monitorTask = MonitorCaptureAsync(
+                    captureProcess,
+                    _sessionCancellation.Token);
+                Publish(new ReplayStateSnapshot(
+                    ReplayState.Buffering,
+                    TimeSpan.Zero,
+                    _retention,
+                    0,
+                    "Instant Replay is filling its buffer."));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                Volatile.Write(ref _isRunning, 0);
+                try
+                {
+                    await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Cancellation takes priority over best-effort cleanup.
+                }
+
+                Publish(new ReplayStateSnapshot(
+                    ReplayState.Stopped,
+                    TimeSpan.Zero,
+                    _retention,
+                    0,
+                    "Instant Replay start was cancelled.",
+                    _lastSavedPath));
+                throw;
+            }
+            catch (Exception exception)
+            {
+                Volatile.Write(ref _isRunning, 0);
+                var message = exception is InvalidOperationException
+                    ? exception.Message
+                    : $"Instant Replay could not start. {exception.Message}";
+
+                try
+                {
+                    await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Preserve the original startup failure.
+                }
+
+                Publish(new ReplayStateSnapshot(
+                    ReplayState.Faulted,
+                    TimeSpan.Zero,
+                    _retention,
+                    0,
+                    message));
+                throw new InvalidOperationException(message, exception);
+            }
+            finally
+            {
+                _lifecycleGate.Release();
+            }
+        }
+        finally
+        {
+            _saveGate.Release();
+        }
+    }
+
+    public async Task StopAsync()
+    {
+        ThrowIfDisposed();
+        await _saveGate.WaitAsync().ConfigureAwait(false);
+
+        try
+        {
+            await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await StopCoreAsync(deleteBuffer: true, publishStopped: true).ConfigureAwait(false);
+            }
+            finally
+            {
+                _lifecycleGate.Release();
+            }
+        }
+        finally
+        {
+            _saveGate.Release();
+        }
+    }
+
+    public void UpdateRetention(TimeSpan retention)
+    {
+        ThrowIfDisposed();
+        if (retention < TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds) ||
+            retention > TimeSpan.FromHours(1))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(retention),
+                "Replay length must be between two seconds and one hour.");
+        }
+
+        lock (_fileGate)
+        {
+            _retention = retention;
+        }
+
+        RefreshBufferState();
+    }
+
+    public async Task<string> SaveClipAsync(
+        TimeSpan requestedDuration,
+        string saveDirectory,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(saveDirectory);
+        if (requestedDuration <= TimeSpan.Zero || requestedDuration > TimeSpan.FromHours(1))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(requestedDuration),
+                "Clip length must be between one second and one hour.");
+        }
+
+        await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<string> selectedSegments = [];
+        string? manifestPath = null;
+        string? partialPath = null;
+
+        try
+        {
+            if (!IsRunning)
+            {
+                throw new InvalidOperationException("Instant Replay is not running.");
+            }
+
+            TimeSpan actualDuration;
+            lock (_fileGate)
+            {
+                var completed = GetCompletedSegmentsLocked();
+                var requestedCount = checked((int)Math.Ceiling(
+                    requestedDuration.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
+                var selectedCount = Math.Min(requestedCount, completed.Count);
+                if (selectedCount == 0)
+                {
+                    throw new InvalidOperationException(
+                        "The replay buffer is still warming up. Wait a moment and try again.");
+                }
+
+                selectedSegments = completed.TakeLast(selectedCount).ToArray();
+                foreach (var path in selectedSegments)
+                {
+                    _protectedSegments.Add(path);
+                }
+
+                actualDuration = TimeSpan.FromSeconds(Math.Min(
+                    requestedDuration.TotalSeconds,
+                    selectedCount * FfmpegArgumentBuilder.SegmentSeconds));
+            }
+
+            Volatile.Write(ref _isSaving, 1);
+            Publish(_state with
+            {
+                State = ReplayState.Saving,
+                Message = "Saving your clip…"
+            });
+
+            var ffmpegPath = _ffmpegSetupService.FindExecutable()
+                ?? throw new InvalidOperationException("The capture engine is no longer available.");
+            Directory.CreateDirectory(saveDirectory);
+            var finalPath = GetUniqueClipPath(saveDirectory);
+            partialPath = Path.Combine(
+                saveDirectory,
+                $".{Path.GetFileNameWithoutExtension(finalPath)}-{Guid.NewGuid():N}.partial.mp4");
+            manifestPath = Path.Combine(
+                _segmentDirectory ?? _bufferRoot,
+                $"export-{Guid.NewGuid():N}.txt");
+
+            var manifestLines = selectedSegments.Select(path =>
+                $"file '{EscapeConcatPath(path)}'");
+            await File.WriteAllLinesAsync(
+                    manifestPath,
+                    manifestLines,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            var selectedDuration = TimeSpan.FromSeconds(
+                selectedSegments.Count * FfmpegArgumentBuilder.SegmentSeconds);
+            var trimFromStart = selectedDuration - actualDuration;
+            var arguments = FfmpegArgumentBuilder.BuildConcatArguments(
+                manifestPath,
+                partialPath,
+                trimFromStart,
+                actualDuration);
+            await RunExportProcessAsync(ffmpegPath, arguments, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!File.Exists(partialPath) || new FileInfo(partialPath).Length == 0)
+            {
+                throw new InvalidDataException("The capture engine produced an empty clip.");
+            }
+
+            File.Move(partialPath, finalPath);
+            partialPath = null;
+            _lastSavedPath = finalPath;
+            return finalPath;
+        }
+        finally
+        {
+            Volatile.Write(ref _isSaving, 0);
+            lock (_fileGate)
+            {
+                foreach (var path in selectedSegments)
+                {
+                    _protectedSegments.Remove(path);
+                }
+            }
+
+            TryDeleteFile(manifestPath);
+            TryDeleteFile(partialPath);
+            _saveGate.Release();
+            RefreshBufferState(_lastSavedPath);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        await _saveGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
+                Volatile.Write(ref _disposed, 1);
+            }
+            finally
+            {
+                _lifecycleGate.Release();
+            }
+        }
+        finally
+        {
+            _saveGate.Release();
+        }
+
+        _lifecycleGate.Dispose();
+        _saveGate.Dispose();
+    }
+
+    private void CreateAudioPipes(CaptureConfiguration configuration)
+    {
+        if (configuration.CaptureSystemAudio)
+        {
+            _audioPipes.Add(new WasapiAudioPipe(
+                configuration.OutputAudioDevice
+                ?? throw new InvalidOperationException("No desktop audio output was selected."),
+                captureLoopback: true));
+        }
+
+        if (configuration.CaptureMicrophone)
+        {
+            _audioPipes.Add(new WasapiAudioPipe(
+                configuration.MicrophoneDevice
+                ?? throw new InvalidOperationException("No microphone was selected."),
+                captureLoopback: false));
+        }
+    }
+
+    private async Task StopCoreAsync(bool deleteBuffer, bool publishStopped)
+    {
+        Volatile.Write(ref _isStopping, 1);
+        var hadSession = _captureProcess is not null ||
+                         _segmentDirectory is not null ||
+                         _audioPipes.Count > 0;
+        if (hadSession && publishStopped)
+        {
+            Publish(_state with
+            {
+                State = ReplayState.Stopping,
+                Message = "Stopping Instant Replay…"
+            });
+        }
+
+        Volatile.Write(ref _isRunning, 0);
+
+        var process = _captureProcess;
+        if (process is not null)
+        {
+            await StopProcessGracefullyAsync(process).ConfigureAwait(false);
+        }
+
+        _sessionCancellation?.Cancel();
+        if (_monitorTask is not null)
+        {
+            try
+            {
+                await _monitorTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when a session is stopped.
+            }
+        }
+
+        foreach (var audioPipe in _audioPipes)
+        {
+            try
+            {
+                await audioPipe.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Continue releasing the remaining capture resources.
+            }
+        }
+
+        _audioPipes.Clear();
+
+        if (_diagnosticTask is not null)
+        {
+            try
+            {
+                await _diagnosticTask.ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+            {
+                // The process stream can close while diagnostics are being drained.
+            }
+        }
+
+        process?.Dispose();
+        _sessionCancellation?.Dispose();
+        _captureProcess = null;
+        _sessionCancellation = null;
+        _monitorTask = null;
+        _diagnosticTask = null;
+
+        var oldSegmentDirectory = _segmentDirectory;
+        _segmentDirectory = null;
+        if (deleteBuffer)
+        {
+            TryDeleteBufferDirectory(oldSegmentDirectory);
+        }
+
+        lock (_fileGate)
+        {
+            _protectedSegments.Clear();
+        }
+
+        Volatile.Write(ref _isStopping, 0);
+        if (publishStopped)
+        {
+            Publish(new ReplayStateSnapshot(
+                ReplayState.Stopped,
+                TimeSpan.Zero,
+                _retention,
+                0,
+                LastSavedPath: _lastSavedPath));
+        }
+    }
+
+    private async Task MonitorCaptureAsync(Process process, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                if (process.HasExited)
+                {
+                    Volatile.Write(ref _isRunning, 0);
+                    if (Volatile.Read(ref _isStopping) == 0)
+                    {
+                        _sessionCancellation?.Cancel();
+                        await DisposeAudioPipesAfterFailureAsync().ConfigureAwait(false);
+                        Publish(_state with
+                        {
+                            State = ReplayState.Faulted,
+                            Message = BuildCaptureFailureMessage()
+                        });
+                    }
+
+                    return;
+                }
+
+                var stoppedAudioPipe = _audioPipes.FirstOrDefault(pipe => pipe.Completion.IsCompleted);
+                if (stoppedAudioPipe is not null && Volatile.Read(ref _isStopping) == 0)
+                {
+                    string detail;
+                    try
+                    {
+                        await stoppedAudioPipe.Completion.ConfigureAwait(false);
+                        detail = "An audio device stopped sending data.";
+                    }
+                    catch (Exception exception)
+                    {
+                        detail = exception.GetBaseException().Message;
+                    }
+
+                    Volatile.Write(ref _isRunning, 0);
+                    _sessionCancellation?.Cancel();
+                    TryKill(process);
+                    await DisposeAudioPipesAfterFailureAsync().ConfigureAwait(false);
+                    Publish(_state with
+                    {
+                        State = ReplayState.Faulted,
+                        Message = $"Audio capture stopped unexpectedly. {detail}"
+                    });
+                    return;
+                }
+
+                RefreshBufferState();
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal stop.
+        }
+        catch (Exception exception)
+        {
+            Volatile.Write(ref _isRunning, 0);
+            if (Volatile.Read(ref _isStopping) == 0)
+            {
+                _sessionCancellation?.Cancel();
+                TryKill(process);
+                await DisposeAudioPipesAfterFailureAsync().ConfigureAwait(false);
+                Publish(_state with
+                {
+                    State = ReplayState.Faulted,
+                    Message = $"The replay buffer stopped unexpectedly. {exception.Message}"
+                });
+            }
+        }
+    }
+
+    private async Task DisposeAudioPipesAfterFailureAsync()
+    {
+        foreach (var audioPipe in _audioPipes.ToArray())
+        {
+            try
+            {
+                await audioPipe.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // The primary capture error is more useful than a cleanup failure.
+            }
+        }
+    }
+
+    private void RefreshBufferState(string? lastSavedPath = null)
+    {
+        if (_segmentDirectory is null || Volatile.Read(ref _isStopping) != 0)
+        {
+            return;
+        }
+
+        TimeSpan available;
+        long bytes;
+
+        lock (_fileGate)
+        {
+            var allSegments = GetAllSegmentsLocked();
+            var maximumCompletedSegments = checked((int)Math.Ceiling(
+                _retention.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
+
+            while (Math.Max(0, allSegments.Count - 1) > maximumCompletedSegments)
+            {
+                var candidate = allSegments.FirstOrDefault(path =>
+                    !_protectedSegments.Contains(path) &&
+                    !string.Equals(path, allSegments[^1], StringComparison.OrdinalIgnoreCase));
+                if (candidate is null)
+                {
+                    break;
+                }
+
+                if (!TryDeleteFile(candidate))
+                {
+                    break;
+                }
+
+                allSegments.Remove(candidate);
+            }
+
+            var completedCount = allSegments
+                .Take(Math.Max(0, allSegments.Count - 1))
+                .Count(path => GetFileLengthSafely(path) > 0);
+            available = TimeSpan.FromSeconds(Math.Min(
+                _retention.TotalSeconds,
+                completedCount * FfmpegArgumentBuilder.SegmentSeconds));
+            bytes = allSegments.Sum(GetFileLengthSafely);
+        }
+
+        var replayState = Volatile.Read(ref _isSaving) != 0
+            ? ReplayState.Saving
+            : available >= _retention
+                ? ReplayState.Ready
+                : ReplayState.Buffering;
+        Publish(new ReplayStateSnapshot(
+            replayState,
+            available,
+            _retention,
+            bytes,
+            replayState == ReplayState.Ready
+                ? "Instant Replay is ready."
+                : replayState == ReplayState.Saving
+                    ? "Saving your clip…"
+                    : "Instant Replay is filling its buffer.",
+            lastSavedPath ?? _lastSavedPath));
+    }
+
+    private List<string> GetCompletedSegmentsLocked()
+    {
+        var all = GetAllSegmentsLocked();
+        if (IsRunning && all.Count > 0)
+        {
+            all.RemoveAt(all.Count - 1);
+        }
+
+        all.RemoveAll(path => GetFileLengthSafely(path) <= 0);
+
+        return all;
+    }
+
+    private List<string> GetAllSegmentsLocked()
+    {
+        if (string.IsNullOrWhiteSpace(_segmentDirectory) ||
+            !Directory.Exists(_segmentDirectory))
+        {
+            return [];
+        }
+
+        try
+        {
+            return Directory
+                .EnumerateFiles(_segmentDirectory, "segment-*.mkv", SearchOption.TopDirectoryOnly)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    private static long GetFileLengthSafely(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or FileNotFoundException)
+        {
+            return 0;
+        }
+    }
+
+    private async Task PumpDiagnosticsAsync(Process process)
+    {
+        while (await process.StandardError.ReadLineAsync().ConfigureAwait(false) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            lock (_diagnosticGate)
+            {
+                _diagnosticLines.Enqueue(line.Trim());
+                while (_diagnosticLines.Count > MaximumDiagnosticLines)
+                {
+                    _ = _diagnosticLines.Dequeue();
+                }
+            }
+        }
+    }
+
+    private string BuildCaptureFailureMessage()
+    {
+        string? detail;
+        lock (_diagnosticGate)
+        {
+            detail = _diagnosticLines.LastOrDefault();
+        }
+
+        return string.IsNullOrWhiteSpace(detail)
+            ? "The capture engine stopped unexpectedly. Check that the selected display and audio devices are available."
+            : $"The capture engine stopped unexpectedly. {detail}";
+    }
+
+    private static async Task RunExportProcessAsync(
+        string executable,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        using var process = CreateProcess(executable, arguments, redirectStandardInput: false);
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Windows could not start the clip exporter.");
+        }
+
+        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            TryKill(process);
+            throw;
+        }
+
+        var error = await errorTask.ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            var detail = error.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(detail)
+                    ? "The capture engine could not assemble the clip."
+                    : $"The capture engine could not assemble the clip. {detail}");
+        }
+    }
+
+    private static Process CreateProcess(
+        string executable,
+        IReadOnlyList<string> arguments,
+        bool redirectStandardInput)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = redirectStandardInput
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        return new Process { StartInfo = startInfo };
+    }
+
+    private static async Task StopProcessGracefullyAsync(Process process)
+    {
+        if (process.HasExited)
+        {
+            return;
+        }
+
+        try
+        {
+            await process.StandardInput.WriteLineAsync("q").ConfigureAwait(false);
+            await process.StandardInput.FlushAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            // The process may have already closed its control stream.
+        }
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            await process.WaitForExitAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // Best effort; the process may have exited between the checks.
+        }
+    }
+
+    private void CleanupStaleBuffers()
+    {
+        try
+        {
+            foreach (var directory in Directory.EnumerateDirectories(_bufferRoot, "session-*"))
+            {
+                if (Directory.GetCreationTimeUtc(directory) < DateTime.UtcNow.AddHours(-24))
+                {
+                    TryDeleteBufferDirectory(directory);
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Stale cleanup must never prevent a new capture session.
+        }
+    }
+
+    private void TryDeleteBufferDirectory(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+            var allowedRoot = _bufferRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (fullPath.StartsWith(allowedRoot, StringComparison.OrdinalIgnoreCase) &&
+                Directory.Exists(fullPath))
+            {
+                Directory.Delete(fullPath, recursive: true);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // A later startup can retry stale session cleanup.
+        }
+    }
+
+    private static bool TryDeleteFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return true;
+        }
+
+        try
+        {
+            File.Delete(path);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Buffer pruning/export cleanup is best effort.
+            return false;
+        }
+    }
+
+    private static string EscapeConcatPath(string path) =>
+        Path.GetFullPath(path)
+            .Replace('\\', '/')
+            .Replace("'", "'\\''", StringComparison.Ordinal);
+
+    private static string GetUniqueClipPath(string saveDirectory)
+    {
+        var stem = $"Clip_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}";
+        var candidate = Path.Combine(saveDirectory, $"{stem}.mp4");
+        var suffix = 2;
+        while (File.Exists(candidate))
+        {
+            candidate = Path.Combine(saveDirectory, $"{stem}_{suffix}.mp4");
+            suffix++;
+        }
+
+        return candidate;
+    }
+
+    private static void ValidateConfiguration(CaptureConfiguration configuration)
+    {
+        if (configuration.Retention < TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds) ||
+            configuration.Retention > TimeSpan.FromHours(1))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(configuration),
+                "Replay length must be between two seconds and one hour.");
+        }
+
+        if (configuration.CaptureSystemAudio && configuration.OutputAudioDevice is null)
+        {
+            throw new ArgumentException("Desktop audio is enabled without an output device.", nameof(configuration));
+        }
+
+        if (configuration.CaptureMicrophone && configuration.MicrophoneDevice is null)
+        {
+            throw new ArgumentException("Microphone capture is enabled without a microphone.", nameof(configuration));
+        }
+    }
+
+    private void Publish(ReplayStateSnapshot snapshot)
+    {
+        _state = snapshot;
+        var handlers = StateChanged;
+        if (handlers is null)
+        {
+            return;
+        }
+
+        foreach (EventHandler<ReplayStateSnapshot> handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, snapshot);
+            }
+            catch
+            {
+                // UI or telemetry subscribers must not be able to stop capture.
+            }
+        }
+    }
+
+    private void ThrowIfDisposed() =>
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+}

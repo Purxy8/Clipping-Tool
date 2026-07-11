@@ -1,0 +1,618 @@
+<Window x:Class="ClipForge.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="ClipForge — Instant Replay"
+        Width="1080"
+        Height="780"
+        MinWidth="860"
+        MinHeight="640"
+        WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display">
+
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto"
+                  PanningMode="VerticalOnly">
+        <Grid MaxWidth="1180"
+              Margin="32,26,32,32"
+              KeyboardNavigation.TabNavigation="Continue">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Non-blocking error state -->
+            <Border x:Name="ErrorBanner"
+                    Grid.Row="0"
+                    Margin="0,0,0,16"
+                    Padding="14,12"
+                    Background="{StaticResource ErrorSoftBrush}"
+                    BorderBrush="{StaticResource ErrorBrush}"
+                    BorderThickness="1"
+                    CornerRadius="10"
+                    Visibility="Collapsed"
+                    AutomationProperties.LiveSetting="Assertive">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Border Width="28"
+                            Height="28"
+                            Margin="0,0,11,0"
+                            VerticalAlignment="Top"
+                            Background="{StaticResource ErrorBrush}"
+                            CornerRadius="14">
+                        <TextBlock HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   FontSize="15"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource WindowBrush}"
+                                   Text="!" />
+                    </Border>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Text="ClipForge needs your attention" />
+                        <TextBlock x:Name="ErrorText"
+                                   Margin="0,2,0,0"
+                                   Style="{StaticResource BodyTextStyle}"
+                                   Text="Something went wrong. Check your capture settings and try again." />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Product header -->
+            <Grid Grid.Row="1" Margin="0,0,0,20">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal">
+                    <Border Width="44"
+                            Height="44"
+                            Margin="0,0,13,0"
+                            Background="{StaticResource AccentGradientBrush}"
+                            CornerRadius="12"
+                            AutomationProperties.Name="ClipForge logo">
+                        <Grid>
+                            <Path Width="20"
+                                  Height="20"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Data="M 4,2 L 16,2 C 17.1,2 18,2.9 18,4 L 18,9 L 15,9 L 15,5 L 5,5 L 5,15 L 10,15 L 10,18 L 4,18 C 2.9,18 2,17.1 2,16 L 2,4 C 2,2.9 2.9,2 4,2 Z M 12,9 L 19,13.5 L 12,18 Z"
+                                  Fill="White"
+                                  Stretch="Uniform" />
+                        </Grid>
+                    </Border>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Style="{StaticResource PageTitleStyle}" Text="ClipForge" />
+                        <TextBlock Style="{StaticResource MutedTextStyle}" Text="Capture the moment after it happens" />
+                    </StackPanel>
+                </StackPanel>
+
+                <Border Grid.Column="1"
+                        Padding="12,8"
+                        VerticalAlignment="Center"
+                        Background="{StaticResource SurfaceBrush}"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="18"
+                        AutomationProperties.LiveSetting="Polite">
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="StatusDot"
+                                 Width="8"
+                                 Height="8"
+                                 Margin="0,0,8,0"
+                                 VerticalAlignment="Center"
+                                 Fill="{StaticResource TextMutedBrush}" />
+                        <TextBlock x:Name="StatusText"
+                                   VerticalAlignment="Center"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   Text="Replay off" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- Primary replay action -->
+            <Border Grid.Row="2"
+                    Margin="0,0,0,18"
+                    Style="{StaticResource HeroCardStyle}"
+                    ClipToBounds="True">
+                <Grid>
+                    <Ellipse Width="300"
+                             Height="300"
+                             Margin="0,-210,-135,0"
+                             HorizontalAlignment="Right"
+                             VerticalAlignment="Top"
+                             Fill="{StaticResource AccentBrush}"
+                             IsHitTestVisible="False"
+                             Opacity="0.09" />
+                    <Ellipse Width="180"
+                             Height="180"
+                             Margin="0,0,-90,-130"
+                             HorizontalAlignment="Right"
+                             VerticalAlignment="Bottom"
+                             Fill="{StaticResource AccentHoverBrush}"
+                             IsHitTestVisible="False"
+                             Opacity="0.08" />
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="32" />
+                            <ColumnDefinition Width="286" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                            <TextBlock Margin="0,0,0,7"
+                                       Style="{StaticResource EyebrowStyle}"
+                                       Text="INSTANT REPLAY" />
+                            <TextBlock Margin="0,0,0,9"
+                                       Style="{StaticResource HeroTitleStyle}"
+                                       Text="Never miss the moment." />
+                            <TextBlock MaxWidth="560"
+                                       HorizontalAlignment="Left"
+                                       Style="{StaticResource BodyTextStyle}"
+                                       Text="ClipForge keeps a private rolling buffer on this PC. Nothing is added to your clips folder until you choose to save it." />
+
+                            <StackPanel Margin="0,20,0,0" Orientation="Horizontal">
+                                <Button x:Name="BufferToggleButton"
+                                        MinWidth="132"
+                                        Content="Start replay"
+                                        Click="BufferToggleButton_Click"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        TabIndex="0"
+                                        ToolTip="Start or pause the rolling replay buffer"
+                                        AutomationProperties.Name="Start instant replay"
+                                        AutomationProperties.HelpText="Starts a private rolling capture buffer on this computer." />
+                                <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
+                                    <TextBlock x:Name="AvailableText"
+                                               FontSize="12"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                               Text="No replay buffered"
+                                               AutomationProperties.LiveSetting="Polite" />
+                                    <TextBlock Margin="0,2,0,0"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Text="The buffer clears when replay stops" />
+                                </StackPanel>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <Border Grid.Column="2"
+                                Padding="18"
+                                VerticalAlignment="Stretch"
+                                Background="#820B0D12"
+                                BorderBrush="#3DFFFFFF"
+                                BorderThickness="1"
+                                CornerRadius="14">
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock HorizontalAlignment="Center"
+                                           Style="{StaticResource MutedTextStyle}"
+                                           Text="READY WHEN YOU ARE" />
+                                <Button x:Name="SaveClipButton"
+                                        Height="58"
+                                        Margin="0,10,0,10"
+                                        Content="Save last clip"
+                                        Click="SaveClipButton_Click"
+                                        IsEnabled="False"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        TabIndex="1"
+                                        ToolTip="Save the current replay buffer as an MP4 clip"
+                                        AutomationProperties.Name="Save replay clip"
+                                        AutomationProperties.HelpText="Saves the available replay buffer without stopping capture." />
+                                <StackPanel HorizontalAlignment="Center" Orientation="Horizontal">
+                                    <TextBlock Margin="0,0,6,0"
+                                               VerticalAlignment="Center"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Text="Global shortcut" />
+                                    <Border Padding="7,3"
+                                            Background="{StaticResource SurfaceRaisedBrush}"
+                                            BorderBrush="{StaticResource BorderStrongBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="5">
+                                        <TextBlock x:Name="HotkeyText"
+                                                   FontFamily="Consolas"
+                                                   FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                   Text="Ctrl + Shift + F10" />
+                                    </Border>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <!-- Capture-engine onboarding -->
+            <Border x:Name="InstallEnginePanel"
+                    Grid.Row="3"
+                    Margin="0,0,0,18"
+                    Padding="20"
+                    Background="{StaticResource WarningSoftBrush}"
+                    BorderBrush="#6BF4B85B"
+                    BorderThickness="1"
+                    CornerRadius="13"
+                    Visibility="Collapsed">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border Width="42"
+                            Height="42"
+                            Margin="0,0,14,0"
+                            VerticalAlignment="Top"
+                            Background="{StaticResource WarningBrush}"
+                            CornerRadius="12">
+                        <Path Width="20"
+                              Height="20"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              Data="M 10,1 L 10,13 M 5,9 L 10,14 L 15,9 M 3,17 L 17,17"
+                              Stroke="{StaticResource WindowBrush}"
+                              StrokeThickness="2"
+                              StrokeStartLineCap="Round"
+                              StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round"
+                              Stretch="Uniform" />
+                    </Border>
+
+                    <StackPanel Grid.Column="1" Margin="0,0,22,0" VerticalAlignment="Center">
+                        <TextBlock FontSize="15" FontWeight="SemiBold" Text="Install the capture engine" />
+                        <TextBlock Margin="0,3,0,0"
+                                   Style="{StaticResource BodyTextStyle}"
+                                   Text="A one-time setup is needed before ClipForge can record and save MP4 clips." />
+                        <ProgressBar x:Name="InstallProgressBar"
+                                     Margin="0,11,0,0"
+                                     Maximum="100"
+                                     Value="0" />
+                        <TextBlock x:Name="InstallStatusText"
+                                   Margin="0,6,0,0"
+                                   Style="{StaticResource MutedTextStyle}"
+                                   Text="Ready to install" />
+                    </StackPanel>
+
+                    <Button x:Name="InstallEngineButton"
+                            Grid.Column="2"
+                            MinWidth="118"
+                            VerticalAlignment="Center"
+                            Content="Install engine"
+                            Click="InstallEngineButton_Click"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            TabIndex="2"
+                            AutomationProperties.Name="Install capture engine" />
+                </Grid>
+            </Border>
+
+            <!-- Settings cards -->
+            <Grid Grid.Row="4" Margin="0,0,0,18">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="18" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" Style="{StaticResource CardStyle}">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Grid.Row="0" Margin="0,0,0,20">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Replay &amp; video" />
+                            <TextBlock Margin="0,4,0,0"
+                                       Style="{StaticResource MutedTextStyle}"
+                                       Text="Choose what to capture and how it should look." />
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="1" Margin="0,0,0,16">
+                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="DISPLAY" />
+                            <ComboBox x:Name="DisplayComboBox"
+                                      SelectionChanged="DisplayComboBox_SelectionChanged"
+                                      TabIndex="3"
+                                      ToolTip="Select the display ClipForge should capture"
+                                      AutomationProperties.Name="Display to capture" />
+                        </StackPanel>
+
+                        <Grid Grid.Row="2" Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="16" />
+                                <ColumnDefinition Width="148" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Style="{StaticResource FieldLabelStyle}" Text="REPLAY LENGTH" />
+                                <ComboBox x:Name="ReplayLengthComboBox"
+                                          SelectionChanged="ReplayLengthComboBox_SelectionChanged"
+                                          TabIndex="4"
+                                          ToolTip="Choose how far back a saved clip should reach"
+                                          AutomationProperties.Name="Replay length" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Style="{StaticResource FieldLabelStyle}" Text="FRAME RATE" />
+                                <ComboBox x:Name="FpsComboBox"
+                                          SelectionChanged="FpsComboBox_SelectionChanged"
+                                          TabIndex="5"
+                                          ToolTip="Choose 30 or 60 frames per second"
+                                          AutomationProperties.Name="Frame rate" />
+                            </StackPanel>
+                        </Grid>
+
+                        <StackPanel Grid.Row="3">
+                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="RESOLUTION" />
+                            <ComboBox x:Name="ResolutionComboBox"
+                                      SelectionChanged="ResolutionComboBox_SelectionChanged"
+                                      TabIndex="6"
+                                      ToolTip="Choose the saved video resolution"
+                                      AutomationProperties.Name="Video resolution" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <Border Grid.Column="2" Style="{StaticResource CardStyle}">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Grid.Row="0" Margin="0,0,0,18">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Audio" />
+                            <TextBlock Margin="0,4,0,0"
+                                       Style="{StaticResource MutedTextStyle}"
+                                       Text="Mix desktop sound and the microphone you choose." />
+                        </StackPanel>
+
+                        <CheckBox x:Name="SystemAudioCheckBox"
+                                  Grid.Row="1"
+                                  Margin="0,0,0,11"
+                                  Content="Include desktop audio"
+                                  IsChecked="True"
+                                  Checked="SystemAudioCheckBox_Checked"
+                                  Unchecked="SystemAudioCheckBox_Unchecked"
+                                  Style="{StaticResource ToggleCheckBoxStyle}"
+                                  TabIndex="7"
+                                  AutomationProperties.Name="Include desktop audio" />
+
+                        <StackPanel Grid.Row="2" Margin="0,0,0,17">
+                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="OUTPUT DEVICE" />
+                            <ComboBox x:Name="OutputDeviceComboBox"
+                                      SelectionChanged="OutputDeviceComboBox_SelectionChanged"
+                                      TabIndex="8"
+                                      ToolTip="Select which desktop audio output to record"
+                                      AutomationProperties.Name="Desktop audio output device" />
+                        </StackPanel>
+
+                        <Border Grid.Row="3"
+                                Height="1"
+                                Margin="0,0,0,17"
+                                Background="{StaticResource BorderBrush}" />
+
+                        <StackPanel Grid.Row="4">
+                            <CheckBox x:Name="MicrophoneCheckBox"
+                                      Margin="0,0,0,11"
+                                      Content="Include microphone"
+                                      IsChecked="False"
+                                      Checked="MicrophoneCheckBox_Checked"
+                                      Unchecked="MicrophoneCheckBox_Unchecked"
+                                      Style="{StaticResource ToggleCheckBoxStyle}"
+                                      TabIndex="9"
+                                      AutomationProperties.Name="Include microphone" />
+                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="MICROPHONE DEVICE" />
+                            <ComboBox x:Name="MicrophoneComboBox"
+                                      IsEnabled="False"
+                                      SelectionChanged="MicrophoneComboBox_SelectionChanged"
+                                      TabIndex="10"
+                                      ToolTip="Select the microphone to include in clips"
+                                      AutomationProperties.Name="Microphone device" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+            </Grid>
+
+            <!-- Save path -->
+            <Border Grid.Row="5" Margin="0,0,0,18" Style="{StaticResource CardStyle}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0" Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Save location" />
+                            <TextBlock Margin="0,4,0,0"
+                                       Style="{StaticResource MutedTextStyle}"
+                                       Text="Every saved clip goes into this folder as an MP4 file." />
+                        </StackPanel>
+                        <TextBlock x:Name="StorageText"
+                                   Grid.Column="1"
+                                   Margin="20,0,0,0"
+                                   VerticalAlignment="Center"
+                                   Style="{StaticResource MutedTextStyle}"
+                                   Text="Checking available storage…"
+                                   AutomationProperties.LiveSetting="Polite" />
+                    </Grid>
+
+                    <Grid Grid.Row="1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="10" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="8" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="SavePathTextBox"
+                                 Grid.Column="0"
+                                 IsReadOnly="True"
+                                 TabIndex="11"
+                                 ToolTip="Folder where ClipForge saves videos"
+                                 AutomationProperties.Name="Clip save folder" />
+                        <Button x:Name="BrowseButton"
+                                Grid.Column="2"
+                                MinWidth="92"
+                                Content="Browse…"
+                                Click="BrowseButton_Click"
+                                Style="{StaticResource SecondaryButtonStyle}"
+                                TabIndex="12"
+                                AutomationProperties.Name="Choose clip save folder" />
+                        <Button x:Name="OpenFolderButton"
+                                Grid.Column="4"
+                                MinWidth="106"
+                                Content="Open folder"
+                                Click="OpenFolderButton_Click"
+                                Style="{StaticResource QuietButtonStyle}"
+                                TabIndex="13"
+                                AutomationProperties.Name="Open clip save folder" />
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <!-- App updates -->
+            <Border x:Name="UpdatePanel"
+                    Grid.Row="6"
+                    Margin="0,0,0,18"
+                    Style="{StaticResource CardStyle}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="22" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="App updates" />
+                            <Border Margin="10,0,0,0"
+                                    Padding="8,3"
+                                    VerticalAlignment="Center"
+                                    Background="{StaticResource AccentSoftBrush}"
+                                    CornerRadius="8">
+                                <TextBlock x:Name="VersionText"
+                                           FontFamily="Consolas"
+                                           FontSize="11"
+                                           Foreground="{StaticResource AccentHoverBrush}"
+                                           Text="v1.0.0" />
+                            </Border>
+                        </StackPanel>
+                        <TextBlock x:Name="UpdateStatusText"
+                                   Margin="0,6,0,0"
+                                   Style="{StaticResource MutedTextStyle}"
+                                   Text="Checking update support…"
+                                   AutomationProperties.LiveSetting="Polite" />
+                        <ProgressBar x:Name="UpdateProgressBar"
+                                     Height="4"
+                                     Margin="0,11,0,0"
+                                     Maximum="100"
+                                     Value="0"
+                                     Visibility="Collapsed" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="2"
+                                MinWidth="180"
+                                VerticalAlignment="Center">
+                        <Button x:Name="UpdateActionButton"
+                                MinWidth="150"
+                                Content="Check for updates"
+                                Click="UpdateActionButton_Click"
+                                Style="{StaticResource SecondaryButtonStyle}"
+                                TabIndex="14"
+                                AutomationProperties.Name="Check for ClipForge updates" />
+                        <CheckBox x:Name="AutoUpdateCheckBox"
+                                  Margin="0,10,0,0"
+                                  HorizontalAlignment="Center"
+                                  Content="Check automatically"
+                                  Click="AutoUpdateCheckBox_Click"
+                                  IsChecked="True"
+                                  TabIndex="15"
+                                  AutomationProperties.Name="Check for updates automatically" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Most recently saved clip -->
+            <Border x:Name="LastSavedPanel"
+                    Grid.Row="7"
+                    Margin="0,0,0,18"
+                    Padding="18"
+                    Background="{StaticResource SuccessSoftBrush}"
+                    BorderBrush="#6046D39A"
+                    BorderThickness="1"
+                    CornerRadius="12"
+                    Visibility="Collapsed"
+                    AutomationProperties.LiveSetting="Polite">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border Width="38"
+                            Height="38"
+                            Margin="0,0,13,0"
+                            VerticalAlignment="Center"
+                            Background="{StaticResource SuccessBrush}"
+                            CornerRadius="19">
+                        <Path Width="18"
+                              Height="14"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              Data="M 1,7 L 6,12 L 17,1"
+                              Stroke="{StaticResource WindowBrush}"
+                              StrokeThickness="2.2"
+                              StrokeStartLineCap="Round"
+                              StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round"
+                              Stretch="Uniform" />
+                    </Border>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock FontSize="13" FontWeight="SemiBold" Text="Clip saved" />
+                        <TextBlock x:Name="LastSavedText"
+                                   Margin="0,3,0,0"
+                                   Style="{StaticResource MutedTextStyle}"
+                                   Text="Your latest clip is ready." />
+                    </StackPanel>
+                    <Button x:Name="OpenLastClipButton"
+                            Grid.Column="2"
+                            MinWidth="96"
+                            Content="Open clip"
+                            Click="OpenLastClipButton_Click"
+                            Style="{StaticResource QuietButtonStyle}"
+                            TabIndex="16"
+                            AutomationProperties.Name="Open latest saved clip" />
+                </Grid>
+            </Border>
+
+            <TextBlock Grid.Row="8"
+                       HorizontalAlignment="Center"
+                       Style="{StaticResource MutedTextStyle}"
+                       Text="Clips and temporary replay data stay on this computer." />
+        </Grid>
+    </ScrollViewer>
+</Window>

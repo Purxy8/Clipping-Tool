@@ -1,0 +1,280 @@
+name: Release ClipForge
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer to release (for example, 1.0.0)"
+        required: true
+        type: string
+      release_notes:
+        description: "Optional Markdown release notes"
+        required: false
+        type: string
+      publish:
+        description: "Publish immediately instead of creating a draft GitHub release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: clipforge-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign, and upload
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_DIRECTORY: artifacts\Distribution
+      UPDATE_URL: https://github.com/${{ github.repository }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+      AZURE_SIGNING_METADATA_JSON: ${{ secrets.AZURE_SIGNING_METADATA_JSON }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.301
+            8.0.x
+
+      - name: Restore dependencies and local release tool
+        shell: pwsh
+        run: |
+          dotnet restore .\ClipForge.slnx
+          dotnet tool restore
+
+      - name: Select signing mode
+        id: signing
+        shell: pwsh
+        run: |
+          $hasPfx = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_BASE64)
+          $hasPfxPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_PASSWORD)
+          $hasAzure = -not [string]::IsNullOrWhiteSpace($env:AZURE_SIGNING_METADATA_JSON)
+
+          if ($hasPfx -ne $hasPfxPassword) {
+            throw "Configure both WINDOWS_SIGNING_PFX_BASE64 and WINDOWS_SIGNING_PFX_PASSWORD, or neither."
+          }
+          if ($hasPfx -and $hasAzure) {
+            throw "Configure either PFX signing or Azure Artifact Signing, not both."
+          }
+
+          if ($hasAzure) {
+            $missingAzureCredential = [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:AZURE_SUBSCRIPTION_ID)
+            if ($missingAzureCredential) {
+              throw "Azure signing also requires AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_SUBSCRIPTION_ID."
+            }
+            "mode=azure" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          elseif ($hasPfx) {
+            "mode=pfx" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          else {
+            Write-Warning "No signing secrets are configured. This run will produce unsigned artifacts."
+            "mode=unsigned" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Sign in to Azure for Artifact Signing
+        if: steps.signing.outputs.mode == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare signing material
+        if: steps.signing.outputs.mode != 'unsigned'
+        shell: pwsh
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          if ($env:SIGNING_MODE -eq "pfx") {
+            $pfxPath = Join-Path $env:RUNNER_TEMP "clipforge-signing.pfx"
+            [System.IO.File]::WriteAllBytes(
+              $pfxPath,
+              [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+
+            $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -Password $password
+            "SIGNING_THUMBPRINT=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          else {
+            $metadataPath = Join-Path $env:RUNNER_TEMP "clipforge-azure-signing.json"
+            [System.IO.File]::WriteAllText(
+              $metadataPath,
+              $env:AZURE_SIGNING_METADATA_JSON,
+              [System.Text.UTF8Encoding]::new($false))
+          }
+
+      - name: Download the previous Velopack release
+        shell: pwsh
+        env:
+          CLIPFORGE_VERSION: ${{ inputs.version }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $releases = @(
+            Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases?per_page=100" `
+              -Headers $headers)
+          $hasVelopackFeed = $releases.assets.name -match '^releases\..+\.json(?:\.zst)?$'
+
+          if ($hasVelopackFeed) {
+            $downloadArguments = @(
+              "tool", "run", "vpk", "--",
+              "download", "github",
+              "--repoUrl", $env:UPDATE_URL,
+              "--token", $env:GITHUB_TOKEN,
+              "--channel", "stable",
+              "--outputDir", $env:RELEASE_DIRECTORY)
+            if ($env:CLIPFORGE_VERSION.Contains("-")) {
+              $downloadArguments += "--pre"
+            }
+            & dotnet @downloadArguments
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+          else {
+            Write-Host "No previous stable Velopack feed was found; creating a full first release."
+          }
+
+      - name: Build release
+        shell: pwsh
+        env:
+          CLIPFORGE_VERSION: ${{ inputs.version }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          $releaseArguments = @{
+            Version = $env:CLIPFORGE_VERSION
+            UpdateUrl = $env:UPDATE_URL
+            OutputDirectory = $env:RELEASE_DIRECTORY
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_NOTES)) {
+            $notesPath = Join-Path $env:RUNNER_TEMP "clipforge-release-notes.md"
+            [System.IO.File]::WriteAllText(
+              $notesPath,
+              $env:RELEASE_NOTES,
+              [System.Text.UTF8Encoding]::new($false))
+            $releaseArguments.ReleaseNotes = $notesPath
+          }
+
+          if ($env:SIGNING_MODE -eq "pfx") {
+            $releaseArguments.SignParams = "/sha1 $env:SIGNING_THUMBPRINT /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com"
+          }
+          elseif ($env:SIGNING_MODE -eq "azure") {
+            $releaseArguments.AzureTrustedSignFile = Join-Path $env:RUNNER_TEMP "clipforge-azure-signing.json"
+          }
+
+          & .\scripts\release.ps1 @releaseArguments
+
+      - name: Verify installer signature
+        shell: pwsh
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          $installerPath = Join-Path $env:RELEASE_DIRECTORY "ClipForge-Setup.exe"
+          if (-not (Test-Path -LiteralPath $installerPath)) {
+            throw "Release did not create $installerPath"
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+          Write-Host "Authenticode status: $($signature.Status)"
+          if ($env:SIGNING_MODE -ne "unsigned" -and $signature.Status -ne "Valid") {
+            throw "The signed installer did not validate: $($signature.StatusMessage)"
+          }
+
+      - name: Upload to GitHub Releases
+        shell: pwsh
+        env:
+          CLIPFORGE_VERSION: ${{ inputs.version }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          $publishRelease = [Convert]::ToBoolean($env:PUBLISH_RELEASE)
+          if ($publishRelease -and $env:SIGNING_MODE -eq "unsigned") {
+            throw "Refusing to publish an unsigned release. Configure signing or create a draft instead."
+          }
+
+          $uploadArguments = @(
+            "tool", "run", "vpk", "--",
+            "upload", "github",
+            "--repoUrl", $env:UPDATE_URL,
+            "--token", $env:GITHUB_TOKEN,
+            "--channel", "stable",
+            "--outputDir", $env:RELEASE_DIRECTORY,
+            "--releaseName", "ClipForge $env:CLIPFORGE_VERSION",
+            "--tag", "v$env:CLIPFORGE_VERSION",
+            "--targetCommitish", $env:GITHUB_SHA)
+
+          if ($env:CLIPFORGE_VERSION.Contains("-")) {
+            $uploadArguments += "--pre"
+          }
+          if ($publishRelease) {
+            $uploadArguments += "--publish"
+          }
+
+          & dotnet @uploadArguments
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          & gh release upload `
+            "v$env:CLIPFORGE_VERSION" `
+            (Join-Path $env:RELEASE_DIRECTORY "ClipForge-Setup.exe") `
+            (Join-Path $env:RELEASE_DIRECTORY "SHA256SUMS.txt") `
+            --repo $env:GITHUB_REPOSITORY `
+            --clobber
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Keep workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipForge-${{ inputs.version }}-win-x64
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            artifacts/Distribution/ClipForge-Setup.exe
+            artifacts/Distribution/ClipForge.Desktop-stable-Setup.exe
+            artifacts/Distribution/ClipForge.Desktop-${{ inputs.version }}-*.nupkg
+            artifacts/Distribution/releases.*.json*
+            artifacts/Distribution/SHA256SUMS.txt
+
+      - name: Remove signing material
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_THUMBPRINT)) {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:SIGNING_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "clipforge-signing.pfx") -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "clipforge-azure-signing.json") -Force -ErrorAction SilentlyContinue
