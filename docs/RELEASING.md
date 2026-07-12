@@ -68,7 +68,7 @@ $signing = '/sha1 CERTIFICATE_THUMBPRINT /fd SHA256 /td SHA256 /tr https://times
   -SignParams $signing
 ```
 
-Use a certificate issued to the publisher identity that should appear in Windows. Modern commercial certificates may be held in a hardware or cloud HSM instead of an exportable PFX, so confirm that the provider supports unattended CI signing before purchase.
+Use a certificate issued to the publisher identity that should appear in Windows. Since the 2023 CA/Browser Forum key-protection change, newly issued publicly trusted code-signing private keys normally live in approved hardware or a compliant cloud HSM. An ordinary exportable PFX placed in GitHub Secrets is therefore not the default modern public-trust route. Use the PFX workflow only when the issuer explicitly provides a compliant, unattended-CI PFX; otherwise use Azure Artifact Signing or add the chosen CA's cloud-signing integration.
 
 ### Azure Artifact Signing
 
@@ -98,15 +98,18 @@ Artifact Signing also requires a valid Microsoft identity validation, certificat
 `.github/workflows/release.yml` is a manual `workflow_dispatch` pipeline. It:
 
 1. Restores .NET dependencies and the repository-local Velopack 1.2.0 tool.
-2. Downloads the previous Velopack GitHub release when a feed already exists, allowing Velopack to produce delta updates.
-3. Builds, tests, optionally signs, and packages ClipForge with `scripts/release.ps1`.
-4. Verifies that a requested signature is valid.
-5. Uploads the update assets through `vpk upload github` using GitHub's short-lived `GITHUB_TOKEN`, then attaches the friendly `ClipForge-Setup.exe` alias, portable ZIP, and checksum file to the same release.
-6. Retains the primary release files as a workflow artifact for 14 days.
+2. Refuses a duplicate or non-increasing version and downloads the previous Velopack GitHub release when a feed already exists, allowing Velopack to produce delta updates.
+3. Builds, tests, and publishes the self-contained payload before any signing identity is activated.
+4. Activates exactly one signing route only for Velopack packaging, then immediately removes temporary signing material.
+5. Verifies the expected publisher, trusted timestamp, and Authenticode chain on both installers plus the application and updater inside the portable/update packages.
+6. Uploads the update assets through `vpk upload github` using GitHub's short-lived `GITHUB_TOKEN`, then attaches the friendly `ClipForge-Setup.exe` alias, portable ZIP, and checksum file to the same release.
+7. Retains the primary release files as a workflow artifact for 14 days.
 
 To run it, open **Actions > Release ClipForge > Run workflow**, enter a new version and optional release notes, and decide whether to publish immediately. The `publish` option defaults to off, which creates a draft GitHub release. Review the assets and signature before publishing the draft. The workflow refuses immediate publishing when no signing configuration is present.
 
-No repository signing secret is required for an unsigned test run. Configure exactly one of the following sets for a trusted release.
+Before adding any signing configuration, create a GitHub Environment named `release` under **Settings > Environments**. Restrict its deployment branch to `main` and add a required reviewer when the repository plan supports it. Store signing values as environment secrets, not in the repository or source tree. The workflow itself is main-only and waits for this environment before it can access signing credentials.
+
+No signing secret is required for an unsigned test run. Configure exactly one of the following sets for a trusted release, plus `WINDOWS_SIGNING_SUBJECT`. Set that common secret to a stable part of the exact certificate subject, normally `CN=LEGAL PUBLISHER NAME`; every signed release component must match it.
 
 ### PFX secrets
 
@@ -116,8 +119,9 @@ Use this mode only when the issuer provides an exportable, CI-suitable PFX. Many
 | --- | --- |
 | `WINDOWS_SIGNING_PFX_BASE64` | Base64 encoding of the PFX file |
 | `WINDOWS_SIGNING_PFX_PASSWORD` | PFX password |
+| `WINDOWS_SIGNING_SUBJECT` | Expected certificate subject text, for example `CN=LEGAL PUBLISHER NAME` |
 
-The workflow imports the certificate into the ephemeral runner's current-user certificate store, passes only its thumbprint to Velopack, and removes the certificate and temporary PFX afterward.
+The workflow rejects ambiguous PFX bundles unless exactly one imported certificate has both a private key and the Code Signing EKU. It passes only that certificate's thumbprint to Velopack and removes every imported certificate plus the temporary PFX immediately after packaging.
 
 ### Azure Artifact Signing secrets
 
@@ -127,6 +131,7 @@ The workflow imports the certificate into the ephemeral runner's current-user ce
 | `AZURE_CLIENT_ID` | Entra application or managed identity client ID |
 | `AZURE_TENANT_ID` | Entra tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
+| `WINDOWS_SIGNING_SUBJECT` | Expected public certificate subject text, for example `CN=LEGAL PUBLISHER NAME` |
 
 The workflow uses GitHub OIDC through `azure/login`, so configure a federated credential for this repository and grant the identity the Artifact Signing certificate-profile signer role. No long-lived Azure client secret is stored in GitHub.
 
@@ -162,6 +167,8 @@ https://github.com/OWNER/REPOSITORY/releases/latest/download/ClipForge-Setup.exe
 ```
 
 Keep the full package, update-feed files, and installer attached to every release; installed clients need the feed and packages to update.
+
+The existing local 1.0.0 build was created without an embedded GitHub update URL, so it cannot discover this first hosted release. Exit every old ClipForge tray instance and install the official 1.1.0 setup manually once. Builds installed from 1.1.0 onward use the permanent repository feed and can update in-app.
 
 If a release has a serious defect, do not replace its files in place and do not publish an older version under the same channel. Fix the issue, increment the version, and publish a new release. A GitHub release can be changed from public to draft to stop new manual downloads, but already installed clients may have cached metadata, so a forward-fix release is the dependable recovery path.
 

@@ -16,7 +16,11 @@ param(
 
     [string]$VpkDllPath,
 
-    [switch]$NoRestore
+    [switch]$NoRestore,
+
+    [switch]$PrepareOnly,
+
+    [switch]$PackOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,9 +41,20 @@ elseif (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
 
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $publishDirectory = Join-Path $artifactsRoot "release-work\$Version\publish"
+$preparedManifestPath = Join-Path (Split-Path $publishDirectory -Parent) "prepared-release.json"
 $releasePackage = Join-Path $OutputDirectory "$packId-$Version-$channel-full.nupkg"
 
-if (Test-Path -LiteralPath $releasePackage) {
+if ($PrepareOnly -and $PackOnly) {
+    throw "Choose either PrepareOnly or PackOnly, not both."
+}
+
+if ($PrepareOnly -and
+    (-not [string]::IsNullOrWhiteSpace($SignParams) -or
+     -not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile))) {
+    throw "PrepareOnly never uses signing credentials. Provide signing only to the packaging stage."
+}
+
+if (-not $PrepareOnly -and (Test-Path -LiteralPath $releasePackage)) {
     throw "Release $Version already exists at $releasePackage. Increment the version instead of overwriting a release."
 }
 
@@ -48,76 +63,129 @@ if (-not [string]::IsNullOrWhiteSpace($SignParams) -and
     throw "Choose either SignParams or AzureTrustedSignFile, not both."
 }
 
-if (-not [string]::IsNullOrWhiteSpace($ReleaseNotes)) {
+if (-not $PrepareOnly -and -not [string]::IsNullOrWhiteSpace($ReleaseNotes)) {
     $ReleaseNotes = (Resolve-Path $ReleaseNotes).Path
 }
 
-if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
+if (-not $PrepareOnly -and -not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
     $AzureTrustedSignFile = (Resolve-Path $AzureTrustedSignFile).Path
 }
 
-if (-not [string]::IsNullOrWhiteSpace($VpkDllPath)) {
+if (-not $PrepareOnly -and -not [string]::IsNullOrWhiteSpace($VpkDllPath)) {
     $VpkDllPath = (Resolve-Path $VpkDllPath).Path
 }
 
 [System.IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
 [System.IO.Directory]::CreateDirectory((Split-Path $publishDirectory -Parent)) | Out-Null
 
-if (Test-Path -LiteralPath $publishDirectory) {
-    $fullPublishPath = [System.IO.Path]::GetFullPath($publishDirectory)
-    $allowedRoot = [System.IO.Path]::GetFullPath($artifactsRoot).TrimEnd('\') + '\'
-    if (-not $fullPublishPath.StartsWith($allowedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean publish directory outside artifacts: $fullPublishPath"
+if (-not $PackOnly) {
+    if (Test-Path -LiteralPath $publishDirectory) {
+        $fullPublishPath = [System.IO.Path]::GetFullPath($publishDirectory)
+        $allowedRoot = [System.IO.Path]::GetFullPath($artifactsRoot).TrimEnd('\') + '\'
+        if (-not $fullPublishPath.StartsWith($allowedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to clean publish directory outside artifacts: $fullPublishPath"
+        }
+        Remove-Item -LiteralPath $fullPublishPath -Recurse -Force
     }
-    Remove-Item -LiteralPath $fullPublishPath -Recurse -Force
-}
-[System.IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
+    [System.IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
 
-$buildArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "build.ps1"), "-Configuration", "Release")
-if ($NoRestore) {
-    $buildArguments += "-NoRestore"
-}
-& powershell @buildArguments
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
+    $buildArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "build.ps1"), "-Configuration", "Release")
+    if ($NoRestore) {
+        $buildArguments += "-NoRestore"
+    }
+    & powershell @buildArguments
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 
-$numericParts = $Version.Split('-', 2)[0].Split('+', 2)[0].Split('.')
-$fileVersion = "$($numericParts[0]).$($numericParts[1]).$($numericParts[2]).0"
-$publishArguments = @(
-    "publish", $projectPath,
-    "--configuration", "Release",
-    "--runtime", "win-x64",
-    "--self-contained", "true",
-    "--output", $publishDirectory,
-    "-p:PublishSingleFile=false",
-    "-p:PublishTrimmed=false",
-    "-p:DebugType=None",
-    "-p:DebugSymbols=false",
-    "-p:Version=$Version",
-    "-p:AssemblyVersion=$fileVersion",
-    "-p:FileVersion=$fileVersion",
-    "-p:InformationalVersion=$Version",
-    "-p:ClipForgeUpdateUrl=$UpdateUrl"
-)
-if ($NoRestore) {
-    $publishArguments += "--no-restore"
-}
+    $numericParts = $Version.Split('-', 2)[0].Split('+', 2)[0].Split('.')
+    $fileVersion = "$($numericParts[0]).$($numericParts[1]).$($numericParts[2]).0"
+    $publishArguments = @(
+        "publish", $projectPath,
+        "--configuration", "Release",
+        "--runtime", "win-x64",
+        "--self-contained", "true",
+        "--output", $publishDirectory,
+        "-p:PublishSingleFile=false",
+        "-p:PublishTrimmed=false",
+        "-p:DebugType=None",
+        "-p:DebugSymbols=false",
+        "-p:Version=$Version",
+        "-p:AssemblyVersion=$fileVersion",
+        "-p:FileVersion=$fileVersion",
+        "-p:InformationalVersion=$Version",
+        "-p:ClipForgeUpdateUrl=$UpdateUrl"
+    )
+    if ($NoRestore) {
+        $publishArguments += "--no-restore"
+    }
 
-& dotnet @publishArguments
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
+    & dotnet @publishArguments
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 
-$dotnetCommand = Get-Command dotnet -ErrorAction Stop
-$dotnetNoticesPath = Join-Path (Split-Path $dotnetCommand.Source -Parent) "ThirdPartyNotices.txt"
-if (Test-Path -LiteralPath $dotnetNoticesPath) {
-    Copy-Item -LiteralPath $dotnetNoticesPath `
-        -Destination (Join-Path $publishDirectory "DOTNET_THIRD_PARTY_NOTICES.txt") `
-        -Force
+    $dotnetCommand = Get-Command dotnet -ErrorAction Stop
+    $dotnetNoticesPath = Join-Path (Split-Path $dotnetCommand.Source -Parent) "ThirdPartyNotices.txt"
+    if (Test-Path -LiteralPath $dotnetNoticesPath) {
+        Copy-Item -LiteralPath $dotnetNoticesPath `
+            -Destination (Join-Path $publishDirectory "DOTNET_THIRD_PARTY_NOTICES.txt") `
+            -Force
+    }
+    else {
+        Write-Warning "The .NET SDK third-party notice file was not found beside dotnet.exe."
+    }
+
+    $preparedExecutable = Join-Path $publishDirectory "ClipForge.exe"
+    $preparedLibrary = Join-Path $publishDirectory "ClipForge.dll"
+    $preparedManifest = [ordered]@{
+        Version = $Version
+        UpdateUrl = [string]$UpdateUrl
+        ExecutableSha256 = (Get-FileHash -LiteralPath $preparedExecutable -Algorithm SHA256).Hash
+        LibrarySha256 = (Get-FileHash -LiteralPath $preparedLibrary -Algorithm SHA256).Hash
+    }
+    [System.IO.File]::WriteAllText(
+        $preparedManifestPath,
+        ($preparedManifest | ConvertTo-Json),
+        [System.Text.UTF8Encoding]::new($false))
 }
 else {
-    Write-Warning "The .NET SDK third-party notice file was not found beside dotnet.exe."
+    $preparedExecutable = Join-Path $publishDirectory "ClipForge.exe"
+    $preparedLibrary = Join-Path $publishDirectory "ClipForge.dll"
+    foreach ($requiredPath in @($preparedExecutable, $preparedLibrary, $preparedManifestPath)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "PackOnly requires a complete prepared release payload at $publishDirectory. Run PrepareOnly first."
+        }
+    }
+
+    $preparedManifest = Get-Content -LiteralPath $preparedManifestPath -Raw | ConvertFrom-Json
+    if (-not [string]::Equals(
+            [string]$preparedManifest.Version,
+            $Version,
+            [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals(
+            [string]$preparedManifest.UpdateUrl,
+            [string]$UpdateUrl,
+            [System.StringComparison]::Ordinal)) {
+        throw "The prepared release identity does not match Version $Version and UpdateUrl $UpdateUrl. Run PrepareOnly again."
+    }
+
+    $executableHash = (Get-FileHash -LiteralPath $preparedExecutable -Algorithm SHA256).Hash
+    $libraryHash = (Get-FileHash -LiteralPath $preparedLibrary -Algorithm SHA256).Hash
+    if (-not $executableHash.Equals(
+            [string]$preparedManifest.ExecutableSha256,
+            [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $libraryHash.Equals(
+            [string]$preparedManifest.LibrarySha256,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "The prepared release payload changed after verification. Run PrepareOnly again."
+    }
+}
+
+if ($PrepareOnly) {
+    Write-Host ""
+    Write-Host "ClipForge $Version payload prepared without activating signing credentials: $publishDirectory"
+    return
 }
 
 $packArguments = @(

@@ -5,3 +5,10 @@ artifacts/
 *.suo
 *.user
 
+# Code-signing credentials and local signing metadata must never be committed.
+*.pfx
+*.p12
+*.pem
+*.key
+clipforge-signing*.json
+clipforge-azure-signing*.json
