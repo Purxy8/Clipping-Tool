@@ -11,6 +11,8 @@ using Button = System.Windows.Controls.Button;
 using Brush = System.Windows.Media.Brush;
 using Color = System.Windows.Media.Color;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
+using MenuItem = System.Windows.Controls.MenuItem;
+using MessageBox = System.Windows.MessageBox;
 using SolidColorBrush = System.Windows.Media.SolidColorBrush;
 using Forms = System.Windows.Forms;
 
@@ -19,6 +21,7 @@ namespace ClipForge;
 public partial class MainWindow : Window
 {
     private static readonly int[] FrameRateOptions = [30, 60];
+    private static readonly int[] RecentClipCountOptions = [4, 8, 10, 15];
 
     private readonly SettingsService _settingsService = new();
     private readonly DeviceDiscoveryService _deviceDiscoveryService = new();
@@ -32,6 +35,7 @@ public partial class MainWindow : Window
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _captureCommandGate = new(1, 1);
     private readonly SemaphoreSlim _libraryRefreshGate = new(1, 1);
+    private readonly object _libraryRefreshCancellationGate = new();
 
     private AppSettings _settings = new();
     private ReplayStateSnapshot _latestState = new(
@@ -55,6 +59,7 @@ public partial class MainWindow : Window
     private ClipLibraryItem? _currentClip;
     private OverlayWindow? _overlayWindow;
     private GlobalHotkeyAction? _capturingHotkeyAction;
+    private CancellationTokenSource? _activeLibraryRefreshCancellation;
 
     public MainWindow()
     {
@@ -92,6 +97,7 @@ public partial class MainWindow : Window
             _settings = await _settingsService.LoadAsync(_lifetimeCancellation.Token);
             _settings.SaveClipHotkey ??= HotkeyGesture.DefaultSaveClip;
             _settings.ToggleOverlayHotkey ??= HotkeyGesture.DefaultToggleOverlay;
+            _settings.RecentClipCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
             PopulateControls();
             EnsureSaveDirectory();
             RefreshEngineState();
@@ -172,6 +178,8 @@ public partial class MainWindow : Window
             ? AppSettings.GetDefaultSaveDirectory()
             : _settings.SaveDirectory;
         AutoUpdateCheckBox.IsChecked = _settings.CheckForUpdatesAutomatically;
+        RecentClipCountComboBox.ItemsSource = RecentClipCountOptions;
+        RecentClipCountComboBox.SelectedItem = _settings.RecentClipCount;
         HotkeyText.Text = _settings.SaveClipHotkey.DisplayText;
         OverlayHotkeyText.Text = _settings.ToggleOverlayHotkey.DisplayText;
         ApplyBackgroundColor(_settings.BackgroundColor);
@@ -514,6 +522,9 @@ public partial class MainWindow : Window
         _settings.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceOption)?.Id;
         _settings.CheckForUpdatesAutomatically = AutoUpdateCheckBox.IsChecked == true;
         _settings.BackgroundColor = NormalizeBackgroundColor(_settings.BackgroundColor);
+        _settings.RecentClipCount = RecentClipCountComboBox.SelectedItem is int recentClipCount
+            ? AppSettings.NormalizeRecentClipCount(recentClipCount)
+            : 4;
         _settings.SaveDirectory = string.IsNullOrWhiteSpace(SavePathTextBox.Text)
             ? AppSettings.GetDefaultSaveDirectory()
             : SavePathTextBox.Text;
@@ -840,6 +851,31 @@ public partial class MainWindow : Window
             FileName = Path.GetFullPath(path),
             UseShellExecute = true
         });
+    }
+
+    private static void RevealClipInExplorer(string validatedClipPath)
+    {
+        if (!Path.IsPathFullyQualified(validatedClipPath) || !File.Exists(validatedClipPath))
+        {
+            throw new FileNotFoundException("The requested local clip does not exist.", validatedClipPath);
+        }
+
+        var windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        var explorerPath = Path.Combine(windowsDirectory, "explorer.exe");
+        var explorer = new FileInfo(explorerPath);
+        if (!explorer.Exists ||
+            (explorer.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+        {
+            throw new FileNotFoundException("The trusted Windows File Explorer executable is unavailable.", explorerPath);
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = explorer.FullName,
+            UseShellExecute = false
+        };
+        startInfo.ArgumentList.Add($"/select,{Path.GetFullPath(validatedClipPath)}");
+        _ = Process.Start(startInfo);
     }
 
     private void ShowLastSaved(string path)
@@ -1234,6 +1270,61 @@ public partial class MainWindow : Window
         ShowMainWindow();
     }
 
+    private async void RecentClipCountComboBox_SelectionChanged(
+        object sender,
+        SelectionChangedEventArgs e)
+    {
+        if (_isInitializing || _isClosing || RecentClipCountComboBox.SelectedItem is not int requestedCount)
+        {
+            return;
+        }
+
+        var normalizedCount = AppSettings.NormalizeRecentClipCount(requestedCount);
+        if (_settings.RecentClipCount == normalizedCount)
+        {
+            UpdateRecentGalleryCardWidth();
+            return;
+        }
+
+        _settings.RecentClipCount = normalizedCount;
+        UpdateRecentGalleryCardWidth();
+        await PersistSettingsAsync();
+        await RefreshClipLibraryAsync();
+    }
+
+    private void RecentClipsScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e) =>
+        UpdateRecentGalleryCardWidth();
+
+    private void UpdateRecentGalleryCardWidth()
+    {
+        if (RecentClipsScrollViewer is null || RecentClipsItemsControl is null)
+        {
+            return;
+        }
+
+        var availableWidth = RecentClipsScrollViewer.ViewportWidth;
+        if (!double.IsFinite(availableWidth) || availableWidth <= 0)
+        {
+            availableWidth = RecentClipsScrollViewer.ActualWidth;
+        }
+
+        if (!double.IsFinite(availableWidth) || availableWidth <= 0)
+        {
+            return;
+        }
+
+        const double itemHorizontalMargin = 6;
+        const double minimumCardWidth = 210;
+        const double maximumCardWidth = 360;
+        var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
+        var maximumVisibleAtMinimumWidth = Math.Max(
+            1,
+            (int)Math.Floor(availableWidth / (minimumCardWidth + itemHorizontalMargin)));
+        var visibleCards = Math.Min(Math.Min(requestedCount, 4), maximumVisibleAtMinimumWidth);
+        var width = (availableWidth / visibleCards) - itemHorizontalMargin;
+        RecentClipsItemsControl.Tag = Math.Clamp(width, minimumCardWidth, maximumCardWidth);
+    }
+
     private void DispatchToUi(Action action)
     {
         if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
@@ -1273,6 +1364,87 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ShowRecentClipInExplorerMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem { Tag: ClipLibraryItem clip })
+        {
+            return;
+        }
+
+        try
+        {
+            if (!ClipLibraryService.TryGetCurrentClipPath(
+                    _settings.SaveDirectory,
+                    clip,
+                    out var validatedPath))
+            {
+                ShowError("That clip changed or is no longer a safe local ClipForge recording. Refresh the gallery and try again.");
+                _ = RefreshClipLibraryAsync();
+                return;
+            }
+
+            RevealClipInExplorer(validatedPath);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException or
+                Win32Exception or ArgumentException or NotSupportedException)
+        {
+            ShowError($"The clip could not be shown in File Explorer. {exception.Message}");
+        }
+    }
+
+    private async void DeleteRecentClipMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isClosing || sender is not MenuItem { Tag: ClipLibraryItem clip })
+        {
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"Permanently delete {clip.FileName}?\n\nThis cannot be undone.",
+            "Delete ClipForge clip",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        var deletingCurrentClip = _currentClip is not null &&
+                                  _currentClip.FullPath.Equals(
+                                      clip.FullPath,
+                                      StringComparison.OrdinalIgnoreCase);
+        if (deletingCurrentClip)
+        {
+            ClearPlayer();
+        }
+
+        var result = ClipLibraryService.DeleteCurrentClip(_settings.SaveDirectory, clip);
+        if (result == ClipDeletionResult.Deleted)
+        {
+            // Release gallery image bindings before removing the cached JPEG so
+            // a decoded thumbnail cannot keep the privacy-sensitive file open.
+            RecentClipsItemsControl.ItemsSource = null;
+            _clipLibraryService.RemoveCachedThumbnail(clip);
+
+            if (string.Equals(_lastSavedPath, clip.FullPath, StringComparison.OrdinalIgnoreCase))
+            {
+                _lastSavedPath = null;
+                LastSavedPanel.Visibility = Visibility.Collapsed;
+            }
+
+            await RefreshClipLibraryAsync();
+            return;
+        }
+
+        await RefreshClipLibraryAsync();
+        ShowError(result == ClipDeletionResult.ChangedOrUnsafe
+            ? "The clip changed or is no longer a safe local ClipForge recording, so it was not deleted."
+            : "The clip could not be deleted. Close any app using it, then try again.");
+    }
+
     private async Task RefreshClipLibraryAsync(string? preferredPath = null)
     {
         if (_isClosing)
@@ -1280,18 +1452,27 @@ public partial class MainWindow : Window
             return;
         }
 
+        var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
+        var refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        lock (_libraryRefreshCancellationGate)
+        {
+            _activeLibraryRefreshCancellation?.Cancel();
+            _activeLibraryRefreshCancellation = refreshCancellation;
+        }
+
         var gateEntered = false;
         try
         {
-            await _libraryRefreshGate.WaitAsync(_lifetimeCancellation.Token);
+            await _libraryRefreshGate.WaitAsync(refreshCancellation.Token);
             gateEntered = true;
             var snapshot = await _clipLibraryService.LoadAsync(
                 _settings.SaveDirectory,
-                count: 5,
+                count: requestedCount,
                 includeThumbnails: true,
-                _lifetimeCancellation.Token);
+                refreshCancellation.Token);
 
-            RecentClipsItemsControl.ItemsSource = snapshot.GalleryClips;
+            RecentClipsItemsControl.ItemsSource = snapshot.Clips;
             var selected = preferredPath is { Length: > 0 }
                 ? snapshot.Clips.FirstOrDefault(clip =>
                     clip.FullPath.Equals(preferredPath, StringComparison.OrdinalIgnoreCase))
@@ -1314,9 +1495,9 @@ public partial class MainWindow : Window
                 SelectClip(selected, autoplay: false);
             }
         }
-        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
-            // Application shutdown.
+            // A newer gallery request superseded this work, or the app is closing.
         }
         catch (Exception exception)
         {
@@ -1328,6 +1509,16 @@ public partial class MainWindow : Window
             {
                 _libraryRefreshGate.Release();
             }
+
+            lock (_libraryRefreshCancellationGate)
+            {
+                if (ReferenceEquals(_activeLibraryRefreshCancellation, refreshCancellation))
+                {
+                    _activeLibraryRefreshCancellation = null;
+                }
+            }
+
+            refreshCancellation.Dispose();
         }
     }
 
@@ -1364,6 +1555,7 @@ public partial class MainWindow : Window
     private void ClearPlayer()
     {
         ClipPlayer.Stop();
+        ClipPlayer.Close();
         ClipPlayer.Source = null;
         _currentClip = null;
         _playWhenOpened = false;

@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:ClipForge"
         mc:Ignorable="d"
         Title="ClipForge — Instant Replay"
         Width="1380"
@@ -17,6 +18,7 @@
 
     <Window.Resources>
         <SolidColorBrush x:Key="UserBackgroundBrush" Color="#0B0D12" />
+        <local:ThumbnailPathConverter x:Key="ThumbnailPathConverter" />
 
         <Style x:Key="AnimatedQuietButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource QuietButtonStyle}">
@@ -131,6 +133,56 @@
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="PART_Track" Property="Opacity" Value="0.38" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="DarkContextMenuStyle" TargetType="{x:Type ContextMenu}">
+            <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="5" />
+            <Setter Property="HasDropShadow" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type ContextMenu}">
+                        <Border Padding="{TemplateBinding Padding}"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="9">
+                            <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="DarkMenuItemStyle" TargetType="{x:Type MenuItem}">
+            <Setter Property="MinWidth" Value="190" />
+            <Setter Property="Padding" Value="12,9" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type MenuItem}">
+                        <Border x:Name="MenuItemBorder" Padding="{TemplateBinding Padding}"
+                                Background="{TemplateBinding Background}" CornerRadius="6">
+                            <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                                              VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="MenuItemBorder" Property="Background"
+                                        Value="{StaticResource SurfaceHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="MenuItemBorder" Property="Opacity" Value="0.45" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -476,7 +528,7 @@
                     <RowDefinition Height="12" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="12" />
-                    <RowDefinition Height="176" />
+                    <RowDefinition Height="214" />
                 </Grid.RowDefinitions>
 
                 <!-- Replay controls -->
@@ -651,20 +703,44 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBlock FontSize="15" FontWeight="SemiBold" Text="Recent clips" />
-                            <TextBlock Grid.Column="1" Style="{StaticResource MutedTextStyle}" Text="Latest 4" />
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Margin="0,0,7,0" VerticalAlignment="Center"
+                                           Style="{StaticResource MutedTextStyle}" Text="Latest" />
+                                <ComboBox x:Name="RecentClipCountComboBox" Width="68" Height="30" MinHeight="30"
+                                          Padding="9,3" VerticalContentAlignment="Center"
+                                          SelectionChanged="RecentClipCountComboBox_SelectionChanged"
+                                          AutomationProperties.Name="Number of recent clips" />
+                            </StackPanel>
                         </Grid>
-                        <ItemsControl x:Name="RecentClipsItemsControl" Grid.Row="1">
+                        <ScrollViewer x:Name="RecentClipsScrollViewer" Grid.Row="1"
+                                      HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled"
+                                      PanningMode="HorizontalOnly" SizeChanged="RecentClipsScrollViewer_SizeChanged">
+                        <ItemsControl x:Name="RecentClipsItemsControl" Tag="260">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
-                                    <UniformGrid Columns="4" />
+                                    <StackPanel Orientation="Horizontal" />
                                 </ItemsPanelTemplate>
                             </ItemsControl.ItemsPanel>
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                    <Button Margin="3" Padding="0" Tag="{Binding}" Click="RecentClipButton_Click"
+                                    <Button Width="{Binding RelativeSource={RelativeSource AncestorType={x:Type ItemsControl}}, Path=Tag}"
+                                            Height="112" Margin="3" Padding="0" Tag="{Binding}"
+                                            Click="RecentClipButton_Click"
                                             Style="{StaticResource GalleryCardButtonStyle}" ToolTip="{Binding FullPath}">
+                                        <Button.ContextMenu>
+                                            <ContextMenu DataContext="{Binding PlacementTarget.Tag, RelativeSource={RelativeSource Self}}"
+                                                         Style="{StaticResource DarkContextMenuStyle}">
+                                                <MenuItem Header="Show in File Explorer" Tag="{Binding}"
+                                                          Click="ShowRecentClipInExplorerMenuItem_Click"
+                                                          Style="{StaticResource DarkMenuItemStyle}" />
+                                                <MenuItem Header="Delete clip..." Tag="{Binding}"
+                                                          Click="DeleteRecentClipMenuItem_Click"
+                                                          Style="{StaticResource DarkMenuItemStyle}" />
+                                            </ContextMenu>
+                                        </Button.ContextMenu>
                                         <Grid>
-                                            <Image Source="{Binding ThumbnailPath}" Stretch="UniformToFill" />
+                                            <Image Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailPathConverter}}"
+                                                   Stretch="UniformToFill" />
                                             <Border VerticalAlignment="Bottom" Padding="9,18,9,8">
                                                 <Border.Background>
                                                     <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
@@ -676,7 +752,7 @@
                                                     <TextBlock FontSize="12" FontWeight="SemiBold" Text="{Binding FileName}"
                                                                TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
                                                     <TextBlock Margin="0,2,0,0" FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"
-                                                               Text="{Binding RecordedAtUtc, StringFormat={}{0:dd MMM · HH:mm}}" />
+                                                               Text="{Binding RecordedAtLocal, StringFormat={}{0:dd MMM · HH:mm}}" />
                                                 </StackPanel>
                                             </Border>
                                             <Border Width="30" Height="30" HorizontalAlignment="Center" VerticalAlignment="Center"
@@ -689,6 +765,7 @@
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
+                        </ScrollViewer>
                     </Grid>
                 </Border>
 
