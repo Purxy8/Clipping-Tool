@@ -281,7 +281,7 @@
                                     <Button x:Name="UpdateActionButton" Content="Check for updates" Click="UpdateActionButton_Click"
                                             Style="{StaticResource SecondaryButtonStyle}" />
                                     <CheckBox x:Name="AutoUpdateCheckBox" Margin="0,9,0,0" Content="Check automatically"
-                                              Click="AutoUpdateCheckBox_Click" IsChecked="True" />
+                                              Click="AutoUpdateCheckBox_Click" IsChecked="False" />
                                 </StackPanel>
                             </Border>
                         </StackPanel>

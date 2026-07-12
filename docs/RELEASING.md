@@ -46,6 +46,10 @@ The script runs the Release build and tests before packaging. It refuses to over
 
 An unsigned installer is suitable for internal testing, but it is not an official trusted Windows release. Windows SmartScreen and antivirus products commonly warn about unsigned applications. Velopack must perform signing while it creates the package so that the application, updater, and installer are signed at the correct stages. See [Velopack's Windows signing guide](https://docs.velopack.io/packaging/signing).
 
+ClipForge has selected the open-source SignPath Foundation route and is preparing an application. **The project has not been accepted, and current preview packages are unsigned.** Do not claim that a preview is signed, trusted, or approved by SignPath. The mandatory team roles, MFA rules, privacy disclosure, and manual-approval requirements are recorded in the repository's [Code signing policy](../CODE_SIGNING_POLICY.md).
+
+If ClipForge is accepted, the SignPath integration must build from the public repository revision, preserve verifiable build provenance, enforce ClipForge product/version metadata, and require a listed Approver to approve every signing request manually. The workflow must not treat SignPath acceptance or signing as automatic. Until that integration has been reviewed and exercised successfully, the existing workflow must continue to refuse immediate unsigned publication. A Foundation-eligibility preview may be published manually only as a conspicuously labeled **unsigned pre-release**, never as a trusted or latest stable release.
+
 Two signing routes are supported by `scripts/release.ps1`:
 
 For a Bulgarian publisher, choose the identity route before purchasing anything:
@@ -157,6 +161,10 @@ For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the p
 5. After publishing a newer version, **Check for updates**, download, and restart complete successfully.
 
 Raw `dotnet run`, IDE, and portable publish builds are intentionally excluded from updater installation tests. Velopack updates only apply to a Velopack-installed copy.
+
+Every download or release page must include a heading or link using the exact term **Code signing policy** and point to [`CODE_SIGNING_POLICY.md`](../CODE_SIGNING_POLICY.md). While the application remains pending, release notes must also label the package **unsigned preview**. After acceptance and successful signing, include this exact attribution in release notes:
+
+> Free code signing provided by SignPath.io, certificate by SignPath Foundation
 
 ## Publishing and recovery
 

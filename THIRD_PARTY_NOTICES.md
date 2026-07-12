@@ -2,6 +2,8 @@
 
 ClipForge depends on open-source software. The notices below are provided for convenience; the license files shipped by each project remain authoritative.
 
+ClipForge's project-owned source code, build scripts, documentation, UI artwork, icons, and other assets are Copyright (C) 2026 Purxy8 and licensed under GPL-3.0-or-later as described in [LICENSE](LICENSE). Original artwork is documented in [ASSET_PROVENANCE.md](ASSET_PROVENANCE.md). This file lists separate third-party works; their licenses are not replaced by ClipForge's license.
+
 | Component | Use | License |
 | --- | --- | --- |
 | [.NET](https://github.com/dotnet/runtime) | Application runtime and Windows desktop framework | MIT |

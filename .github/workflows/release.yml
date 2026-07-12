@@ -53,13 +53,14 @@ jobs:
       - name: Restore dependencies and local release tool
         shell: pwsh
         run: |
-          dotnet restore .\ClipForge.slnx
+          dotnet restore .\ClipForge.slnx --locked-mode
           dotnet tool restore
 
       - name: Select signing mode
         id: signing
         shell: pwsh
         env:
+          CLIPFORGE_VERSION: ${{ inputs.version }}
           HAS_WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 != '' }}
           HAS_WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD != '' }}
           HAS_AZURE_SIGNING_METADATA: ${{ secrets.AZURE_SIGNING_METADATA_JSON != '' }}
@@ -97,6 +98,9 @@ jobs:
             "mode=pfx" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
           else {
+            if (-not $env:CLIPFORGE_VERSION.Contains("-")) {
+              throw "Unsigned artifacts are allowed only for explicitly versioned prereleases."
+            }
             Write-Warning "No signing secrets are configured. This run will produce unsigned artifacts."
             "mode=unsigned" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
@@ -129,6 +133,7 @@ jobs:
           }
 
           $requestedCore = [Version]($env:CLIPFORGE_VERSION.Split('-', 2)[0])
+          $isPrerelease = $env:CLIPFORGE_VERSION.Contains('-')
           $stableVersions = @(
             $releases |
               Where-Object {
@@ -138,14 +143,19 @@ jobs:
               ForEach-Object { [Version]$_.tag_name.TrimStart('v') })
           if ($stableVersions.Count -gt 0) {
             $highestStable = $stableVersions | Sort-Object -Descending | Select-Object -First 1
-            $isPrerelease = $env:CLIPFORGE_VERSION.Contains('-')
             if (($isPrerelease -and $requestedCore -le $highestStable) -or
                 (-not $isPrerelease -and $requestedCore -le $highestStable)) {
               throw "Requested version $env:CLIPFORGE_VERSION is not newer than stable release $highestStable."
             }
           }
 
-          $hasVelopackFeed = $releases.assets.name -match '^releases\..+\.json(?:\.zst)?$'
+          $eligibleFeedReleases = @(
+            $releases | Where-Object {
+              -not $_.draft -and [bool]$_.prerelease -eq $isPrerelease
+            })
+          $hasVelopackFeed = @(
+            $eligibleFeedReleases.assets |
+              Where-Object { $_.name -match '^releases\..+\.json(?:\.zst)?$' }).Count -gt 0
 
           if ($hasVelopackFeed) {
             $downloadArguments = @(
@@ -155,7 +165,7 @@ jobs:
               "--token", $env:GITHUB_TOKEN,
               "--channel", "stable",
               "--outputDir", $env:RELEASE_DIRECTORY)
-            if ($env:CLIPFORGE_VERSION.Contains("-")) {
+            if ($isPrerelease) {
               $downloadArguments += "--pre"
             }
             & dotnet @downloadArguments
@@ -164,7 +174,7 @@ jobs:
             }
           }
           else {
-            Write-Host "No previous stable Velopack feed was found; creating a full first release."
+            Write-Host "No previous eligible published Velopack feed was found; creating a full release."
           }
 
       - name: Prepare and test release payload
@@ -265,14 +275,33 @@ jobs:
             PackOnly = $true
           }
 
-          if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_NOTES)) {
-            $notesPath = Join-Path $env:RUNNER_TEMP "clipforge-release-notes.md"
-            [System.IO.File]::WriteAllText(
-              $notesPath,
-              $env:RELEASE_NOTES,
-              [System.Text.UTF8Encoding]::new($false))
-            $releaseArguments.ReleaseNotes = $notesPath
+          $releaseNotes = [System.Collections.Generic.List[string]]::new()
+          if ($env:SIGNING_MODE -eq "unsigned") {
+            $releaseNotes.Add("# UNSIGNED PREVIEW")
+            $releaseNotes.Add("")
+            $releaseNotes.Add("**This is an unsigned public beta, not an official trusted release. Windows can show an unverified publisher or SmartScreen warning.**")
+            $releaseNotes.Add("")
           }
+
+          $releaseNotes.Add("## Code signing policy")
+          $releaseNotes.Add("")
+          $releaseNotes.Add("[Read the ClipForge Code signing policy]($env:UPDATE_URL/blob/$env:GITHUB_SHA/CODE_SIGNING_POLICY.md).")
+          $releaseNotes.Add("")
+          $releaseNotes.Add("Source commit: [$env:GITHUB_SHA]($env:UPDATE_URL/commit/$env:GITHUB_SHA)")
+
+          if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_NOTES)) {
+            $releaseNotes.Add("")
+            $releaseNotes.Add("---")
+            $releaseNotes.Add("")
+            $releaseNotes.Add($env:RELEASE_NOTES.Trim())
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "clipforge-release-notes.md"
+          [System.IO.File]::WriteAllText(
+            $notesPath,
+            ($releaseNotes -join [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false))
+          $releaseArguments.ReleaseNotes = $notesPath
 
           if ($env:SIGNING_MODE -eq "pfx") {
             $releaseArguments.SignParams = "/sha1 $env:SIGNING_THUMBPRINT /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com"
@@ -329,7 +358,7 @@ jobs:
           }
 
           if ($env:SIGNING_MODE -eq "unsigned") {
-            Write-Warning "Unsigned draft artifacts were structurally verified but are not eligible for publication."
+            Write-Warning "Unsigned artifacts were structurally verified but are not eligible for trusted or stable publication. They may only be manually reviewed and published as a conspicuously labeled prerelease."
             return
           }
 
@@ -378,6 +407,13 @@ jobs:
             throw "Refusing to publish an unsigned release. Configure signing or create a draft instead."
           }
 
+          $releaseName = if ($env:SIGNING_MODE -eq "unsigned") {
+            "ClipForge $env:CLIPFORGE_VERSION - UNSIGNED PREVIEW"
+          }
+          else {
+            "ClipForge $env:CLIPFORGE_VERSION"
+          }
+
           $uploadArguments = @(
             "tool", "run", "vpk", "--",
             "upload", "github",
@@ -385,7 +421,7 @@ jobs:
             "--token", $env:GITHUB_TOKEN,
             "--channel", "stable",
             "--outputDir", $env:RELEASE_DIRECTORY,
-            "--releaseName", "ClipForge $env:CLIPFORGE_VERSION",
+            "--releaseName", $releaseName,
             "--tag", "v$env:CLIPFORGE_VERSION",
             "--targetCommitish", $env:GITHUB_SHA)
 

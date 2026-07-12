@@ -44,6 +44,33 @@ $publishDirectory = Join-Path $artifactsRoot "release-work\$Version\publish"
 $preparedManifestPath = Join-Path (Split-Path $publishDirectory -Parent) "prepared-release.json"
 $releasePackage = Join-Path $OutputDirectory "$packId-$Version-$channel-full.nupkg"
 
+function Get-PublishTreeManifestEntries {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $resolvedRoot = [System.IO.Path]::GetFullPath($RootPath)
+    $rootPrefix = $resolvedRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) +
+        [System.IO.Path]::DirectorySeparatorChar
+    @(
+        Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse |
+            ForEach-Object {
+                $fullPath = [System.IO.Path]::GetFullPath($_.FullName)
+                if (-not $fullPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Publish file escaped the prepared payload root: $fullPath"
+                }
+                $relativePath = $fullPath.Substring($rootPrefix.Length).Replace('\', '/')
+                [pscustomobject][ordered]@{
+                    Path = $relativePath
+                    Length = [long]$_.Length
+                    Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            } |
+            Sort-Object -Property Path
+    )
+}
+
 if ($PrepareOnly -and $PackOnly) {
     throw "Choose either PrepareOnly or PackOnly, not both."
 }
@@ -106,6 +133,7 @@ if (-not $PackOnly) {
         "--runtime", "win-x64",
         "--self-contained", "true",
         "--output", $publishDirectory,
+        "--no-restore",
         "-p:PublishSingleFile=false",
         "-p:PublishTrimmed=false",
         "-p:DebugType=None",
@@ -116,9 +144,6 @@ if (-not $PackOnly) {
         "-p:InformationalVersion=$Version",
         "-p:ClipForgeUpdateUrl=$UpdateUrl"
     )
-    if ($NoRestore) {
-        $publishArguments += "--no-restore"
-    }
 
     & dotnet @publishArguments
     if ($LASTEXITCODE -ne 0) {
@@ -136,17 +161,19 @@ if (-not $PackOnly) {
         Write-Warning "The .NET SDK third-party notice file was not found beside dotnet.exe."
     }
 
-    $preparedExecutable = Join-Path $publishDirectory "ClipForge.exe"
-    $preparedLibrary = Join-Path $publishDirectory "ClipForge.dll"
+    $preparedFiles = @(Get-PublishTreeManifestEntries -RootPath $publishDirectory)
+    if ($preparedFiles.Count -eq 0) {
+        throw "The prepared release payload is empty."
+    }
     $preparedManifest = [ordered]@{
+        FormatVersion = 1
         Version = $Version
         UpdateUrl = [string]$UpdateUrl
-        ExecutableSha256 = (Get-FileHash -LiteralPath $preparedExecutable -Algorithm SHA256).Hash
-        LibrarySha256 = (Get-FileHash -LiteralPath $preparedLibrary -Algorithm SHA256).Hash
+        Files = $preparedFiles
     }
     [System.IO.File]::WriteAllText(
         $preparedManifestPath,
-        ($preparedManifest | ConvertTo-Json),
+        ($preparedManifest | ConvertTo-Json -Depth 5),
         [System.Text.UTF8Encoding]::new($false))
 }
 else {
@@ -159,7 +186,8 @@ else {
     }
 
     $preparedManifest = Get-Content -LiteralPath $preparedManifestPath -Raw | ConvertFrom-Json
-    if (-not [string]::Equals(
+    if ([int]$preparedManifest.FormatVersion -ne 1 -or
+        -not [string]::Equals(
             [string]$preparedManifest.Version,
             $Version,
             [System.StringComparison]::Ordinal) -or
@@ -170,15 +198,26 @@ else {
         throw "The prepared release identity does not match Version $Version and UpdateUrl $UpdateUrl. Run PrepareOnly again."
     }
 
-    $executableHash = (Get-FileHash -LiteralPath $preparedExecutable -Algorithm SHA256).Hash
-    $libraryHash = (Get-FileHash -LiteralPath $preparedLibrary -Algorithm SHA256).Hash
-    if (-not $executableHash.Equals(
-            [string]$preparedManifest.ExecutableSha256,
-            [System.StringComparison]::OrdinalIgnoreCase) -or
-        -not $libraryHash.Equals(
-            [string]$preparedManifest.LibrarySha256,
-            [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "The prepared release payload changed after verification. Run PrepareOnly again."
+    $expectedFiles = @($preparedManifest.Files)
+    $actualFiles = @(Get-PublishTreeManifestEntries -RootPath $publishDirectory)
+    if ($expectedFiles.Count -eq 0 -or $expectedFiles.Count -ne $actualFiles.Count) {
+        throw "The prepared release file set changed after verification. Run PrepareOnly again."
+    }
+
+    for ($index = 0; $index -lt $actualFiles.Count; $index++) {
+        $expected = $expectedFiles[$index]
+        $actual = $actualFiles[$index]
+        if (-not [string]::Equals(
+                [string]$expected.Path,
+                [string]$actual.Path,
+                [System.StringComparison]::Ordinal) -or
+            [long]$expected.Length -ne [long]$actual.Length -or
+            -not [string]::Equals(
+                [string]$expected.Sha256,
+                [string]$actual.Sha256,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "The prepared release payload changed at '$($actual.Path)' after verification. Run PrepareOnly again."
+        }
     }
 }
 
@@ -195,7 +234,7 @@ $packArguments = @(
     "--packDir", $publishDirectory,
     "--mainExe", "ClipForge.exe",
     "--packTitle", "ClipForge",
-    "--packAuthors", "ClipForge",
+    "--packAuthors", "Purxy8",
     "--runtime", "win-x64",
     "--channel", $channel,
     "--icon", $iconPath,

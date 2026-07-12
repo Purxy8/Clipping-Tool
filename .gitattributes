@@ -1,2 +1,8 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+* text=auto eol=lf
+
+*.ico binary
+*.png binary
+*.zip binary
+*.nupkg binary
+*.exe binary
+*.dll binary

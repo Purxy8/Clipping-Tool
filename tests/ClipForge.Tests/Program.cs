@@ -99,7 +99,9 @@ internal static class Program
             expectedSettingsDirectory,
             SettingsService.GetDefaultSettingsDirectory(),
             "Settings must be stored under the user's local application data folder.");
-        Assert.True(new AppSettings().CheckForUpdatesAutomatically, "Automatic update checks should default on.");
+        Assert.True(
+            !new AppSettings().CheckForUpdatesAutomatically,
+            "Automatic update checks should require explicit opt-in.");
         var defaults = new AppSettings();
         Assert.Equal(HotkeyGesture.DefaultSaveClip, defaults.SaveClipHotkey, "The Save Clip hotkey default is incorrect.");
         Assert.Equal(

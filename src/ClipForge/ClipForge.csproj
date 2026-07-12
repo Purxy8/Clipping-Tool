@@ -17,10 +17,13 @@
     <InformationalVersion>1.1.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Company>ClipForge</Company>
-    <Product>ClipForge Instant Replay</Product>
+    <Product>ClipForge</Product>
     <Description>A private, local-first instant replay recorder for Windows.</Description>
-    <Authors>ClipForge</Authors>
-    <Copyright>Copyright © 2026 ClipForge</Copyright>
+    <Authors>Purxy8</Authors>
+    <Copyright>Copyright (c) 2026 Purxy8</Copyright>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Purxy8/Clipping-Tool</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <NeutralLanguage>en</NeutralLanguage>
   </PropertyGroup>
 
@@ -35,6 +38,26 @@
     <AssemblyMetadata Include="ClipForgeUpdateUrl" Value="$(ClipForgeUpdateUrl)" />
     <None Include="..\..\THIRD_PARTY_NOTICES.md"
           Link="THIRD_PARTY_NOTICES.md"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE"
+          Link="LICENSE"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\SOURCE.md"
+          Link="SOURCE.md"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\PRIVACY.md"
+          Link="PRIVACY.md"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\CODE_SIGNING_POLICY.md"
+          Link="CODE_SIGNING_POLICY.md"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\ASSET_PROVENANCE.md"
+          Link="ASSET_PROVENANCE.md"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>

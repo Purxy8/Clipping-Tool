@@ -23,21 +23,26 @@ elseif (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 [System.IO.Directory]::CreateDirectory($OutputPath) | Out-Null
 
+if (-not $NoRestore) {
+    & dotnet restore $projectPath --runtime win-x64 --locked-mode
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+}
+
 $publishArguments = @(
     "publish", $projectPath,
     "--configuration", $Configuration,
     "--runtime", "win-x64",
     "--self-contained", "true",
     "--output", $OutputPath,
+    "--no-restore",
     "-p:PublishSingleFile=true",
     "-p:IncludeNativeLibrariesForSelfExtract=true",
     "-p:PublishTrimmed=false",
     "-p:DebugType=None",
     "-p:DebugSymbols=false"
 )
-if ($NoRestore) {
-    $publishArguments += "--no-restore"
-}
 
 & dotnet @publishArguments
 

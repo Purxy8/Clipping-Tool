@@ -2,7 +2,12 @@
 
 All notable user-facing changes to ClipForge are recorded here.
 
-## [1.1.0] - 2026-07-12
+## [1.1.0-beta.1] - 2026-07-12
+
+### Release status
+
+- First public beta used to establish the release history required for a SignPath Foundation application.
+- This beta is explicitly unsigned and is not an official trusted release. Windows can show an unverified-publisher or SmartScreen warning.
 
 ### Added
 

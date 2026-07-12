@@ -2,6 +2,8 @@
 
 ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. Version 1.1 keeps capture local while adding adaptive hardware encoding, an in-app clip library, configurable global shortcuts, and a compact overlay/tray workflow.
 
+Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed under the [GNU General Public License v3.0 or later](LICENSE). Project-owned source code, build scripts, documentation, UI artwork, icons, and other assets use that license unless a file clearly says otherwise. Third-party software retains its own open-source license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Features
 
 - Replay lengths: 30 seconds; 1, 2, 3, 5, 10, 20, 30, or 40 minutes; and 1 hour.
@@ -92,7 +94,7 @@ Network access is limited to user-visible setup and maintenance:
 | Operation | When it happens | Data sent |
 | --- | --- | --- |
 | Install FFmpeg | The user selects **Install engine** | A normal HTTPS request for the pinned FFmpeg archive; no screen or audio content |
-| Check for updates | Automatically when enabled, or when the user selects **Check for updates** | A normal HTTPS request to the release host for update metadata; no clips or capture content |
+| Check for updates | After the user enables automatic checks, or when the user selects **Check for updates** | A normal HTTPS request to the release host for update metadata; no clips or capture content |
 | Download an update | The user accepts an available update | A normal HTTPS request for the ClipForge release package |
 
 Local data is kept in these locations:
@@ -124,6 +126,15 @@ Approximate storage for **1080p, 30 FPS, with audio**:
 | 1 hour | 3.73 GB |
 
 Leave additional room for segment overhead and the MP4 being saved. Higher frame rates and resolutions can increase both disk use and CPU load substantially; 2160p at 60 FPS can approach the estimator's 55 Mbps ceiling.
+
+## Uninstalling and removing local data
+
+1. Choose **Exit ClipForge** from the notification-area menu so ClipForge and its FFmpeg process have stopped.
+2. Open **Windows Settings > Apps > Installed apps**, find **ClipForge**, open its menu, and select **Uninstall**. A portable development build has no registered uninstaller; delete the folder into which it was extracted instead.
+3. Uninstalling the application does not intentionally delete personal clips or the separate ClipForge data folder. To remove settings, the optional FFmpeg install, thumbnails, and any leftover replay buffer, delete `%LOCALAPPDATA%\ClipForge` after ClipForge has exited.
+4. To remove saved recordings, delete the clips folder selected in ClipForge. Its default is `%USERPROFILE%\Videos\ClipForge`. Check that folder before deleting it because it contains the user's recordings, not disposable application files.
+
+Removing `%LOCALAPPDATA%\ClipForge` resets ClipForge if it is installed again. A cloud-sync provider may retain its own copies or deleted-file history when the selected clips folder is synchronized; consult that provider for complete removal.
 
 ## Package a portable development build
 
@@ -160,9 +171,15 @@ The manual GitHub Actions release workflow downloads the previous feed, builds a
 https://github.com/OWNER/REPOSITORY/releases/latest/download/ClipForge-Setup.exe
 ```
 
-Unsigned installers are appropriate for internal testing, but should not be described as an official trusted release. The workflow refuses to publish an unsigned run. A public build needs a user-provided Authenticode certificate or Azure Artifact Signing configuration; repository credentials and signing identities are intentionally not included in source control.
+Unsigned installers must not be described as official trusted releases. The workflow refuses immediate public publication when signing is unavailable. While the SignPath Foundation application is pending, a deliberately unsigned beta may be published manually as a GitHub **pre-release** only when its title and notes prominently warn that Windows will show an unverified publisher; it is never promoted as the latest stable download. A trusted public build requires a valid Authenticode signing route such as an accepted SignPath Foundation integration.
 
 See [docs/RELEASING.md](docs/RELEASING.md) for signing secrets, the GitHub workflow, release verification, and recovery guidance.
+
+## Code signing policy
+
+[Read the ClipForge Code signing policy](CODE_SIGNING_POLICY.md).
+
+ClipForge is preparing an application to the SignPath Foundation open-source program, but it has not been accepted. Current preview packages are unsigned. If accepted, releases will use the attribution "Free code signing provided by SignPath.io, certificate by SignPath Foundation," and every signing request will require manual approval. Do not interpret this statement as confirmation that SignPath has accepted or signed ClipForge.
 
 ## Current limitations
 
@@ -175,4 +192,4 @@ See [docs/RELEASING.md](docs/RELEASING.md) for signing secrets, the GitHub workf
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details and extension points, and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency notices.
 
-See [PRIVACY.md](PRIVACY.md) for the concise network and local-media policy, [SECURITY.md](SECURITY.md) for security boundaries and reporting, and [CHANGELOG.md](CHANGELOG.md) for release history.
+See [PRIVACY.md](PRIVACY.md) for the concise network and local-media policy, [SECURITY.md](SECURITY.md) for security boundaries and reporting, [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md) for release-signing governance, and [CHANGELOG.md](CHANGELOG.md) for release history.

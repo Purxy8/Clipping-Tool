@@ -10,7 +10,7 @@ public sealed class AppSettings
     public string? OutputAudioDeviceId { get; set; }
     public bool CaptureMicrophone { get; set; }
     public string? MicrophoneDeviceId { get; set; }
-    public bool CheckForUpdatesAutomatically { get; set; } = true;
+    public bool CheckForUpdatesAutomatically { get; set; }
     public HotkeyGesture SaveClipHotkey { get; set; } = HotkeyGesture.DefaultSaveClip;
     public HotkeyGesture ToggleOverlayHotkey { get; set; } = HotkeyGesture.DefaultToggleOverlay;
     public string SaveDirectory { get; set; } = GetDefaultSaveDirectory();
