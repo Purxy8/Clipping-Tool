@@ -17,6 +17,7 @@ public sealed class AppSettings
     public bool CaptureMicrophone { get; set; }
     public string? MicrophoneDeviceId { get; set; }
     public bool CheckForUpdatesAutomatically { get; set; }
+    public bool PlayClipSavedSound { get; set; } = true;
     public string BackgroundColor { get; set; } = DefaultBackgroundColor;
     public int RecentClipCount { get; set; } = 4;
     public HotkeyGesture SaveClipHotkey { get; set; } = HotkeyGesture.DefaultSaveClip;

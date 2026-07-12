@@ -21,58 +21,10 @@
         <local:ThumbnailPathConverter x:Key="ThumbnailPathConverter" />
 
         <Style x:Key="AnimatedQuietButtonStyle" TargetType="{x:Type Button}"
-               BasedOn="{StaticResource QuietButtonStyle}">
-            <Setter Property="RenderTransform">
-                <Setter.Value>
-                    <TranslateTransform Y="0" />
-                </Setter.Value>
-            </Setter>
-            <Style.Triggers>
-                <EventTrigger RoutedEvent="MouseEnter">
-                    <BeginStoryboard>
-                        <Storyboard>
-                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
-                                             To="-1" Duration="0:0:0.10" />
-                        </Storyboard>
-                    </BeginStoryboard>
-                </EventTrigger>
-                <EventTrigger RoutedEvent="MouseLeave">
-                    <BeginStoryboard>
-                        <Storyboard>
-                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
-                                             To="0" Duration="0:0:0.12" />
-                        </Storyboard>
-                    </BeginStoryboard>
-                </EventTrigger>
-            </Style.Triggers>
-        </Style>
+               BasedOn="{StaticResource QuietButtonStyle}" />
 
         <Style x:Key="AnimatedPrimaryButtonStyle" TargetType="{x:Type Button}"
-               BasedOn="{StaticResource PrimaryButtonStyle}">
-            <Setter Property="RenderTransform">
-                <Setter.Value>
-                    <TranslateTransform Y="0" />
-                </Setter.Value>
-            </Setter>
-            <Style.Triggers>
-                <EventTrigger RoutedEvent="MouseEnter">
-                    <BeginStoryboard>
-                        <Storyboard>
-                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
-                                             To="-1" Duration="0:0:0.10" />
-                        </Storyboard>
-                    </BeginStoryboard>
-                </EventTrigger>
-                <EventTrigger RoutedEvent="MouseLeave">
-                    <BeginStoryboard>
-                        <Storyboard>
-                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
-                                             To="0" Duration="0:0:0.12" />
-                        </Storyboard>
-                    </BeginStoryboard>
-                </EventTrigger>
-            </Style.Triggers>
-        </Style>
+               BasedOn="{StaticResource PrimaryButtonStyle}" />
 
         <Style x:Key="BackgroundSwatchButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
@@ -191,26 +143,7 @@
         </Style>
     </Window.Resources>
 
-    <Grid x:Name="RootLayout" Background="{DynamicResource UserBackgroundBrush}" Opacity="0">
-        <Grid.RenderTransform>
-            <TranslateTransform Y="10" />
-        </Grid.RenderTransform>
-        <Grid.Triggers>
-            <EventTrigger RoutedEvent="FrameworkElement.Loaded">
-                <BeginStoryboard>
-                    <Storyboard>
-                        <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                                         To="1" Duration="0:0:0.28" />
-                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
-                                         To="0" Duration="0:0:0.32">
-                            <DoubleAnimation.EasingFunction>
-                                <CubicEase EasingMode="EaseOut" />
-                            </DoubleAnimation.EasingFunction>
-                        </DoubleAnimation>
-                    </Storyboard>
-                </BeginStoryboard>
-            </EventTrigger>
-        </Grid.Triggers>
+    <Grid x:Name="RootLayout" Background="{DynamicResource UserBackgroundBrush}">
 
         <Grid.RowDefinitions>
             <RowDefinition Height="76" />
@@ -219,14 +152,14 @@
         </Grid.RowDefinitions>
 
         <!-- Header -->
-        <Grid Grid.Row="0" Margin="24,14,24,10">
+        <Grid x:Name="AppHeader" Grid.Row="0" Margin="24,14,24,10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
             <StackPanel Orientation="Horizontal">
-                <Border Width="46" Height="46" Margin="0,0,13,0"
+                <Border x:Name="BrandMark" Width="46" Height="46" Margin="0,0,13,0"
                         Background="{StaticResource AccentGradientBrush}" CornerRadius="14">
                     <Path Width="22" Height="22" HorizontalAlignment="Center" VerticalAlignment="Center"
                           Data="M 4,2 L 16,2 C 17.1,2 18,2.9 18,4 L 18,9 L 15,9 L 15,5 L 5,5 L 5,15 L 10,15 L 10,18 L 4,18 C 2.9,18 2,17.1 2,16 L 2,4 C 2,2.9 2.9,2 4,2 Z M 12,9 L 19,13.5 L 12,18 Z"
@@ -287,7 +220,7 @@
             </Grid.ColumnDefinitions>
 
             <!-- Settings sidebar -->
-            <Border Grid.Column="0" Background="{StaticResource SurfaceBrush}"
+            <Border x:Name="CaptureSidebar" Grid.Column="0" Background="{StaticResource SurfaceBrush}"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="18">
                 <Grid>
                     <Grid.RowDefinitions>
@@ -307,7 +240,8 @@
                         </StackPanel>
                         <Border Grid.Column="1" Padding="8,4" VerticalAlignment="Center"
                                 Background="{StaticResource AccentSoftBrush}" CornerRadius="7">
-                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource AccentHoverBrush}" Text="V1.2" />
+                                            <TextBlock x:Name="SidebarVersionText" FontSize="11" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource AccentHoverBrush}" Text="V1.3" />
                         </Border>
                     </Grid>
 
@@ -475,6 +409,20 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- Feedback -->
+                            <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
+                                <StackPanel>
+                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="FEEDBACK" />
+                                    <CheckBox x:Name="ClipSavedSoundCheckBox" Margin="0,10,0,0"
+                                              Content="Play a sound when a clip is saved" IsChecked="True"
+                                              Click="ClipSavedSoundCheckBox_Click"
+                                              Style="{StaticResource ToggleCheckBoxStyle}" />
+                                    <TextBlock Margin="0,7,0,0" Style="{StaticResource MutedTextStyle}"
+                                               Text="A short, quiet confirmation plays only after the MP4 is safely saved."
+                                               TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- Storage -->
                             <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
                                 <StackPanel>
@@ -532,7 +480,8 @@
                 </Grid.RowDefinitions>
 
                 <!-- Replay controls -->
-                <Border Grid.Row="0" Padding="18" Style="{StaticResource HeroCardStyle}" ClipToBounds="True">
+                <Border x:Name="ReplayHeroCard" Grid.Row="0" Padding="18"
+                        Style="{StaticResource HeroCardStyle}" ClipToBounds="True">
                     <Grid>
                         <Ellipse Width="260" Height="260" Margin="0,-190,-100,0" HorizontalAlignment="Right"
                                  VerticalAlignment="Top" Fill="{StaticResource AccentBrush}" Opacity="0.1" IsHitTestVisible="False" />
@@ -550,14 +499,15 @@
                                 <Button x:Name="BufferToggleButton" MinWidth="120" Margin="0,0,8,0" Content="Start replay"
                                         Click="BufferToggleButton_Click" Style="{StaticResource SecondaryButtonStyle}" />
                                 <Button x:Name="SaveClipButton" MinWidth="172" Content="Save last clip" IsEnabled="False"
-                                        Click="SaveClipButton_Click" Style="{StaticResource PrimaryButtonStyle}" />
+                                        Click="SaveClipButton_Click" Style="{StaticResource AnimatedPrimaryButtonStyle}" />
                             </StackPanel>
                         </Grid>
                     </Grid>
                 </Border>
 
                 <!-- Player -->
-                <Border Grid.Row="2" Padding="0" Style="{StaticResource CardStyle}" ClipToBounds="True">
+                <Border x:Name="PlayerCard" Grid.Row="2" Padding="0"
+                        Style="{StaticResource CardStyle}" ClipToBounds="True">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="64" />
@@ -691,7 +641,7 @@
                 </Border>
 
                 <!-- Recent gallery -->
-                <Border Grid.Row="4" Padding="16" Style="{StaticResource CardStyle}">
+                <Border x:Name="RecentClipsCard" Grid.Row="4" Padding="16" Style="{StaticResource CardStyle}">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -770,13 +720,21 @@
                 </Border>
 
                 <!-- Compatibility/latest saved state used by code and accessibility -->
-                <Border x:Name="LastSavedPanel" Grid.Row="2" Margin="18,72,18,64" Padding="10"
+                <Border x:Name="LastSavedPanel" Grid.Row="2" Panel.ZIndex="10"
+                        Margin="18,72,18,64" Padding="10"
                         VerticalAlignment="Top" HorizontalAlignment="Right" Background="#D9181C26"
                         BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="9"
-                        Visibility="Collapsed">
+                        Visibility="Collapsed" AutomationProperties.LiveSetting="Polite">
                     <StackPanel Orientation="Horizontal">
+                        <Border Width="26" Height="26" Margin="0,0,9,0" VerticalAlignment="Center"
+                                Background="{StaticResource SuccessSoftBrush}" CornerRadius="13">
+                            <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       FontSize="14" FontWeight="Bold" Foreground="{StaticResource SuccessBrush}"
+                                       Text="&#x2713;" />
+                        </Border>
                         <TextBlock x:Name="LastSavedText" MaxWidth="330" VerticalAlignment="Center"
-                                   Style="{StaticResource MutedTextStyle}" TextTrimming="CharacterEllipsis" />
+                                   Style="{StaticResource MutedTextStyle}" TextTrimming="CharacterEllipsis"
+                                   AutomationProperties.LiveSetting="Polite" />
                         <Button x:Name="OpenLastClipButton" Margin="8,0,0,0" Height="32" MinHeight="32" Padding="10,4"
                                 Content="Open" Click="OpenLastClipButton_Click" Style="{StaticResource QuietButtonStyle}" />
                     </StackPanel>

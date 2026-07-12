@@ -32,6 +32,7 @@ internal static class Program
             ("Updater channel selection", TestUpdaterChannelSelectionAsync),
             ("Default save directory", TestDefaultSaveDirectoryAsync),
             ("Background color policy", TestBackgroundColorPolicyAsync),
+            ("UI feedback helpers", TestUiFeedbackHelpersAsync),
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
@@ -118,6 +119,7 @@ internal static class Program
             defaults.BackgroundColor,
             "The default background color is incorrect.");
         Assert.Equal(4, defaults.RecentClipCount, "The recent clip gallery should default to four items.");
+        Assert.True(defaults.PlayClipSavedSound, "Saved-clip sound feedback should be enabled by default.");
         int[] expectedRecentClipCounts = [4, 8, 10, 15];
         Assert.SequenceEqual(
             expectedRecentClipCounts,
@@ -161,6 +163,44 @@ internal static class Program
             "#300000",
             AppSettings.NormalizeBackgroundColor("#FF0000"),
             "Tone limiting should preserve the requested hue.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestUiFeedbackHelpersAsync()
+    {
+        Assert.Equal(
+            0x00332211u,
+            NativeWindowThemeService.ToColorRef(0x11, 0x22, 0x33),
+            "Native title-bar colors must use Win32 COLORREF byte order.");
+
+        var wave = ClipSavedSoundService.CreateChimeWave();
+        Assert.Equal(19_244, wave.Length, "The in-memory confirmation chime has an unexpected size.");
+        Assert.SequenceEqual(
+            new byte[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' },
+            wave.Take(4),
+            "The confirmation chime is not a RIFF file.");
+        Assert.SequenceEqual(
+            new byte[] { (byte)'W', (byte)'A', (byte)'V', (byte)'E' },
+            wave.Skip(8).Take(4),
+            "The confirmation chime is not a WAVE stream.");
+        Assert.Equal(19_200, BitConverter.ToInt32(wave, 40), "The PCM data length is incorrect.");
+
+        var peak = Enumerable.Range(0, (wave.Length - 44) / sizeof(short))
+            .Select(index => Math.Abs((int)BitConverter.ToInt16(wave, 44 + (index * sizeof(short)))))
+            .Max();
+        Assert.True(peak > 0, "The confirmation chime must contain audible PCM samples.");
+        Assert.True(peak < short.MaxValue / 4, "The confirmation chime should remain deliberately quiet.");
+
+        var constructionTimer = Stopwatch.StartNew();
+        using (var soundService = new ClipSavedSoundService())
+        {
+            soundService.TryPlay(enabled: false);
+        }
+
+        constructionTimer.Stop();
+        Assert.True(
+            constructionTimer.Elapsed < TimeSpan.FromSeconds(2),
+            "Preparing optional sound feedback must not block application startup.");
         return Task.CompletedTask;
     }
 
@@ -699,6 +739,7 @@ internal static class Program
                 CaptureMicrophone = true,
                 MicrophoneDeviceId = "microphone-device",
                 CheckForUpdatesAutomatically = false,
+                PlayClipSavedSound = false,
                 BackgroundColor = "#161321",
                 RecentClipCount = 10,
                 SaveClipHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Alt, Key.F8),
@@ -722,6 +763,10 @@ internal static class Program
                 expected.CheckForUpdatesAutomatically,
                 actual.CheckForUpdatesAutomatically,
                 "Automatic update preference did not roundtrip.");
+            Assert.Equal(
+                expected.PlayClipSavedSound,
+                actual.PlayClipSavedSound,
+                "Saved-clip sound preference did not roundtrip.");
             Assert.Equal(
                 expected.BackgroundColor,
                 actual.BackgroundColor,
