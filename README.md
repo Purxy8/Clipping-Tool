@@ -1,6 +1,6 @@
 # ClipForge
 
-ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. Version 1.2 keeps capture local while adding complete in-app playback controls, a customizable dark background, conservative capture optimizations, and tighter media-library and update handling.
+ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. ClipForge keeps capture local while providing complete in-app playback controls, a customizable dark interface, conservative capture optimizations, and tightly scoped media-library and update handling.
 
 Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed under the [GNU General Public License v3.0 or later](LICENSE). Project-owned source code, build scripts, documentation, UI artwork, icons, and other assets use that license unless a file clearly says otherwise. Third-party software retains its own open-source license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -20,6 +20,8 @@ Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed u
 - Browse 4, 8, 10, or 15 recent ClipForge-generated clips in an adaptive, horizontally scrollable thumbnail gallery.
 - Right-click a recent clip to reveal it in File Explorer or permanently delete it after confirmation.
 - Choose from five dark app-background presets or a custom color. Bright custom colors are proportionally darkened to preserve readable contrast.
+- Use a native black Windows title bar and restrained startup/save transitions that honor High Contrast, reduced-motion, and rendering-capability preferences.
+- Receive a short confirmation chime after a clip is safely saved, with an option to disable it from the Feedback panel.
 - Runtime-tested NVIDIA NVENC, Intel Quick Sync, and AMD AMF H.264 encoding, with software H.264 as a compatibility fallback.
 - A live estimate of the disk space needed by the selected rolling buffer.
 - Settings remembered between launches.
@@ -76,7 +78,7 @@ For a managed or offline installation, place the exact pinned `ffmpeg.exe` and `
 5. Select **Start replay**. ClipForge begins building the rolling buffer on local disk.
 6. Select **Save last clip** or use the configured Save Clip shortcut after the buffer has content.
 
-The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. The player includes a timeline, elapsed/total time, play/pause, restart, 10-second skip controls, mute, and volume. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
+The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. After the save succeeds, ClipForge can play a short confirmation sound and show a compact in-app confirmation; disable the sound at any time from **Feedback**. The player includes a timeline, elapsed/total time, play/pause, restart, 10-second skip controls, mute, and volume. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
 
 The gallery automatically loads only top-level files using ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` naming format. Other MP4 files in the save folder are left untouched and are not automatically decoded by the embedded player. Use the selector above the gallery to show 4, 8, 10, or 15 recent clips; larger sets scroll horizontally. Right-clicking a card can reveal the revalidated file in Explorer or permanently delete that exact ClipForge recording after confirmation.
 

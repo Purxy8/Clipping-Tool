@@ -4,6 +4,30 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.4.0-beta.1] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- ClipForge now plays a short, original confirmation chime after an MP4 has been saved successfully. The sound is enabled by default and can be disabled from the new **Feedback** setting.
+- Successful saves show a compact animated confirmation panel while the main window is active. Its interactive **Open** action remains available until the panel is replaced or the window is hidden.
+
+### Changed
+
+- The main window keeps the native Windows caption and system buttons but now requests a black DWM title bar with light caption text. High Contrast mode retains the system-selected colors.
+- The app header, settings sidebar, replay controls, player, and gallery receive a short staggered startup reveal; refreshed gallery content and save confirmation use restrained opacity/translation transitions.
+- Optional movement is disabled when Windows client animations are disabled, High Contrast is active, or hardware rendering is unavailable. Static hover color states remain available without retaining animation clocks.
+- Sound preparation is asynchronous, playback begins only after the save operation succeeds, and all UI feedback remains outside the replay capture and encoding path.
+
+### Verification note
+
+- The native black title bar, system caption buttons, responsive settings panel, player, and gallery were visually checked in the real Windows development build.
+- The Release build completes with zero warnings and the deterministic suite passes 29/29 tests, including title-color encoding, confirmation-wave validation, settings persistence, and non-blocking sound-service construction.
+
 ## [1.3.0-beta.1] - 2026-07-13
 
 ### Release status

@@ -31,6 +31,8 @@ public partial class MainWindow : Window
     private readonly ClipLibraryService _clipLibraryService;
     private readonly GlobalHotkeyService _hotkeyService = new();
     private readonly TrayIconService _trayIconService;
+    private readonly NativeWindowThemeService _nativeWindowThemeService;
+    private readonly ClipSavedSoundService _clipSavedSoundService = new();
     private readonly DispatcherTimer _playerTimer;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _captureCommandGate = new(1, 1);
@@ -69,6 +71,7 @@ public partial class MainWindow : Window
         _appUpdateService.StateChanged += AppUpdateService_StateChanged;
 
         InitializeComponent();
+        _nativeWindowThemeService = new NativeWindowThemeService(this);
         _trayIconService = new TrayIconService();
         _trayIconService.ShowRequested += TrayIconService_ShowRequested;
         _trayIconService.SaveClipRequested += TrayIconService_SaveClipRequested;
@@ -91,6 +94,7 @@ public partial class MainWindow : Window
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
         Loaded -= MainWindow_Loaded;
+        RunStartupMotion();
 
         try
         {
@@ -178,6 +182,7 @@ public partial class MainWindow : Window
             ? AppSettings.GetDefaultSaveDirectory()
             : _settings.SaveDirectory;
         AutoUpdateCheckBox.IsChecked = _settings.CheckForUpdatesAutomatically;
+        ClipSavedSoundCheckBox.IsChecked = _settings.PlayClipSavedSound;
         RecentClipCountComboBox.ItemsSource = RecentClipCountOptions;
         RecentClipCountComboBox.SelectedItem = _settings.RecentClipCount;
         HotkeyText.Text = _settings.SaveClipHotkey.DisplayText;
@@ -264,6 +269,7 @@ public partial class MainWindow : Window
                 _settings.SaveDirectory,
                 _lifetimeCancellation.Token);
             ShowLastSaved(path);
+            _clipSavedSoundService.TryPlay(_settings.PlayClipSavedSound);
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
@@ -521,6 +527,7 @@ public partial class MainWindow : Window
         _settings.CaptureMicrophone = MicrophoneCheckBox.IsChecked == true;
         _settings.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceOption)?.Id;
         _settings.CheckForUpdatesAutomatically = AutoUpdateCheckBox.IsChecked == true;
+        _settings.PlayClipSavedSound = ClipSavedSoundCheckBox.IsChecked == true;
         _settings.BackgroundColor = NormalizeBackgroundColor(_settings.BackgroundColor);
         _settings.RecentClipCount = RecentClipCountComboBox.SelectedItem is int recentClipCount
             ? AppSettings.NormalizeRecentClipCount(recentClipCount)
@@ -883,9 +890,17 @@ public partial class MainWindow : Window
         var changed = !string.Equals(_lastSavedPath, path, StringComparison.OrdinalIgnoreCase);
         _lastSavedPath = path;
         LastSavedText.Text = $"{Path.GetFileName(path)} · saved";
-        LastSavedPanel.Visibility = Visibility.Visible;
         if (changed)
         {
+            if (IsVisible && IsActive)
+            {
+                UiMotionService.ShowSavedToast(LastSavedPanel);
+            }
+            else
+            {
+                LastSavedPanel.Visibility = Visibility.Collapsed;
+            }
+
             if (IsVisible && IsActive)
             {
                 _ = RefreshClipLibraryAsync(path);
@@ -899,6 +914,21 @@ public partial class MainWindow : Window
         }
     }
 
+    private void RunStartupMotion()
+    {
+        UiMotionService.RevealStartup(AppHeader, sequenceIndex: 0);
+        UiMotionService.RevealStartup(CaptureSidebar, sequenceIndex: 1);
+        UiMotionService.RevealStartup(ReplayHeroCard, sequenceIndex: 2);
+        UiMotionService.RevealStartup(PlayerCard, sequenceIndex: 3);
+        UiMotionService.RevealStartup(RecentClipsCard, sequenceIndex: 4);
+    }
+
+    private void CancelSavedToast()
+    {
+        LastSavedPanel.Visibility = Visibility.Collapsed;
+        LastSavedPanel.Opacity = 1;
+    }
+
     private void ShowError(string message)
     {
         ErrorText.Text = message;
@@ -910,6 +940,11 @@ public partial class MainWindow : Window
     private void InitializeUpdateControls()
     {
         VersionText.Text = $"v{ReleaseInfo.Version}";
+        var versionCore = ReleaseInfo.Version.Split('-', 2)[0].Split('+', 2)[0];
+        var versionParts = versionCore.Split('.');
+        SidebarVersionText.Text = versionParts.Length >= 2
+            ? $"V{versionParts[0]}.{versionParts[1]}"
+            : $"V{versionCore}";
         UpdateControlsForState(_appUpdateService.Snapshot);
     }
 
@@ -981,6 +1016,17 @@ public partial class MainWindow : Window
         {
             await RunAutomaticUpdateCheckAsync();
         }
+    }
+
+    private async void ClipSavedSoundCheckBox_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isClosing)
+        {
+            return;
+        }
+
+        SyncSettingsFromControls();
+        await PersistSettingsAsync();
     }
 
     private void AppUpdateService_StateChanged(object? sender, AppUpdateSnapshot snapshot)
@@ -1234,6 +1280,7 @@ public partial class MainWindow : Window
         }
 
         PausePlayerForBackgroundWork();
+        CancelSavedToast();
 
         Hide();
         if (!_backgroundHintShown)
@@ -1432,7 +1479,7 @@ public partial class MainWindow : Window
             if (string.Equals(_lastSavedPath, clip.FullPath, StringComparison.OrdinalIgnoreCase))
             {
                 _lastSavedPath = null;
-                LastSavedPanel.Visibility = Visibility.Collapsed;
+                CancelSavedToast();
             }
 
             await RefreshClipLibraryAsync();
@@ -1473,6 +1520,11 @@ public partial class MainWindow : Window
                 refreshCancellation.Token);
 
             RecentClipsItemsControl.ItemsSource = snapshot.Clips;
+            if (IsVisible && IsActive)
+            {
+                UiMotionService.CrossFadeRefresh(RecentClipsItemsControl);
+            }
+
             var selected = preferredPath is { Length: > 0 }
                 ? snapshot.Clips.FirstOrDefault(clip =>
                     clip.FullPath.Equals(preferredPath, StringComparison.OrdinalIgnoreCase))
@@ -1933,6 +1985,7 @@ public partial class MainWindow : Window
         IsEnabled = false;
         StatusText.Text = "Closing ClipForge…";
         _lifetimeCancellation.Cancel();
+        CancelSavedToast();
 
         try
         {
@@ -1978,6 +2031,8 @@ public partial class MainWindow : Window
             }
 
             _trayIconService.Dispose();
+            _nativeWindowThemeService.Dispose();
+            _clipSavedSoundService.Dispose();
             _appUpdateService.Dispose();
             _hotkeyService.Dispose();
             _settingsService.Dispose();
