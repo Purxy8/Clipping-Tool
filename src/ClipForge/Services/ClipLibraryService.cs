@@ -5,6 +5,7 @@ using System.Security;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using ClipForge.Models;
 
 namespace ClipForge.Services;
@@ -18,9 +19,16 @@ public sealed class ClipLibraryService
 
     private const int MaximumClipCount = 100;
     private const int MaximumDiscoveryCandidates = 4096;
+    private const int MinimumProbeCandidates = 20;
+    private const int ProbeCandidatesPerRequestedClip = 4;
     private const long MaximumThumbnailBytes = 16 * 1024 * 1024;
+    private static readonly Regex ClipForgeFileNamePattern = new(
+        @"\AClip_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.mp4\z",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
     private static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan DefaultThumbnailTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MaximumTotalProbeDuration = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MaximumTotalThumbnailDuration = TimeSpan.FromSeconds(20);
 
     private readonly Func<string?> _findFfmpeg;
     private readonly Func<string?> _findFfprobe;
@@ -99,9 +107,8 @@ public sealed class ClipLibraryService
         Path.Combine(SettingsService.GetDefaultSettingsDirectory(), "Cache", "Thumbnails");
 
     /// <summary>
-    /// Returns safely discovered clips in newest-first order. Corrupt media is skipped when ffprobe
-    /// is available; if the private tools are not installed yet, safe MP4 candidates remain visible
-    /// with an unknown duration and without a thumbnail.
+    /// Returns safely discovered clips in newest-first order. The gallery fails closed when the
+    /// pinned private probe is unavailable or cannot validate a candidate.
     /// </summary>
     public async Task<IReadOnlyList<ClipLibraryItem>> GetRecentClipsAsync(
         string saveDirectory,
@@ -125,17 +132,45 @@ public sealed class ClipLibraryService
         }
 
         var ffprobePath = GetSafeToolPath(_findFfprobe());
+        if (ffprobePath is null)
+        {
+            return Array.Empty<ClipLibraryItem>();
+        }
+
         var clips = new List<ClipLibraryItem>(count);
+        using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        probeBudget.CancelAfter(MaximumTotalProbeDuration);
+        var maximumProbes = Math.Min(
+            discovery.Candidates.Count,
+            Math.Max(MinimumProbeCandidates, checked(count * ProbeCandidatesPerRequestedClip)));
+        var probesStarted = 0;
 
         foreach (var candidate in discovery.Candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            ProbeOutcome probe = ffprobePath is null
-                ? ProbeOutcome.Unknown
-                : await ProbeAsync(ffprobePath, candidate.FullPath, cancellationToken).ConfigureAwait(false);
+            if (probesStarted >= maximumProbes)
+            {
+                break;
+            }
 
-            if (probe.State == ProbeState.Invalid)
+            probesStarted++;
+            ProbeOutcome probe;
+            try
+            {
+                probe = await ProbeAsync(
+                        ffprobePath,
+                        candidate.FullPath,
+                        probeBudget.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (
+                probeBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            if (probe.State != ProbeState.Valid)
             {
                 continue;
             }
@@ -155,14 +190,26 @@ public sealed class ClipLibraryService
 
         if (includeThumbnails && clips.Count > 0)
         {
+            using var thumbnailBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            thumbnailBudget.CancelAfter(MaximumTotalThumbnailDuration);
             for (var index = 0; index < clips.Count; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var thumbnail = await GetThumbnailAsync(
-                        discovery.RootDirectory,
-                        clips[index],
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                string? thumbnail;
+                try
+                {
+                    thumbnail = await GetThumbnailAsync(
+                            discovery.RootDirectory,
+                            clips[index],
+                            thumbnailBudget.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (
+                    thumbnailBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
                 clips[index] = clips[index] with { ThumbnailPath = thumbnail };
             }
         }
@@ -183,6 +230,20 @@ public sealed class ClipLibraryService
                 cancellationToken)
             .ConfigureAwait(false);
         return clips.Count == 0 ? ClipLibrarySnapshot.Empty : new ClipLibrarySnapshot(clips);
+    }
+
+    /// <summary>
+    /// Revalidates a discovered clip immediately before it is handed to an in-process media decoder.
+    /// </summary>
+    internal static bool IsCurrentClipSafe(string saveDirectory, ClipLibraryItem clip)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        var rootDirectory = TryGetSafeRootDirectory(saveDirectory);
+        return rootDirectory is not null &&
+               TryGetCurrentCandidate(rootDirectory, clip.FullPath, out var candidate) &&
+               candidate.FileName.Equals(clip.FileName, StringComparison.Ordinal) &&
+               candidate.Length == clip.FileSizeBytes &&
+               candidate.LastWriteTimeUtc == clip.RecordedAtUtc.UtcDateTime;
     }
 
     /// <summary>
@@ -315,7 +376,7 @@ public sealed class ClipLibraryService
         if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
             !Path.IsPathFullyQualified(rootDirectory) ||
             !Path.IsPathFullyQualified(candidatePath) ||
-            !Path.GetExtension(candidatePath).Equals(".mp4", StringComparison.OrdinalIgnoreCase))
+            !ClipForgeFileNamePattern.IsMatch(Path.GetFileName(candidatePath)))
         {
             return false;
         }
@@ -347,6 +408,8 @@ public sealed class ClipLibraryService
     internal static IReadOnlyList<string> BuildProbeArguments(string clipPath) =>
     [
         "-v", "error",
+        "-protocol_whitelist", "file",
+        "-f", "mov",
         "-select_streams", "v:0",
         "-show_entries", "stream=codec_type:format=duration",
         "-of", "json",
@@ -369,6 +432,8 @@ public sealed class ClipLibraryService
             "-nostdin",
             "-y",
             "-threads", "1",
+            "-protocol_whitelist", "file",
+            "-f", "mov",
             "-ss", seekSeconds.ToString("0.###", CultureInfo.InvariantCulture),
             "-i", clipPath,
             "-map", "0:v:0",
@@ -400,7 +465,7 @@ public sealed class ClipLibraryService
                 .ConfigureAwait(false);
             if (result.TimedOut)
             {
-                return ProbeOutcome.Unknown;
+                return ProbeOutcome.Invalid;
             }
 
             if (!result.Succeeded)
@@ -416,7 +481,7 @@ public sealed class ClipLibraryService
         }
         catch (Exception exception) when (IsExpectedMediaException(exception))
         {
-            return ProbeOutcome.Unknown;
+            return ProbeOutcome.Invalid;
         }
     }
 
@@ -725,14 +790,12 @@ public sealed class ClipLibraryService
 
     private enum ProbeState
     {
-        Unknown,
         Valid,
         Invalid
     }
 
     private readonly record struct ProbeOutcome(ProbeState State, TimeSpan? Duration)
     {
-        public static ProbeOutcome Unknown { get; } = new(ProbeState.Unknown, null);
         public static ProbeOutcome Invalid { get; } = new(ProbeState.Invalid, null);
     }
 }

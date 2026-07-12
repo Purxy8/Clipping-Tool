@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Security;
 using System.Text;
 using ClipForge.Capture;
 using ClipForge.Models;
@@ -12,6 +14,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
 {
     private const int MaximumDiagnosticLines = 60;
     private const int MaximumDiagnosticLineCharacters = 1000;
+    private static readonly TimeSpan CaptureHealthPollInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan BufferRefreshInterval = TimeSpan.FromSeconds(1);
 
     private readonly FfmpegSetupService _ffmpegSetupService;
     private readonly FfmpegCapabilityProbe _capabilityProbe = new();
@@ -23,6 +27,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly HashSet<string> _protectedSegments = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _diagnosticLines = new();
     private readonly List<WasapiAudioPipe> _audioPipes = [];
+    private readonly List<BufferedSegment> _segments = [];
 
     private Process? _captureProcess;
     private CancellationTokenSource? _sessionCancellation;
@@ -37,7 +42,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
         0);
     private string? _lastSavedPath;
     private string? _activeEncoderDescription;
+    private long _bufferBytes;
     private long _reportedDroppedAudioBlocks;
+    private int _nextSegmentNumber;
     private int _isRunning;
     private int _isSaving;
     private int _isStopping;
@@ -48,10 +55,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string? bufferRoot = null)
     {
         _ffmpegSetupService = ffmpegSetupService ?? new FfmpegSetupService();
-        _bufferRoot = Path.GetFullPath(bufferRoot ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        _bufferRoot = Path.GetFullPath(bufferRoot ?? GetDefaultBufferRoot());
+
+        // MainWindow creates this service only after primary single-instance
+        // ownership is established, so pre-existing sessions are crash residue.
+        CleanupStaleBuffers();
+    }
+
+    internal static string GetDefaultBufferRoot()
+    {
+        var localApplicationData = Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData);
+        using var process = Process.GetCurrentProcess();
+        return Path.Combine(
+            localApplicationData,
             "ClipForge",
-            "Buffer"));
+            "Buffer",
+            $"WindowsSession-{process.SessionId}");
     }
 
     public event EventHandler<ReplayStateSnapshot>? StateChanged;
@@ -117,12 +137,31 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     ?? throw new InvalidOperationException(
                         "The capture engine is not installed. Use Install engine and try again.");
 
+                EnsureSafeBufferRoot();
                 Directory.CreateDirectory(_bufferRoot);
+                EnsureSafeBufferRoot();
                 CleanupStaleBuffers();
                 _segmentDirectory = Path.Combine(
                     _bufferRoot,
                     $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+                EnsureSafeBufferRoot();
                 Directory.CreateDirectory(_segmentDirectory);
+                var sessionInfo = new DirectoryInfo(_segmentDirectory);
+                if (!sessionInfo.Exists ||
+                    !IsSafeBufferDirectoryPath(
+                        _bufferRoot,
+                        sessionInfo.FullName,
+                        sessionInfo.Attributes))
+                {
+                    throw new InvalidOperationException(
+                        "The replay buffer session path is not a regular local directory.");
+                }
+
+                lock (_fileGate)
+                {
+                    ResetSegmentIndexLocked();
+                }
+
                 _sessionCancellation = new CancellationTokenSource();
                 _reportedDroppedAudioBlocks = 0;
                 lock (_diagnosticGate)
@@ -321,17 +360,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
             TimeSpan actualDuration;
             lock (_fileGate)
             {
-                var completed = GetCompletedSegmentsLocked();
                 var requestedCount = checked((int)Math.Ceiling(
                     requestedDuration.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
-                var selectedCount = Math.Min(requestedCount, completed.Count);
+                var completed = GetCompletedSegmentsLocked(requestedCount);
+                var selectedCount = completed.Count;
                 if (selectedCount == 0)
                 {
                     throw new InvalidOperationException(
                         "The replay buffer is still warming up. Wait a moment and try again.");
                 }
 
-                selectedSegments = completed.TakeLast(selectedCount).ToArray();
+                selectedSegments = completed;
                 foreach (var path in selectedSegments)
                 {
                     _protectedSegments.Add(path);
@@ -536,6 +575,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         lock (_fileGate)
         {
             _protectedSegments.Clear();
+            ResetSegmentIndexLocked();
         }
 
         Volatile.Write(ref _isStopping, 0);
@@ -552,11 +592,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private async Task MonitorCaptureAsync(Process process, CancellationToken cancellationToken)
     {
+        using var healthTimer = new PeriodicTimer(CaptureHealthPollInterval);
+        var lastBufferRefresh = Stopwatch.GetTimestamp();
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (await healthTimer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
                 if (process.HasExited)
                 {
                     Volatile.Write(ref _isRunning, 0);
@@ -600,6 +642,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     return;
                 }
 
+                if (Stopwatch.GetElapsedTime(lastBufferRefresh) < BufferRefreshInterval)
+                {
+                    continue;
+                }
+
+                lastBufferRefresh = Stopwatch.GetTimestamp();
                 var droppedAudioBlocks = _audioPipes.Sum(pipe => pipe.DroppedSampleBlocks);
                 if (droppedAudioBlocks > _reportedDroppedAudioBlocks)
                 {
@@ -659,35 +707,36 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         lock (_fileGate)
         {
-            var allSegments = GetAllSegmentsLocked();
+            RefreshSegmentIndexLocked();
             var maximumCompletedSegments = checked((int)Math.Ceiling(
                 _retention.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
 
-            while (Math.Max(0, allSegments.Count - 1) > maximumCompletedSegments)
+            while (Math.Max(0, _segments.Count - 1) > maximumCompletedSegments)
             {
-                var candidate = allSegments.FirstOrDefault(path =>
-                    !_protectedSegments.Contains(path) &&
-                    !string.Equals(path, allSegments[^1], StringComparison.OrdinalIgnoreCase));
-                if (candidate is null)
+                var candidateIndex = _segments.FindIndex(0, _segments.Count - 1, segment =>
+                    !_protectedSegments.Contains(segment.Path));
+                if (candidateIndex < 0)
                 {
                     break;
                 }
 
-                if (!TryDeleteFile(candidate))
+                var candidate = _segments[candidateIndex];
+                if (!TryDeleteFile(candidate.Path))
                 {
                     break;
                 }
 
-                allSegments.Remove(candidate);
+                _bufferBytes = Math.Max(0, _bufferBytes - candidate.Length);
+                _segments.RemoveAt(candidateIndex);
             }
 
-            var completedCount = allSegments
-                .Take(Math.Max(0, allSegments.Count - 1))
-                .Count(path => GetFileLengthSafely(path) > 0);
+            var completedCount = _segments
+                .Take(Math.Max(0, _segments.Count - 1))
+                .Count(segment => segment.Length > 0);
             available = TimeSpan.FromSeconds(Math.Min(
                 _retention.TotalSeconds,
                 completedCount * FfmpegArgumentBuilder.SegmentSeconds));
-            bytes = allSegments.Sum(GetFileLengthSafely);
+            bytes = _bufferBytes;
         }
 
         var replayState = Volatile.Read(ref _isSaving) != 0
@@ -708,38 +757,89 @@ public sealed class ReplayBufferService : IAsyncDisposable
             lastSavedPath ?? _lastSavedPath));
     }
 
-    private List<string> GetCompletedSegmentsLocked()
+    private List<string> GetCompletedSegmentsLocked(int maximumCount)
     {
-        var all = GetAllSegmentsLocked();
-        if (IsRunning && all.Count > 0)
+        if (maximumCount <= 0)
         {
-            all.RemoveAt(all.Count - 1);
+            return [];
         }
 
-        all.RemoveAll(path => GetFileLengthSafely(path) <= 0);
+        RefreshSegmentIndexLocked();
+        var completedCount = _segments.Count;
+        if (IsRunning && completedCount > 0)
+        {
+            completedCount--;
+        }
 
-        return all;
+        // Revalidate only the tail needed by this export. A 30-second hotkey
+        // save therefore checks about 15 files, not all ~1,800 entries in a
+        // one-hour ring. Walk farther back only when a file disappeared.
+        var result = new List<string>(Math.Min(maximumCount, completedCount));
+        for (var index = completedCount - 1;
+             index >= 0 && result.Count < maximumCount;
+             index--)
+        {
+            var segment = _segments[index];
+            if (GetFileLengthSafely(segment.Path) > 0)
+            {
+                result.Add(segment.Path);
+            }
+        }
+
+        result.Reverse();
+        return result;
     }
 
-    private List<string> GetAllSegmentsLocked()
+    private void RefreshSegmentIndexLocked()
     {
         if (string.IsNullOrWhiteSpace(_segmentDirectory) ||
             !Directory.Exists(_segmentDirectory))
         {
-            return [];
+            return;
         }
 
-        try
+        // FFmpeg's segment muxer creates zero-padded, strictly increasing file
+        // names. Follow that sequence instead of enumerating, sorting, and
+        // stat'ing the entire one-hour ring on every health poll.
+        while (_nextSegmentNumber < int.MaxValue)
         {
-            return Directory
-                .EnumerateFiles(_segmentDirectory, "segment-*.mkv", SearchOption.TopDirectoryOnly)
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            var nextPath = Path.Combine(
+                _segmentDirectory,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"segment-{_nextSegmentNumber:D9}.mkv"));
+            if (!File.Exists(nextPath))
+            {
+                break;
+            }
+
+            UpdateNewestSegmentLengthLocked();
+            _segments.Add(new BufferedSegment(nextPath, 0));
+            _nextSegmentNumber++;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+
+        UpdateNewestSegmentLengthLocked();
+    }
+
+    private void UpdateNewestSegmentLengthLocked()
+    {
+        if (_segments.Count == 0)
         {
-            return [];
+            return;
         }
+
+        var newestIndex = _segments.Count - 1;
+        var newest = _segments[newestIndex];
+        var currentLength = GetFileLengthSafely(newest.Path);
+        _bufferBytes = Math.Max(0, _bufferBytes + currentLength - newest.Length);
+        _segments[newestIndex] = newest with { Length = currentLength };
+    }
+
+    private void ResetSegmentIndexLocked()
+    {
+        _segments.Clear();
+        _bufferBytes = 0;
+        _nextSegmentNumber = 0;
     }
 
     private static long GetFileLengthSafely(string path)
@@ -846,7 +946,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         _ = ProcessTuning.TryApplyLowImpactPriority(process);
 
-        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        // FFmpeg can repeat warnings for every frame. Drain stderr continuously
+        // so the process cannot block, but retain only the final bounded line
+        // instead of growing an in-memory string for the whole export.
+        var errorTask = ReadLastDiagnosticLineAsync(process.StandardError);
         try
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
@@ -854,18 +957,41 @@ public sealed class ReplayBufferService : IAsyncDisposable
         catch
         {
             TryKill(process);
+            _ = errorTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
             throw;
         }
 
         var error = await errorTask.ConfigureAwait(false);
         if (process.ExitCode != 0)
         {
-            var detail = error.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
             throw new InvalidOperationException(
-                string.IsNullOrWhiteSpace(detail)
+                string.IsNullOrWhiteSpace(error)
                     ? "The capture engine could not assemble the clip."
-                    : $"The capture engine could not assemble the clip. {detail}");
+                    : $"The capture engine could not assemble the clip. {error}");
         }
+    }
+
+    private static async Task<string?> ReadLastDiagnosticLineAsync(StreamReader reader)
+    {
+        string? lastLine = null;
+        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            var trimmed = line.Trim();
+            lastLine = trimmed.Length <= MaximumDiagnosticLineCharacters
+                ? trimmed
+                : trimmed[^MaximumDiagnosticLineCharacters..];
+        }
+
+        return lastLine;
     }
 
     private static Process CreateProcess(
@@ -936,14 +1062,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private void CleanupStaleBuffers()
     {
+        if (!IsSafeBufferRootPath(_bufferRoot))
+        {
+            return;
+        }
+
         try
         {
             foreach (var directory in Directory.EnumerateDirectories(_bufferRoot, "session-*"))
             {
-                if (Directory.GetCreationTimeUtc(directory) < DateTime.UtcNow.AddHours(-24))
-                {
-                    TryDeleteBufferDirectory(directory);
-                }
+                // Single-instance ownership is established before this service
+                // is created, so every pre-existing session is crash residue.
+                // Purge it immediately instead of retaining screen/audio data.
+                TryDeleteBufferDirectory(directory);
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
@@ -954,7 +1085,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private void TryDeleteBufferDirectory(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path))
+        if (string.IsNullOrWhiteSpace(path) || !IsSafeBufferRootPath(_bufferRoot))
         {
             return;
         }
@@ -963,7 +1094,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         {
             var directory = new DirectoryInfo(Path.GetFullPath(path));
             if (directory.Exists &&
-                IsSafeBufferDirectoryPath(_bufferRoot, directory.FullName, directory.Attributes))
+                IsSafeBufferDirectoryPath(_bufferRoot, directory.FullName, directory.Attributes) &&
+                IsSafeBufferRootPath(_bufferRoot))
             {
                 Directory.Delete(directory.FullName, recursive: true);
             }
@@ -986,6 +1118,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         if ((attributes & FileAttributes.Directory) == 0 ||
             (attributes & FileAttributes.ReparsePoint) != 0 ||
+            !IsSafeBufferRootPath(bufferRoot) ||
             !Path.IsPathFullyQualified(bufferRoot) ||
             !Path.IsPathFullyQualified(candidatePath))
         {
@@ -1007,6 +1140,70 @@ public sealed class ReplayBufferService : IAsyncDisposable
             exception is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Rejects an app-owned replay root when it or any existing ancestor is a
+    /// reparse point. Recursive cleanup must never traverse a junction or
+    /// symbolic link into an unrelated directory.
+    /// </summary>
+    internal static bool IsSafeBufferRootPath(string bufferRoot)
+    {
+        if (string.IsNullOrWhiteSpace(bufferRoot) ||
+            !Path.IsPathFullyQualified(bufferRoot))
+        {
+            return false;
+        }
+
+        try
+        {
+            var current = Path.TrimEndingDirectorySeparator(Path.GetFullPath(bufferRoot));
+            while (!string.IsNullOrWhiteSpace(current))
+            {
+                try
+                {
+                    var attributes = File.GetAttributes(current);
+                    if ((attributes & FileAttributes.Directory) == 0 ||
+                        (attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return false;
+                    }
+                }
+                catch (Exception exception) when (
+                    exception is FileNotFoundException or DirectoryNotFoundException)
+                {
+                    // A not-yet-created leaf is safe only if every existing
+                    // parent that will contain it is a regular directory.
+                }
+
+                var parent = Path.GetDirectoryName(current);
+                if (string.IsNullOrWhiteSpace(parent) ||
+                    parent.Equals(current, StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                current = parent;
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private void EnsureSafeBufferRoot()
+    {
+        if (!IsSafeBufferRootPath(_bufferRoot))
+        {
+            throw new InvalidOperationException(
+                "The replay buffer path or one of its parent folders is a junction or symbolic link. " +
+                "ClipForge refused to use it to protect unrelated files.");
         }
     }
 
@@ -1093,4 +1290,6 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private void ThrowIfDisposed() =>
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+    private readonly record struct BufferedSegment(string Path, long Length);
 }

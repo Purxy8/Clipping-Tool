@@ -10,7 +10,11 @@ public partial class App : System.Windows.Application
     private static void Main(string[] args)
     {
         ProcessSecurityService.Apply();
-        VelopackApp.Build().Run();
+        // Applying an update is always initiated explicitly from ClipForge's update panel.
+        // This prevents a previously staged package from being applied implicitly at startup.
+        VelopackApp.Build()
+            .SetAutoApplyOnStartup(false)
+            .Run();
 
         using var singleInstance = SingleInstanceService.Acquire();
         if (!singleInstance.IsPrimary)

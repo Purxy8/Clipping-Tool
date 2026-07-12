@@ -1,6 +1,6 @@
 # ClipForge
 
-ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. Version 1.1 keeps capture local while adding adaptive hardware encoding, an in-app clip library, configurable global shortcuts, and a compact overlay/tray workflow.
+ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. Version 1.2 keeps capture local while adding complete in-app playback controls, a customizable dark background, conservative capture optimizations, and tighter media-library and update handling.
 
 Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed under the [GNU General Public License v3.0 or later](LICENSE). Project-owned source code, build scripts, documentation, UI artwork, icons, and other assets use that license unless a file clearly says otherwise. Third-party software retains its own open-source license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -16,7 +16,9 @@ Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed u
 - Toggle a compact, always-on-top replay overlay with a second configurable shortcut (**Ctrl+Shift+F9** by default).
 - Close the main window to the notification area while replay continues; use the tray menu to reopen ClipForge, save a clip, or exit.
 - A second launch reopens the existing ClipForge instance instead of competing for capture devices or global shortcuts.
-- Play the latest saved clip in the app and browse the four most recent clips as a thumbnail gallery.
+- Play, pause, restart, seek, skip backward/forward 10 seconds, mute, and adjust the volume of the latest saved clip without opening another application.
+- Browse the four most recent ClipForge-generated clips as a thumbnail gallery.
+- Choose from five dark app-background presets or a custom color. Bright custom colors are proportionally darkened to preserve readable contrast.
 - Runtime-tested NVIDIA NVENC, Intel Quick Sync, and AMD AMF H.264 encoding, with software H.264 as a compatibility fallback.
 - A live estimate of the disk space needed by the selected rolling buffer.
 - Settings remembered between launches.
@@ -62,7 +64,7 @@ ClipForge uses FFmpeg as its local capture and MP4 engine. If it cannot find `ff
 
 The FFmpeg download is one of two optional network features. An installed release can also check its configured release host for update metadata and download an update after the user requests it. ClipForge does not download or redistribute FFmpeg while building the application.
 
-For a managed or offline installation, set `CLIPFORGE_FFMPEG_PATH` to either an `ffmpeg.exe` file or a directory containing it before launching ClipForge. The app also checks its own directory, `Tools\FFmpeg` beside the app, and the Windows `PATH`.
+For a managed or offline installation, place the exact pinned `ffmpeg.exe` and `ffprobe.exe` pair in `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg`, beside the application, or in `Tools\FFmpeg` beside the application. ClipForge verifies both executable SHA-256 values before use. Arbitrary `PATH` or `CLIPFORGE_FFMPEG_PATH` tools are ignored by default; developers can opt into them explicitly by setting `CLIPFORGE_DEVELOPER_MODE=1`, which deliberately bypasses the pinned-tool trust policy and must not be used for a production release.
 
 ## Using ClipForge
 
@@ -73,7 +75,9 @@ For a managed or offline installation, set `CLIPFORGE_FFMPEG_PATH` to either an 
 5. Select **Start replay**. ClipForge begins building the rolling buffer on local disk.
 6. Select **Save last clip** or use the configured Save Clip shortcut after the buffer has content.
 
-The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
+The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. The player includes a timeline, elapsed/total time, play/pause, restart, 10-second skip controls, mute, and volume. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
+
+The gallery automatically loads only top-level files using ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` naming format. Other MP4 files in the save folder are left untouched and are not automatically decoded by the embedded player.
 
 Select either shortcut in the left settings panel and press a new combination to change it. Each shortcut must contain at least one modifier and a non-modifier key, and Save Clip and Toggle Overlay must be different. If another application owns a chosen combination, ClipForge keeps the previous working registration and reports the conflict.
 
@@ -83,7 +87,9 @@ Closing the main window hides it to the notification area rather than stopping c
 
 At replay startup, ClipForge runs short, real encoding probes instead of assuming that an encoder compiled into FFmpeg is usable with the installed driver. It tries NVIDIA NVENC, Intel Quick Sync, and AMD AMF in that order, then falls back to software H.264. For a verified hardware encoder it tries direct Windows Graphics Capture first, a multi-GPU-compatible Windows Graphics Capture transfer second, and GDI desktop capture last. The active strategy is shown in the interface.
 
-The FFmpeg capture process runs at below-normal priority, and desktop/microphone PCM transfer is bounded so capture cannot grow an unlimited in-memory queue. Hardware encoding generally reduces CPU pressure, but performance still depends on the GPU driver, resolution, frame rate, game, and other software. The release smoke test samples normalized FFmpeg CPU use, working set, and process priority while producing and validating a real six-second clip; that diagnostic is evidence for the test machine, not a guarantee of zero input latency on every PC. Test the intended games, especially at 1440p/2160p or 60 FPS, before relying on a configuration.
+The FFmpeg capture process runs at below-normal priority, and desktop/microphone PCM transfer is bounded and reuses pooled buffers so capture cannot grow an unlimited in-memory queue. Replay retention now follows FFmpeg's sequential segment names incrementally instead of repeatedly enumerating and sorting the entire buffer, while media probes and thumbnail decoding also run below the foreground game's priority. The player position timer runs only while the visible, active window is playing a clip.
+
+These are conservative reductions in disk scans, allocation pressure, and background CPU contention; they do not change the captured format or promise zero lag. Hardware encoding generally reduces CPU pressure, but performance still depends on the GPU driver, resolution, frame rate, game, and other software. The release smoke test samples normalized FFmpeg CPU use, working set, and process priority while producing and validating a real six-second clip; that diagnostic is evidence for the test machine, not a guarantee of zero input latency on every PC. Test the intended games, especially at 1440p/2160p or 60 FPS, before relying on a configuration.
 
 ## Privacy and local data
 
@@ -104,7 +110,7 @@ Local data is kept in these locations:
 | Saved clips | The folder selected in the app; `%USERPROFILE%\Videos\ClipForge` by default |
 | Settings | `%LOCALAPPDATA%\ClipForge\settings.json` |
 | Private FFmpeg install | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
-| Rolling replay segments | `%LOCALAPPDATA%\ClipForge\Buffer` in a per-session folder removed when replay stops normally |
+| Rolling replay segments | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture folder removed when replay stops normally |
 
 Choosing a cloud-synced save folder, such as a OneDrive folder, can cause the operating system or another application to upload saved clips; ClipForge itself does not do so. A forced shutdown can leave temporary files behind; ClipForge removes stale session folders on a later launch. Avoid selecting a replay length larger than the available disk space.
 
@@ -134,7 +140,7 @@ Leave additional room for segment overhead and the MP4 being saved. Higher frame
 3. Uninstalling the application does not intentionally delete personal clips or the separate ClipForge data folder. To remove settings, the optional FFmpeg install, thumbnails, and any leftover replay buffer, delete `%LOCALAPPDATA%\ClipForge` after ClipForge has exited.
 4. To remove saved recordings, delete the clips folder selected in ClipForge. Its default is `%USERPROFILE%\Videos\ClipForge`. Check that folder before deleting it because it contains the user's recordings, not disposable application files.
 
-Removing `%LOCALAPPDATA%\ClipForge` resets ClipForge if it is installed again. A cloud-sync provider may retain its own copies or deleted-file history when the selected clips folder is synchronized; consult that provider for complete removal.
+Removing `%LOCALAPPDATA%\ClipForge` resets ClipForge, including the selected background color, if it is installed again. A cloud-sync provider may retain its own copies or deleted-file history when the selected clips folder is synchronized; consult that provider for complete removal.
 
 ## Package a portable development build
 
@@ -159,19 +165,21 @@ Restore the pinned Velopack 1.2.0 tool and create a versioned Windows installer:
 ```powershell
 dotnet tool restore
 .\scripts\release.ps1 `
-  -Version 1.1.0 `
+  -Version 1.2.0-beta.1 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY
 ```
 
 The release output contains `ClipForge-Setup.exe`, a portable ZIP, the full update package, Velopack feed metadata, and `SHA256SUMS.txt`. Use a permanent update URL: it is embedded in the installed application. Every published build must use a new semantic version; do not replace release files for a version users may already have installed.
 
-The manual GitHub Actions release workflow downloads the previous feed, builds and tests ClipForge, optionally signs the installer, and uploads a draft or public GitHub Release. Separate CI and CodeQL workflows verify pushes and pull requests, while Dependabot monitors NuGet, .NET SDK, and GitHub Actions dependencies. The release also attaches a stable friendly download name:
+The manual GitHub Actions release workflow downloads the previous feed, builds and tests ClipForge, optionally signs the installer, and uploads a draft or public GitHub Release. Separate CI and CodeQL workflows verify pushes and pull requests, while Dependabot monitors NuGet, .NET SDK, and GitHub Actions dependencies. A stable release also attaches a friendly download name:
 
 ```text
 https://github.com/OWNER/REPOSITORY/releases/latest/download/ClipForge-Setup.exe
 ```
 
 Unsigned installers must not be described as official trusted releases. The workflow refuses immediate public publication when signing is unavailable. While the SignPath Foundation application is pending, a deliberately unsigned beta may be published manually as a GitHub **pre-release** only when its title and notes prominently warn that Windows will show an unverified publisher; it is never promoted as the latest stable download. A trusted public build requires a valid Authenticode signing route such as an accepted SignPath Foundation integration.
+
+ClipForge disables Velopack's implicit apply-on-startup behavior. A downloaded update is applied only after the user selects **Restart to update**, allowing ClipForge to stop capture and shut down cleanly first. This improves control over when an update runs, but it does not solve publisher authentication: the current unsigned beta uses HTTPS, GitHub access controls, and feed/package checksums and does not pin a project signing key or Authenticode publisher in the client. Treat beta updates as previews and verify them on the GitHub release page until a signing route and client-side trust policy have been completed.
 
 See [docs/RELEASING.md](docs/RELEASING.md) for signing secrets, the GitHub workflow, release verification, and recovery guidance.
 

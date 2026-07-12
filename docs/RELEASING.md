@@ -32,7 +32,7 @@ Restore the pinned tool, then build an installer from the repository root:
 ```powershell
 dotnet tool restore
 .\scripts\release.ps1 `
-  -Version 1.1.0 `
+  -Version 1.2.0-beta.1 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY
 ```
 
@@ -67,7 +67,7 @@ First make the certificate available to `signtool.exe`, then pass the signing ar
 ```powershell
 $signing = '/sha1 CERTIFICATE_THUMBPRINT /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com'
 .\scripts\release.ps1 `
-  -Version 1.1.0 `
+  -Version 1.2.0-beta.1 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY `
   -SignParams $signing
 ```
@@ -90,7 +90,7 @@ Pass it to the release script:
 
 ```powershell
 .\scripts\release.ps1 `
-  -Version 1.1.0 `
+  -Version 1.2.0-beta.1 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY `
   -AzureTrustedSignFile C:\secure\clipforge-signing.json
 ```
@@ -158,7 +158,7 @@ For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the p
 2. ClipForge launches from the Start menu and Desktop shortcut.
 3. FFmpeg setup, replay capture, and clip saving work.
 4. The displayed application version matches the release.
-5. After publishing a newer version, **Check for updates**, download, and restart complete successfully.
+5. After publishing a newer version, **Check for updates**, download, and **Restart to update** complete successfully. Verify that a staged package is not applied merely by launching the app without that explicit action.
 
 Raw `dotnet run`, IDE, and portable publish builds are intentionally excluded from updater installation tests. Velopack updates only apply to a Velopack-installed copy.
 
@@ -176,7 +176,9 @@ https://github.com/OWNER/REPOSITORY/releases/latest/download/ClipForge-Setup.exe
 
 Keep the full package, update-feed files, and installer attached to every release; installed clients need the feed and packages to update.
 
-The existing local 1.0.0 build was created without an embedded GitHub update URL, so it cannot discover this first hosted release. Exit every old ClipForge tray instance and install the official 1.1.0 setup manually once. Builds installed from 1.1.0 onward use the permanent repository feed and can update in-app.
+The existing local 1.0.0 build was created without an embedded GitHub update URL, so it cannot discover hosted releases. The public 1.1.0-beta.1 client was configured to ignore later pre-releases, so moving from that beta to 1.2.0-beta.1 also requires one manual installer run after exiting every old ClipForge tray instance. From 1.2.0-beta.1 onward, beta versions include later pre-releases in update checks; stable versions continue to exclude them.
+
+Startup auto-apply is disabled in 1.2. A downloaded package is scheduled only when the user selects **Restart to update**, allowing the application shutdown path to stop capture first. This does not close the current authenticity gap: the unsigned beta uses HTTPS and Velopack checksums but does not pin a project signing key or expected Authenticode publisher in the client. Before publishing a trusted stable updater, complete a valid signing integration and an explicit client-side trust-enforcement/rotation design. Do not claim that checksum validation alone authenticates the ClipForge publisher.
 
 If a release has a serious defect, do not replace its files in place and do not publish an older version under the same channel. Fix the issue, increment the version, and publish a new release. A GitHub release can be changed from public to draft to stop new manual downloads, but already installed clients may have cached metadata, so a forward-fix release is the dependable recovery path.
 

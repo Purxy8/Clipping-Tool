@@ -2,7 +2,7 @@
 
 ## Supported releases
 
-Security fixes are provided for the latest stable ClipForge release. Users should install updates from the in-app update panel or the official GitHub release page.
+Security fixes are provided for the latest supported ClipForge release in its published channel. Stable users should install the latest stable release; beta users should install the newest explicitly labeled pre-release. The public beta is unsigned and is not equivalent to a trusted stable release.
 
 ## Reporting a vulnerability
 
@@ -12,11 +12,19 @@ Do not publish an exploitable vulnerability, private recording, credential, cert
 
 - ClipForge runs as the signed-in user and never requests administrator privileges.
 - Screen and audio media remain in local memory, named pipes, the replay buffer, and the user-selected clips folder. There is no clip upload feature or telemetry.
-- Audio named pipes are limited to the current Windows user, and replay cleanup refuses reparse points and paths outside ClipForge's buffer root.
+- Audio named pipes are limited to the current Windows user. Replay roots are separated by Windows logon-session ID so simultaneous RDP/local sessions do not clean one another's buffers. Cleanup rejects a buffer root or existing ancestor that is a reparse point and deletes only regular direct `session-*` children; abandoned sessions in the current logon scope are purged after single-instance ownership is established on the next launch.
 - External processes are launched with explicit executable paths and argument lists, without a command shell.
-- The bundled update integration accepts HTTPS feeds. Trusted/stable releases are required to pass Authenticode verification in the release workflow; a pending-SignPath unsigned preview may be public only when it is conspicuously labeled as an unsigned pre-release.
-- The optional FFmpeg installer downloads a pinned archive and verifies its SHA-256 digest before extraction.
+- The clip gallery auto-loads only top-level files using ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` naming format. Its FFprobe and thumbnail processes force the MOV/MP4 demuxer and allow only the local `file` protocol.
+- The bundled update integration accepts HTTPS feeds. Applying a staged update requires an explicit **Restart to update** action; automatic application at process startup is disabled so capture can shut down cleanly first.
+- Trusted/stable releases are required to pass Authenticode verification in the release workflow; a pending-SignPath unsigned preview may be public only when it is conspicuously labeled as an unsigned pre-release.
+- The optional FFmpeg installer requires a declared size, enforces download/extraction limits, downloads a pinned archive over HTTPS, verifies its SHA-256 digest, and verifies the pinned SHA-256 of both extracted executables. Normal production discovery ignores arbitrary `PATH` tools and rejects reparse-point tool paths.
 - Process startup enables the restricted Windows DLL search policy to reduce DLL preloading risk.
 - GitHub CI, CodeQL, Dependabot, and NuGet vulnerability auditing provide continuous checks; they supplement rather than replace code review and runtime testing.
+
+## Known update-authenticity limitation
+
+The current beta is unsigned. HTTPS protects transport and Velopack feed/package checksums detect accidental or inconsistent package corruption, but the client does not yet pin a ClipForge project signing key or an expected Authenticode publisher. A compromised release account or feed could therefore publish a higher-version package with matching feed metadata. Disabling startup auto-apply limits surprise installation timing; it does not authenticate the publisher.
+
+Until a public signing route is accepted, successfully exercised, and enforced by a client-side trust policy, treat in-app beta updates as previews. Verify the release tag and published SHA-256 value on the official GitHub release page before installing. Do not describe an unsigned beta as trusted or officially signed.
 
 No desktop application can guarantee protection from an already-compromised Windows account, administrator, kernel driver, screen-injection tool, or malicious software with equal or higher privileges. Code signing proves publisher identity and detects modification; it does not make unsafe code invulnerable.

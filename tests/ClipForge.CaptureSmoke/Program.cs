@@ -40,7 +40,7 @@ try
     var microphones = discovery.GetMicrophones();
     Console.WriteLine($"Devices: {displays.Count} display(s), {outputs.Count} output(s), {microphones.Count} microphone(s)");
 
-    var display = displays.FirstOrDefault()
+    var display = displays.FirstOrDefault(candidate => candidate.IsPrimary) ?? displays.FirstOrDefault()
         ?? throw new InvalidOperationException("No display was available for the capture smoke test.");
     var includeSystemAudio = args.Contains("--audio", StringComparer.OrdinalIgnoreCase) && outputs.Count > 0;
     var includeMicrophone = args.Contains("--microphone", StringComparer.OrdinalIgnoreCase) && microphones.Count > 0;

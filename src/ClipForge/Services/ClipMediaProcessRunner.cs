@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text;
+using ClipForge.Capture;
 
 namespace ClipForge.Services;
 
@@ -50,6 +51,11 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
         {
             throw new Win32Exception("The media helper process could not be started.");
         }
+
+        // Thumbnail decoding and metadata probes are presentation work. Keep
+        // them below the foreground game's CPU priority just like the capture
+        // and export processes.
+        _ = ProcessTuning.TryApplyLowImpactPriority(process);
 
         var outputTask = ReadBoundedAsync(process.StandardOutput);
         var errorTask = ReadBoundedAsync(process.StandardError);
@@ -181,4 +187,3 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
         }
     }
 }
-

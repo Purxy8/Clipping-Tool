@@ -23,14 +23,20 @@ internal static class Program
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
             ("FFmpeg concat arguments", TestConcatArgumentsAsync),
             ("Configured FFmpeg discovery", TestConfiguredFfmpegDiscoveryAsync),
+            ("Pinned FFmpeg trust policy", TestPinnedFfmpegTrustPolicyAsync),
+            ("FFmpeg download byte limits", TestFfmpegDownloadLimitsAsync),
             ("Release metadata", TestReleaseMetadataAsync),
             ("Unconfigured updater is non-fatal", TestUnconfiguredUpdaterAsync),
+            ("Updater channel selection", TestUpdaterChannelSelectionAsync),
             ("Default save directory", TestDefaultSaveDirectoryAsync),
+            ("Background color policy", TestBackgroundColorPolicyAsync),
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
             ("Secure clip discovery and thumbnail cache", TestClipLibraryAsync),
             ("Clip path and media process hardening", TestClipLibrarySecurityPolicyAsync),
+            ("Clip library fail-closed probing", TestClipLibraryFailClosedAsync),
+            ("Clip library probe budget", TestClipLibraryProbeBudgetAsync),
             ("Runtime local-data boundaries", TestRuntimeLocalDataBoundariesAsync),
             ("Clip library cancellation", TestClipLibraryCancellationAsync)
         ];
@@ -103,11 +109,44 @@ internal static class Program
             !new AppSettings().CheckForUpdatesAutomatically,
             "Automatic update checks should require explicit opt-in.");
         var defaults = new AppSettings();
+        Assert.Equal(
+            AppSettings.DefaultBackgroundColor,
+            defaults.BackgroundColor,
+            "The default background color is incorrect.");
         Assert.Equal(HotkeyGesture.DefaultSaveClip, defaults.SaveClipHotkey, "The Save Clip hotkey default is incorrect.");
         Assert.Equal(
             HotkeyGesture.DefaultToggleOverlay,
             defaults.ToggleOverlayHotkey,
             "The Toggle Overlay hotkey default is incorrect.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestBackgroundColorPolicyAsync()
+    {
+        Assert.Equal(
+            AppSettings.DefaultBackgroundColor,
+            AppSettings.NormalizeBackgroundColor(null),
+            "A missing background color must use the safe default.");
+        Assert.Equal(
+            AppSettings.DefaultBackgroundColor,
+            AppSettings.NormalizeBackgroundColor("red"),
+            "Malformed persisted color text must use the safe default.");
+        Assert.Equal(
+            "#161321",
+            AppSettings.NormalizeBackgroundColor("#161321"),
+            "A valid dark preset should remain unchanged.");
+        Assert.Equal(
+            "#0D1A19",
+            AppSettings.NormalizeBackgroundColor("#0d1a19"),
+            "Valid hex should be stored canonically.");
+        Assert.Equal(
+            "#303030",
+            AppSettings.NormalizeBackgroundColor("#FFFFFF"),
+            "A bright neutral custom color should be darkened for readable fixed typography.");
+        Assert.Equal(
+            "#300000",
+            AppSettings.NormalizeBackgroundColor("#FF0000"),
+            "Tone limiting should preserve the requested hue.");
         return Task.CompletedTask;
     }
 
@@ -151,6 +190,20 @@ internal static class Program
         Assert.True(!service.CanCheck, "A raw developer build must not make update network requests.");
         await service.CheckAsync().ConfigureAwait(false);
         Assert.Equal(AppUpdateState.Disabled, service.Snapshot.State, "A disabled update check should remain non-fatal.");
+    }
+
+    private static Task TestUpdaterChannelSelectionAsync()
+    {
+        Assert.True(
+            !AppUpdateService.ShouldIncludePrereleases("1.2.0"),
+            "Stable builds must not discover pre-release updates.");
+        Assert.True(
+            AppUpdateService.ShouldIncludePrereleases("1.2.0-beta.1"),
+            "Beta builds must be able to discover the next beta update.");
+        Assert.True(
+            AppUpdateService.ShouldIncludePrereleases("2.0.0-rc.2+build.5"),
+            "Release-candidate builds must remain on the pre-release channel.");
+        return Task.CompletedTask;
     }
 
     private static Task TestCaptureArgumentsAsync()
@@ -472,6 +525,7 @@ internal static class Program
     {
         var testDirectory = CreateTestDirectory();
         var previous = Environment.GetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH");
+        var previousDeveloperMode = Environment.GetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE");
 
         try
         {
@@ -479,6 +533,7 @@ internal static class Program
             var executable = Path.Combine(testDirectory, "ffmpeg.exe");
             File.WriteAllBytes(executable, [0x4D, 0x5A]);
             Environment.SetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH", executable);
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", "1");
 
             var service = new FfmpegSetupService(Path.Combine(testDirectory, "private"));
             Assert.Equal(
@@ -489,10 +544,100 @@ internal static class Program
         finally
         {
             Environment.SetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH", previous);
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", previousDeveloperMode);
             DeleteTestDirectory(testDirectory);
         }
 
         return Task.CompletedTask;
+    }
+
+    private static Task TestPinnedFfmpegTrustPolicyAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var previousPath = Environment.GetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH");
+        var previousDeveloperMode = Environment.GetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE");
+
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            var fakePrivateTool = Path.Combine(testDirectory, "ffmpeg.exe");
+            File.WriteAllBytes(fakePrivateTool, [0x4D, 0x5A, 1, 2, 3]);
+            Environment.SetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH", fakePrivateTool);
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", null);
+
+            var service = new FfmpegSetupService(testDirectory);
+            Assert.Equal<string?>(
+                null,
+                service.FindExecutable(),
+                "Production discovery must reject an unverified private or environment-provided FFmpeg binary.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH", previousPath);
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", previousDeveloperMode);
+            DeleteTestDirectory(testDirectory);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFfmpegDownloadLimitsAsync()
+    {
+        await using (var source = new MemoryStream([1, 2, 3, 4]))
+        await using (var destination = new MemoryStream())
+        {
+            await FfmpegSetupService.CopyWithProgressAsync(
+                    source,
+                    destination,
+                    totalBytes: 4,
+                    maximumBytes: 4,
+                    progress: null,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.Equal(4L, destination.Length, "A download at the exact byte limit should succeed.");
+        }
+
+        var oversizedRejected = false;
+        try
+        {
+            await using var source = new MemoryStream([1, 2, 3, 4, 5]);
+            await using var destination = new MemoryStream();
+            await FfmpegSetupService.CopyWithProgressAsync(
+                    source,
+                    destination,
+                    totalBytes: 4,
+                    maximumBytes: 4,
+                    progress: null,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidDataException)
+        {
+            oversizedRejected = true;
+        }
+
+        Assert.True(oversizedRejected, "A chunked response that exceeds its hard byte cap must be rejected.");
+
+        var missingLengthRejected = false;
+        try
+        {
+            await using var source = new MemoryStream([1]);
+            await using var destination = new MemoryStream();
+            await FfmpegSetupService.CopyWithProgressAsync(
+                    source,
+                    destination,
+                    totalBytes: null,
+                    maximumBytes: 4,
+                    progress: null,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidDataException)
+        {
+            missingLengthRejected = true;
+        }
+
+        Assert.True(missingLengthRejected, "A download without a declared size must be rejected.");
     }
 
     private static Task TestStorageEstimatorAsync()
@@ -539,6 +684,7 @@ internal static class Program
                 CaptureMicrophone = true,
                 MicrophoneDeviceId = "microphone-device",
                 CheckForUpdatesAutomatically = false,
+                BackgroundColor = "#161321",
                 SaveClipHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Alt, Key.F8),
                 ToggleOverlayHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Shift, Key.O),
                 SaveDirectory = Path.Combine(testDirectory, "Clips")
@@ -560,6 +706,10 @@ internal static class Program
                 expected.CheckForUpdatesAutomatically,
                 actual.CheckForUpdatesAutomatically,
                 "Automatic update preference did not roundtrip.");
+            Assert.Equal(
+                expected.BackgroundColor,
+                actual.BackgroundColor,
+                "Background color did not roundtrip.");
             Assert.Equal(expected.SaveClipHotkey, actual.SaveClipHotkey, "Save Clip hotkey did not roundtrip.");
             Assert.Equal(
                 expected.ToggleOverlayHotkey,
@@ -634,10 +784,10 @@ internal static class Program
             await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
             await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
 
-            var oldest = Path.Combine(clipsDirectory, "older.MP4");
-            var newest = Path.Combine(clipsDirectory, "Clip & pretend-command.mp4");
-            var corrupt = Path.Combine(clipsDirectory, "corrupt.mp4");
-            var empty = Path.Combine(clipsDirectory, "empty.mp4");
+            var oldest = Path.Combine(clipsDirectory, "Clip_2026-01-01_01-00-00.MP4");
+            var newest = Path.Combine(clipsDirectory, "Clip_2026-01-02_01-00-00_2.mp4");
+            var corrupt = Path.Combine(clipsDirectory, "Clip_2026-01-03_01-00-00.mp4");
+            var empty = Path.Combine(clipsDirectory, "Clip_2026-01-04_01-00-00.mp4");
             await File.WriteAllBytesAsync(oldest, [1, 2, 3]).ConfigureAwait(false);
             await File.WriteAllBytesAsync(newest, [4, 5, 6]).ConfigureAwait(false);
             await File.WriteAllBytesAsync(corrupt, [7, 8, 9]).ConfigureAwait(false);
@@ -646,7 +796,7 @@ internal static class Program
                 .ConfigureAwait(false);
             Directory.CreateDirectory(Path.Combine(clipsDirectory, "Nested"));
             await File.WriteAllBytesAsync(
-                    Path.Combine(clipsDirectory, "Nested", "nested.mp4"),
+                    Path.Combine(clipsDirectory, "Nested", "Clip_2026-01-05_01-00-00.mp4"),
                     [10, 11, 12])
                 .ConfigureAwait(false);
 
@@ -701,6 +851,13 @@ internal static class Program
                 clips[0].ThumbnailPath,
                 secondLoad[0].ThumbnailPath,
                 "An unchanged clip must have a deterministic thumbnail cache key.");
+            Assert.True(
+                ClipLibraryService.IsCurrentClipSafe(clipsDirectory, clips[0]),
+                "A freshly discovered unchanged recording should pass the pre-playback identity check.");
+            await File.AppendAllTextAsync(clips[0].FullPath, "changed after discovery").ConfigureAwait(false);
+            Assert.True(
+                !ClipLibraryService.IsCurrentClipSafe(clipsDirectory, clips[0]),
+                "A recording changed after discovery must be rejected before in-process playback.");
         }
         finally
         {
@@ -711,9 +868,9 @@ internal static class Program
     private static Task TestClipLibrarySecurityPolicyAsync()
     {
         var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "ClipForge-Security-Root"));
-        var valid = Path.Combine(root, "Clip.mp4");
-        var nested = Path.Combine(root, "Nested", "Clip.mp4");
-        var traversal = Path.Combine(root, "..", "outside.mp4");
+        var valid = Path.Combine(root, "Clip_2026-07-12_18-30-00.mp4");
+        var nested = Path.Combine(root, "Nested", "Clip_2026-07-12_18-30-00.mp4");
+        var traversal = Path.Combine(root, "..", "Clip_2026-07-12_18-30-00.mp4");
 
         Assert.True(
             ClipLibraryService.IsSafeTopLevelClipPath(root, valid, FileAttributes.Normal),
@@ -730,6 +887,15 @@ internal static class Program
         Assert.True(
             !ClipLibraryService.IsSafeTopLevelClipPath(root, $"{valid}.exe", FileAttributes.Normal),
             "A disguised executable must not be treated as MP4 media.");
+        Assert.True(
+            !ClipLibraryService.IsSafeTopLevelClipPath(
+                root,
+                Path.Combine(root, "downloaded-video.mp4"),
+                FileAttributes.Normal),
+            "The in-app gallery must not auto-decode unrelated MP4 files from the save folder.");
+
+        var probeArguments = ClipLibraryService.BuildProbeArguments(valid);
+        Assert.ContainsSequence(probeArguments, "-protocol_whitelist", "file", "-f", "mov");
 
         string[] arguments = ["-i", valid, "argument & not-a-command"];
         var startInfo = ClipMediaProcessRunner.CreateStartInfo(@"C:\Tools\ffmpeg.exe", arguments);
@@ -741,16 +907,123 @@ internal static class Program
             valid,
             Path.Combine(root, "thumbnail.jpg"),
             TimeSpan.FromSeconds(20));
-        Assert.ContainsSequence(thumbnailArguments, "-nostdin", "-y", "-threads", "1");
+        Assert.ContainsSequence(
+            thumbnailArguments,
+            "-nostdin", "-y", "-threads", "1", "-protocol_whitelist", "file", "-f", "mov");
         Assert.ContainsSequence(thumbnailArguments, "-i", valid, "-map", "0:v:0");
         return Task.CompletedTask;
     }
 
-    private static Task TestRuntimeLocalDataBoundariesAsync()
+    private static async Task TestClipLibraryProbeBudgetAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+            for (var index = 0; index < 40; index++)
+            {
+                await File.WriteAllBytesAsync(
+                        Path.Combine(clipsDirectory, $"Clip_2026-07-12_18-30-{index:00}.mp4"),
+                        [1, 2, 3])
+                    .ConfigureAwait(false);
+            }
+
+            var runner = new FakeClipMediaProcessRunner { RejectAllProbes = true };
+            var service = new ClipLibraryService(
+                () => null,
+                () => ffprobePath,
+                runner,
+                Path.Combine(testDirectory, "Cache"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+
+            var clips = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 5,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(0, clips.Count, "Invalid media must not be returned by the gallery.");
+            Assert.Equal(
+                20,
+                runner.Invocations.Count,
+                "A folder full of invalid recordings must not launch an unbounded number of probe processes.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestClipLibraryFailClosedAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipPath = Path.Combine(testDirectory, "Clip_2026-07-12_18-30-00.mp4");
+        var probePath = Path.Combine(testDirectory, "ffprobe.exe");
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            await File.WriteAllBytesAsync(clipPath, [1, 2, 3]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(probePath, [0x4D, 0x5A]).ConfigureAwait(false);
+
+            var missingProbeRunner = new FakeClipMediaProcessRunner();
+            var missingProbeService = new ClipLibraryService(
+                () => null,
+                () => null,
+                missingProbeRunner,
+                Path.Combine(testDirectory, "Cache-Missing"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+            var withoutProbe = await missingProbeService.GetRecentClipsAsync(
+                    testDirectory,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(0, withoutProbe.Count, "The gallery must fail closed when ffprobe is unavailable.");
+            Assert.Equal(0, missingProbeRunner.Invocations.Count, "No helper should run without a trusted probe path.");
+
+            var timeoutRunner = new FakeClipMediaProcessRunner { TimeOutAllProbes = true };
+            var timeoutService = new ClipLibraryService(
+                () => null,
+                () => probePath,
+                timeoutRunner,
+                Path.Combine(testDirectory, "Cache-Timeout"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+            var afterTimeout = await timeoutService.GetRecentClipsAsync(
+                    testDirectory,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(0, afterTimeout.Count, "A timed-out media probe must not reach embedded playback.");
+            Assert.Equal(1, timeoutRunner.Invocations.Count, "The timed-out candidate should be probed once.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRuntimeLocalDataBoundariesAsync()
     {
         Assert.True(
             WasapiAudioPipe.ServerPipeOptions.HasFlag(PipeOptions.CurrentUserOnly),
             "The private audio pipe must reject clients running as another Windows user.");
+
+        using (var process = Process.GetCurrentProcess())
+        {
+            var defaultBufferRoot = ReplayBufferService.GetDefaultBufferRoot();
+            Assert.Equal(
+                $"WindowsSession-{process.SessionId}",
+                Path.GetFileName(defaultBufferRoot),
+                "Replay buffers must be separated between simultaneous Windows logon sessions.");
+            Assert.Equal(
+                "Buffer",
+                Path.GetFileName(Path.GetDirectoryName(defaultBufferRoot)),
+                "The session-scoped replay root should remain below ClipForge's Buffer directory.");
+        }
 
         var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "ClipForge-Buffer-Root"));
         var session = Path.Combine(root, "session-20260712-test");
@@ -782,7 +1055,77 @@ internal static class Program
                 FileAttributes.Directory),
             "Replay cleanup must only delete ClipForge session directories.");
 
-        return Task.CompletedTask;
+        var testDirectory = CreateTestDirectory();
+        string? linkPath = null;
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            Assert.True(
+                ReplayBufferService.IsSafeBufferRootPath(
+                    Path.Combine(testDirectory, "ClipForge", "Buffer")),
+                "A not-yet-created buffer below regular ancestors should pass the root policy.");
+            Assert.True(
+                !ReplayBufferService.IsSafeBufferRootPath(Path.Combine("relative", "Buffer")),
+                "A relative buffer root must be rejected.");
+
+            var regularFile = Path.Combine(testDirectory, "not-a-directory");
+            File.WriteAllText(regularFile, "regular file");
+            Assert.True(
+                !ReplayBufferService.IsSafeBufferRootPath(regularFile),
+                "A regular file must not be accepted as a replay buffer root or ancestor.");
+
+            var linkTarget = Path.Combine(testDirectory, "LinkTarget");
+            Directory.CreateDirectory(linkTarget);
+            linkPath = Path.Combine(testDirectory, "LinkedRoot");
+            try
+            {
+                Directory.CreateSymbolicLink(linkPath, linkTarget);
+                Assert.True(
+                    !ReplayBufferService.IsSafeBufferRootPath(linkPath),
+                    "A symbolic-link buffer root must be rejected.");
+                var linkedBuffer = Path.Combine(linkPath, "Buffer");
+                Assert.True(
+                    !ReplayBufferService.IsSafeBufferRootPath(linkedBuffer),
+                    "A buffer root below a symbolic-link ancestor must be rejected.");
+                Assert.True(
+                    !ReplayBufferService.IsSafeBufferDirectoryPath(
+                        linkedBuffer,
+                        Path.Combine(linkedBuffer, "session-20260712-test"),
+                        FileAttributes.Directory),
+                    "Session cleanup must reject a buffer root chain containing a symbolic link.");
+            }
+            catch (Exception exception) when (
+                exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                // Windows developer mode or symbolic-link privilege may be unavailable on CI.
+            }
+
+            var cleanupRoot = Path.Combine(testDirectory, "CleanupRoot");
+            var abandonedSession = Path.Combine(cleanupRoot, "session-20260712-crash-residue");
+            Directory.CreateDirectory(abandonedSession);
+            await File.WriteAllBytesAsync(
+                    Path.Combine(abandonedSession, "segment-000000000.mkv"),
+                    [1, 2, 3])
+                .ConfigureAwait(false);
+            await using (var replay = new ReplayBufferService(
+                             new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
+                             cleanupRoot))
+            {
+                Assert.True(
+                    !Directory.Exists(abandonedSession),
+                    "Abandoned screen/audio replay data must be purged when the service starts.");
+            }
+        }
+        finally
+        {
+            if (linkPath is not null && Directory.Exists(linkPath))
+            {
+                Directory.Delete(linkPath);
+            }
+
+            DeleteTestDirectory(testDirectory);
+        }
+
     }
 
     private static async Task TestClipLibraryCancellationAsync()
@@ -791,7 +1134,10 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(testDirectory);
-            await File.WriteAllBytesAsync(Path.Combine(testDirectory, "clip.mp4"), [1]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(
+                    Path.Combine(testDirectory, "Clip_2026-07-12_18-30-00.mp4"),
+                    [1])
+                .ConfigureAwait(false);
             var runner = new FakeClipMediaProcessRunner();
             var service = new ClipLibraryService(
                 () => null,
@@ -859,6 +1205,10 @@ internal static class Program
 
         public int ThumbnailRunCount { get; private set; }
 
+        public bool RejectAllProbes { get; init; }
+
+        public bool TimeOutAllProbes { get; init; }
+
         public async Task<ClipMediaProcessResult> RunAsync(
             string executablePath,
             IReadOnlyList<string> arguments,
@@ -870,7 +1220,14 @@ internal static class Program
 
             if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
             {
-                return Path.GetFileName(arguments[^1]).Equals("corrupt.mp4", StringComparison.OrdinalIgnoreCase)
+                if (TimeOutAllProbes)
+                {
+                    return new ClipMediaProcessResult(-1, string.Empty, string.Empty, true);
+                }
+
+                return RejectAllProbes || Path.GetFileName(arguments[^1]).Equals(
+                        "Clip_2026-01-03_01-00-00.mp4",
+                        StringComparison.OrdinalIgnoreCase)
                     ? new ClipMediaProcessResult(1, string.Empty, "invalid media", false)
                     : new ClipMediaProcessResult(
                         0,

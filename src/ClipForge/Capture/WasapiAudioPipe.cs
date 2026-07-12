@@ -15,6 +15,8 @@ namespace ClipForge.Capture;
 /// </summary>
 internal sealed class WasapiAudioPipe : IAsyncDisposable
 {
+    private const int MaximumQueuedSampleBlocks = 16;
+
     internal const PipeOptions ServerPipeOptions =
         PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
 
@@ -53,12 +55,17 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
             inBufferSize: 64 * 1024,
             outBufferSize: 64 * 1024);
 
-        _samples = Channel.CreateBounded<AudioSampleBlock>(new BoundedChannelOptions(32)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.Wait
-        });
+        _samples = Channel.CreateBounded<AudioSampleBlock>(
+            new BoundedChannelOptions(MaximumQueuedSampleBlocks)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                // If scheduling pressure stalls the pipe writer, preserving
+                // the newest samples bounds audio latency. The dropped-item
+                // callback immediately returns the pooled buffer.
+                FullMode = BoundedChannelFullMode.DropOldest
+            },
+            OnSampleBlockDropped);
 
         _capture.DataAvailable += Capture_DataAvailable;
         _capture.RecordingStopped += Capture_RecordingStopped;
@@ -166,11 +173,17 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
 
         var buffer = ArrayPool<byte>.Shared.Rent(eventArgs.BytesRecorded);
         eventArgs.Buffer.AsSpan(0, eventArgs.BytesRecorded).CopyTo(buffer);
-        if (!_samples.Writer.TryWrite(new AudioSampleBlock(buffer, eventArgs.BytesRecorded)))
+        var sample = new AudioSampleBlock(buffer, eventArgs.BytesRecorded);
+        if (!_samples.Writer.TryWrite(sample))
         {
-            ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
-            Interlocked.Increment(ref _droppedSampleBlocks);
+            OnSampleBlockDropped(sample);
         }
+    }
+
+    private void OnSampleBlockDropped(AudioSampleBlock sample)
+    {
+        ArrayPool<byte>.Shared.Return(sample.Buffer, clearArray: true);
+        Interlocked.Increment(ref _droppedSampleBlocks);
     }
 
     private void Capture_RecordingStopped(object? sender, StoppedEventArgs eventArgs) =>

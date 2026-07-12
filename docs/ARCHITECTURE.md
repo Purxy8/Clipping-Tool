@@ -12,21 +12,22 @@ ClipForge is a Windows-only WPF application targeting `.NET 10` and `win-x64`. T
 - Make missing FFmpeg a recoverable first-run setup step rather than a startup failure.
 - Prefer a runtime-verified hardware encoder and low-overhead capture source while retaining safe compatibility fallbacks.
 - Let the main window hide to the notification area while replay and global shortcuts remain available.
+- Keep player and appearance work out of the capture-critical path, and avoid periodic whole-buffer scans.
 
-Version 1.1 does not attempt a game-process hook, HDR pipeline, editor, or upload service.
+Version 1.2 does not attempt a game-process hook, HDR pipeline, editor, or upload service.
 
 ## Component map
 
 | Area | Main types | Responsibility |
 | --- | --- | --- |
-| WPF shell | `MainWindow`, `OverlayWindow`, `App`, `Themes/Styles.xaml` | Present the settings sidebar, replay controls, latest-clip player, recent gallery, compact overlay, animations, and non-blocking error states. |
+| WPF shell | `MainWindow`, `OverlayWindow`, `App`, `Themes/Styles.xaml` | Present the settings sidebar, replay controls, complete latest-clip transport, recent gallery, compact overlay, dark background customization, short animations, and non-blocking error states. |
 | Models | `AppSettings`, `CaptureConfiguration`, `HotkeyGesture`, `ClipLibraryItem`, option records, `ReplayStateSnapshot` | Separate serializable preferences and library views from the validated, immutable configuration used by a running capture. |
 | Device discovery | `DeviceDiscoveryService` | Enumerate Windows displays and active render/capture audio endpoints. Displays come from WinForms `Screen`; audio endpoints come from NAudio/Core Audio. |
 | Replay engine | `ReplayBufferService` and capture helpers under `Capture/` | Probe capture/encoder capabilities, own the tuned FFmpeg process, WASAPI audio producers, temporary segment set, retention policy, save snapshots, cancellation, and lifecycle state. |
 | FFmpeg command construction | `FfmpegArgumentBuilder` | Build argument lists without shell interpolation for both continuous segment capture and MP4 creation. |
 | FFmpeg provisioning | `FfmpegSetupService` | Resolve an existing FFmpeg installation or download a private copy on request. |
-| Clip library | `ClipLibraryService`, `ClipMediaProcessRunner` | Discover recent top-level MP4 files, validate media, create cached thumbnails, and supply the latest clip plus four gallery items. |
-| Application updates | `AppUpdateService`, `ReleaseInfo`, Velopack | Check the configured stable release feed, download an update without interrupting capture, then apply it after the window shuts down cleanly. |
+| Clip library | `ClipLibraryService`, `ClipMediaProcessRunner` | Discover recent top-level ClipForge-named MP4 files, validate local MOV/MP4 media, create cached thumbnails, and supply the latest clip plus four gallery items. |
+| Application updates | `AppUpdateService`, `ReleaseInfo`, Velopack | Check the configured release feed, download an update without interrupting capture, then explicitly apply it after the window shuts down cleanly. |
 | Settings | `SettingsService` | Load JSON with safe defaults and atomically replace the settings file after changes. |
 | Shortcuts | `GlobalHotkeyService`, `HotkeyGesture` | Atomically register configurable Save Clip and Toggle Overlay combinations through the Win32 hotkey API and preserve working bindings on conflicts. |
 | Tray lifecycle | `TrayIconService` | Keep window visibility separate from application/capture lifetime and expose Show, Save Clip, and Exit actions. |
@@ -82,7 +83,7 @@ The capture command uses:
 
 `gfxcapture` can keep compatible frames on the GPU for NVENC and AMF. When the capture and encoder devices differ, a runtime-probed compatibility strategy downloads BGRA frames before the verified hardware encoder; Quick Sync converts that transfer to NV12. Software capture downloads/converts to YUV420P. The selected strategy is exposed as `ReplayBufferService.ActiveEncoderDescription` and shown in the UI so compatibility fallbacks are visible rather than silent.
 
-The FFmpeg capture process is assigned below-normal priority to reduce competition with interactive workloads. The software fallback also caps encoder worker threads, and WASAPI producers use bounded pooled buffers. These measures reduce contention and prevent an unbounded audio backlog; they cannot guarantee a fixed input-latency result across games, drivers, and hardware.
+The FFmpeg capture process is assigned below-normal priority to reduce competition with interactive workloads. The software fallback also caps encoder worker threads. WASAPI producers keep at most 16 pooled sample blocks, preserve the newest audio if the writer falls behind, and promptly return dropped or shutdown-remnant buffers. The replay monitor follows the segment muxer's strictly increasing file names and keeps an incremental size/index view instead of enumerating and sorting the entire ring on every health poll. Media metadata and thumbnail helpers receive the same low-impact process priority, while the WPF player position timer is stopped when playback or the active window does not need it. These measures reduce contention, disk metadata work, and allocation pressure; they cannot guarantee a fixed input-latency result across games, drivers, and hardware.
 
 Argument values are passed with `ProcessStartInfo.ArgumentList`; they are not concatenated into a command line for a shell. This is important for device names and user-selected paths.
 
@@ -94,9 +95,11 @@ Stream copy avoids a second video encode. The two-second keyframe/segment cadenc
 
 ### Clip library and playback
 
-After startup, a save, or a save-folder change, `ClipLibraryService` enumerates top-level `.mp4` files in the selected clips directory and sorts them newest first. It returns the latest clip for the large WPF `MediaElement` player and up to four recent items for the gallery. Enumeration rejects reparse-point and path-traversal cases, and FFprobe validates each candidate before it is surfaced as playable media.
+After startup, a save, or a save-folder change, `ClipLibraryService` enumerates top-level files in the selected clips directory and sorts eligible candidates newest first. Eligibility requires ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` filename format as well as existing path, file-identity, reparse-point, and traversal checks. FFprobe is forced to the MOV/MP4 demuxer with a `file`-only protocol whitelist before a candidate is surfaced as playable media. This intentionally excludes unrelated or renamed MP4 files from automatic decoding; users can still open those files outside the gallery.
 
-Thumbnail generation runs asynchronously through FFmpeg with bounded output capture, cancellation, and timeouts. Cached thumbnails use a content-derived SHA-256 name and atomic replacement so a crash cannot leave a trusted partial cache entry. The library is a local view over existing files; it does not copy or upload clips.
+Thumbnail generation runs asynchronously through FFmpeg with the same local-file/MOV constraints, bounded output capture, cancellation, timeouts, one decode thread, and low-impact process priority. Cached thumbnails use a content-derived SHA-256 name and atomic replacement so a crash cannot leave a trusted partial cache entry. The library is a local view over existing files; it does not copy or upload clips.
+
+The large `MediaElement` surface provides play/pause, restart, clickable/draggable and keyboard seeking, elapsed/total time, 10-second backward/forward skips, mute, and volume. Playback is independent of replay capture. Short opacity/translation and button-hover animations are bounded, and the position timer runs only while media is playing in the visible, active main window.
 
 ### Shortcuts, tray, and overlay
 
@@ -104,7 +107,7 @@ Thumbnail generation runs asynchronously through FFmpeg with bounded output capt
 
 Closing `MainWindow` hides it to the notification area. `TrayIconService` can reopen the window, request a save, or perform a real application exit. The global hotkeys and rolling buffer require the ClipForge process to remain alive; no Windows service or injected game component is installed. `OverlayWindow` is a small topmost WPF surface for replay state and save/open controls. It can be shown or hidden from anywhere with the configured shortcut, but exclusive-fullscreen content can render above it.
 
-`SingleInstanceService` scopes a named mutex and activation event to the current Windows user and logon session. A second v1.1 launch sends only an activation signal and exits; the primary process restores its main window. This prevents two recorders from competing for the same hotkeys and devices. A legacy pre-v1.1 process is detected and must be exited once before the upgraded build starts.
+`SingleInstanceService` scopes a named mutex and activation event to the current Windows user and logon session. A second launch sends only an activation signal and exits; the primary process restores its main window. This prevents two recorders from competing for the same hotkeys and devices. A legacy pre-v1.1 process is detected and must be exited once before the upgraded build starts.
 
 ### Stopping and failure handling
 
@@ -114,40 +117,44 @@ Unexpected device removal, a full disk, FFmpeg exit, or pipe failure transitions
 
 ## Configuration and local state
 
-`AppSettings` is a tolerant serialization model. Missing, unsupported, malformed, or oversized JSON falls back to product defaults; settings input is capped at 1 MiB. `SettingsService` writes a uniquely named temporary file and atomically replaces the previous file, reducing the chance of partial JSON after a crash.
+`AppSettings` is a tolerant serialization model. Missing, unsupported, malformed, or oversized JSON falls back to product defaults; settings input is capped at 1 MiB. `SettingsService` writes a uniquely named temporary file and atomically replaces the previous file, reducing the chance of partial JSON after a crash. Background colors are stored as validated `#RRGGBB`; invalid values use `#0B0D12`, and any custom color with a channel above 48 is proportionally scaled down while preserving its hue so the fixed light typography remains readable.
 
 | Item | Default location / source |
 | --- | --- |
 | Settings | `%LOCALAPPDATA%\ClipForge\settings.json` |
 | FFmpeg tools | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
 | Saved clips | `%USERPROFILE%\Videos\ClipForge` |
-| Capture segments and concat manifests | `%LOCALAPPDATA%\ClipForge\Buffer` in a per-session directory managed by the replay engine |
+| Capture segments and concat manifests | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture directory managed by the replay engine |
 
-`FfmpegSetupService` resolves `ffmpeg.exe` in this order:
+`FfmpegSetupService` resolves and checksum-verifies the pinned `ffmpeg.exe`/`ffprobe.exe` pair in this order:
 
-1. `CLIPFORGE_FFMPEG_PATH`, as either an executable or a directory.
-2. The private per-user tools directory.
-3. Beside the application.
-4. `Tools\FFmpeg` beside the application.
-5. Directories on `PATH`.
+1. The private per-user tools directory.
+2. Beside the application.
+3. `Tools\FFmpeg` beside the application.
 
-On explicit install, it downloads the pinned Gyan.dev FFmpeg 8.1.2 essentials ZIP to a unique staging directory, verifies its SHA-256 digest, extracts only `ffmpeg.exe` and `ffprobe.exe`, moves them into the private tools directory, and removes staging data. A mismatched archive is rejected before extraction. The packaging script does not perform this download or redistribute FFmpeg.
+Arbitrary environment or `PATH` tools are disabled in normal operation. `CLIPFORGE_DEVELOPER_MODE=1` explicitly enables `CLIPFORGE_FFMPEG_PATH` and `PATH` discovery for source-level experiments; that mode intentionally bypasses the pinned executable policy and is not a production configuration.
+
+On explicit install, the service requires a bounded Content-Length and sufficient free space, downloads the pinned Gyan.dev FFmpeg 8.1.2 essentials ZIP to a unique non-reparse staging directory, enforces hard streamed-byte and ZIP-entry size/compression-ratio ceilings, verifies the archive SHA-256, extracts only `ffmpeg.exe` and `ffprobe.exe`, and verifies both pinned executable SHA-256 values before and after installation. A mismatched or oversized response is rejected. The packaging script does not perform this download or redistribute FFmpeg.
 
 ## Installation and update lifecycle
 
 Velopack packages ClipForge as a per-user Windows installer under the permanent package ID `ClipForge.Desktop`. This is intentionally different from the `%LOCALAPPDATA%\ClipForge` data directory so install and uninstall operations cannot replace settings, FFmpeg, or replay data.
 
-Release builds use the `stable` channel and semantic versions. The public update location is embedded at build time; an unconfigured developer build remains fully usable but does not make update requests. An installed, configured build can check its feed automatically or on demand, download the full or delta package, and stage it for restart. Applying an update is scheduled before the window closes so the existing shutdown path can stop FFmpeg, persist settings, and release the replay buffer first.
+Release builds use the permanent package identity/channel and semantic versions. The public update location is embedded at build time; an unconfigured developer build remains fully usable but does not make update requests. Stable installations exclude pre-releases, while a version containing a SemVer pre-release suffix includes later beta releases and can eventually move to the stable build. An installed, configured build can check its feed automatically or on demand, download the full or delta package, and stage it for restart.
+
+Velopack's default implicit apply-on-startup path is disabled. Applying a staged update is scheduled only after the user selects **Restart to update**, before the window closes, so the existing shutdown path can stop FFmpeg, persist settings, and release the replay buffer first. This is an installation-timing and lifecycle control; it is not a publisher-authentication mechanism.
 
 The release script emits the installer, portable ZIP, full update package, feed metadata, and SHA-256 manifest. The portable build is useful for testing but is not registered for automatic updates. Authenticode signing is optional at the release-script level for local testing, while the GitHub Actions workflow refuses to publish an unsigned public release. Publisher-owned signing credentials belong only in GitHub Actions secrets and are never committed to this repository.
 
 Update sources are accepted only as HTTPS URLs without embedded credentials or as fully qualified local paths for development. A build without an embedded update source does not make update requests. Update application follows the same orderly shutdown path as a tray Exit, releasing capture and temporary resources before restart.
 
+The current beta remains unsigned and the installed client does not pin a ClipForge project key or expected Authenticode publisher. HTTPS and Velopack package/feed checksums are useful integrity controls, but matching feed metadata can be replaced together with a package if the release account/feed is compromised. Trusted distribution therefore still requires an accepted signing route plus an enforced client-side trust policy; the unsigned beta must not be represented as a trusted stable updater.
+
 ## Process and input hardening
 
 ClipForge runs as the signed-in user with `asInvoker` and does not request elevation. Startup calls the restricted Windows DLL directory policy before native capture or updater components load; assembly-level DllImport policy limits native resolution to the application directory, Windows system directory, and explicitly added user directories.
 
-FFmpeg and FFprobe are launched by fully resolved executable path with `UseShellExecute=false`, no command shell, and individual argument-list entries. Media probe/thumbnail processes bound diagnostic output, enforce timeouts, honor cancellation, and terminate their child process on timeout. WASAPI named pipes are restricted to the current user, and replay cleanup refuses reparse points or any directory outside a direct `session-*` child of the buffer root. User-facing Open actions accept only fully qualified existing local paths. The optional FFmpeg installer accepts a pinned HTTPS archive, verifies its SHA-256 digest, and extracts only the expected executables.
+FFmpeg and FFprobe are launched by fully resolved executable path with `UseShellExecute=false`, no command shell, and individual argument-list entries. Normal builds accept only the pinned private/bundled executable hashes. Media probe/thumbnail processes accept only ClipForge-named top-level candidates, revalidate file identity immediately before embedded playback, force MOV/MP4 demuxing with the local `file` protocol, cap process count and total helper time, bound diagnostic output, honor cancellation, and terminate their child process on timeout. WASAPI named pipes are restricted to the current user. Replay roots are separated by Windows logon-session ID; cleanup rejects a root when it or an existing ancestor is a reparse point, accepts only a regular direct `session-*` child, and purges abandoned sessions in the current logon scope after single-instance ownership is established on the next launch. User-facing Open actions accept only fully qualified existing local paths. The optional FFmpeg installer uses bounded download/extraction, a pinned HTTPS archive digest, and pinned hashes for both extracted executables.
 
 These controls reduce DLL preloading, command injection, path traversal, resource-exhaustion, and update-feed mistakes. They do not protect recordings from malware already running as the same user, an administrator, a kernel driver, or a compromised Windows installation. Authenticode establishes publisher identity and file integrity; it is not a substitute for secure implementation and operating-system hygiene.
 
@@ -190,7 +197,7 @@ These rules prevent overlapping capture processes, use-after-delete races during
 - Audio device removal or format changes during a session may require replay to be restarted.
 - The overlay is a desktop WPF window, not a game-injected overlay. There is no startup task, clip editor, or automatic upload.
 - The performance smoke test validates real segment rollover, a saved MP4, duration, encoder/process priority, and sampled resource use on the test machine. It cannot certify zero input delay for every game/GPU/driver combination; target-game testing remains a release check.
-- Trusted code signing and public update hosting are release-operations responsibilities and require publisher-owned credentials and infrastructure.
+- The current beta is unsigned, and the installed updater does not yet enforce a pinned publisher identity. Signing and a client-side update trust policy remain release/security work rather than completed protection.
 
 ## Extension points
 

@@ -12,9 +12,134 @@
         WindowStartupLocation="CenterScreen"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
+        Background="{DynamicResource UserBackgroundBrush}"
         TextOptions.TextFormattingMode="Display">
 
-    <Grid x:Name="RootLayout" Opacity="0">
+    <Window.Resources>
+        <SolidColorBrush x:Key="UserBackgroundBrush" Color="#0B0D12" />
+
+        <Style x:Key="AnimatedQuietButtonStyle" TargetType="{x:Type Button}"
+               BasedOn="{StaticResource QuietButtonStyle}">
+            <Setter Property="RenderTransform">
+                <Setter.Value>
+                    <TranslateTransform Y="0" />
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <EventTrigger RoutedEvent="MouseEnter">
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                             To="-1" Duration="0:0:0.10" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+                <EventTrigger RoutedEvent="MouseLeave">
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                             To="0" Duration="0:0:0.12" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="AnimatedPrimaryButtonStyle" TargetType="{x:Type Button}"
+               BasedOn="{StaticResource PrimaryButtonStyle}">
+            <Setter Property="RenderTransform">
+                <Setter.Value>
+                    <TranslateTransform Y="0" />
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <EventTrigger RoutedEvent="MouseEnter">
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                             To="-1" Duration="0:0:0.10" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+                <EventTrigger RoutedEvent="MouseLeave">
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                             To="0" Duration="0:0:0.12" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="BackgroundSwatchButtonStyle" TargetType="{x:Type Button}"
+               BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Width" Value="34" />
+            <Setter Property="Height" Value="34" />
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0,0,7,0" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="AutomationProperties.HelpText" Value="Apply this app background color" />
+        </Style>
+
+        <Style x:Key="TransportSliderStyle" TargetType="{x:Type Slider}">
+            <Setter Property="Height" Value="24" />
+            <Setter Property="MinWidth" Value="80" />
+            <Setter Property="IsMoveToPointEnabled" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Slider}">
+                        <Grid Background="Transparent">
+                            <Border x:Name="SliderFocusRing" Height="13" VerticalAlignment="Center"
+                                    BorderBrush="Transparent" BorderThickness="1" CornerRadius="7" />
+                            <Track x:Name="PART_Track" VerticalAlignment="Center">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Command="{x:Static Slider.DecreaseLarge}" IsTabStop="False">
+                                        <RepeatButton.Template>
+                                            <ControlTemplate TargetType="{x:Type RepeatButton}">
+                                                <Border Height="5" Background="{StaticResource AccentBrush}" CornerRadius="3" />
+                                            </ControlTemplate>
+                                        </RepeatButton.Template>
+                                    </RepeatButton>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Command="{x:Static Slider.IncreaseLarge}" IsTabStop="False">
+                                        <RepeatButton.Template>
+                                            <ControlTemplate TargetType="{x:Type RepeatButton}">
+                                                <Border Height="5" Background="{StaticResource BorderStrongBrush}" CornerRadius="3" />
+                                            </ControlTemplate>
+                                        </RepeatButton.Template>
+                                    </RepeatButton>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Width="16" Height="16">
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="{x:Type Thumb}">
+                                                <Ellipse Fill="{StaticResource AccentHoverBrush}"
+                                                         Stroke="#D8FFFFFF" StrokeThickness="2" />
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                <Setter TargetName="SliderFocusRing" Property="BorderBrush"
+                                        Value="{StaticResource AccentHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="PART_Track" Property="Opacity" Value="0.38" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid x:Name="RootLayout" Background="{DynamicResource UserBackgroundBrush}" Opacity="0">
         <Grid.RenderTransform>
             <TranslateTransform Y="10" />
         </Grid.RenderTransform>
@@ -130,7 +255,7 @@
                         </StackPanel>
                         <Border Grid.Column="1" Padding="8,4" VerticalAlignment="Center"
                                 Background="{StaticResource AccentSoftBrush}" CornerRadius="7">
-                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource AccentHoverBrush}" Text="V1.1" />
+                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource AccentHoverBrush}" Text="V1.2" />
                         </Border>
                     </Grid>
 
@@ -243,6 +368,61 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- Appearance -->
+                            <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
+                                <StackPanel>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Style="{StaticResource EyebrowStyle}" Text="APPEARANCE" />
+                                        <Border Grid.Column="1" Padding="7,3" Background="{StaticResource AccentSoftBrush}"
+                                                CornerRadius="6">
+                                            <TextBlock x:Name="BackgroundColorValueText" FontFamily="Consolas" FontSize="10"
+                                                       Foreground="{StaticResource AccentHoverBrush}" Text="#0B0D12" />
+                                        </Border>
+                                    </Grid>
+                                    <TextBlock Margin="0,8,0,8" Style="{StaticResource MutedTextStyle}"
+                                               Text="Choose a calm app background. Custom colors are darkened when needed so text stays readable." />
+                                    <StackPanel x:Name="BackgroundSwatchesPanel" Orientation="Horizontal">
+                                        <Button Tag="#0B0D12" Background="#0B0D12" ToolTip="Midnight"
+                                                AutomationProperties.Name="Midnight background"
+                                                Click="BackgroundSwatchButton_Click"
+                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                        <Button Tag="#0D1422" Background="#0D1422" ToolTip="Deep navy"
+                                                AutomationProperties.Name="Deep navy background"
+                                                Click="BackgroundSwatchButton_Click"
+                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                        <Button Tag="#161321" Background="#161321" ToolTip="Soft plum"
+                                                AutomationProperties.Name="Soft plum background"
+                                                Click="BackgroundSwatchButton_Click"
+                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                        <Button Tag="#0D1A19" Background="#0D1A19" ToolTip="Deep forest"
+                                                AutomationProperties.Name="Deep forest background"
+                                                Click="BackgroundSwatchButton_Click"
+                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                        <Button Tag="#17191F" Background="#17191F" ToolTip="Graphite"
+                                                AutomationProperties.Name="Graphite background"
+                                                Click="BackgroundSwatchButton_Click"
+                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                    </StackPanel>
+                                    <Grid Margin="0,9,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="8" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Button Grid.Column="0" Content="Custom color" Click="CustomBackgroundButton_Click"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                AutomationProperties.Name="Choose a custom background color" />
+                                        <Button Grid.Column="2" Content="Reset" Click="ResetBackgroundButton_Click"
+                                                Style="{StaticResource QuietButtonStyle}"
+                                                AutomationProperties.Name="Reset app background color" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
                             <!-- Storage -->
                             <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
                                 <StackPanel>
@@ -273,7 +453,7 @@
                                         </Grid.ColumnDefinitions>
                                         <TextBlock Style="{StaticResource EyebrowStyle}" Text="APP UPDATES" />
                                         <TextBlock x:Name="VersionText" Grid.Column="1" FontFamily="Consolas" FontSize="11"
-                                                   Foreground="{StaticResource AccentHoverBrush}" Text="v1.1.0" />
+                                                   Foreground="{StaticResource AccentHoverBrush}" Text="v1.2.0" />
                                     </Grid>
                                     <TextBlock x:Name="UpdateStatusText" Margin="0,8,0,8" Style="{StaticResource MutedTextStyle}"
                                                Text="Update status unavailable." />
@@ -296,7 +476,7 @@
                     <RowDefinition Height="12" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="12" />
-                    <RowDefinition Height="190" />
+                    <RowDefinition Height="176" />
                 </Grid.RowDefinitions>
 
                 <!-- Replay controls -->
@@ -328,9 +508,9 @@
                 <Border Grid.Row="2" Padding="0" Style="{StaticResource CardStyle}" ClipToBounds="True">
                     <Grid>
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="62" />
+                            <RowDefinition Height="64" />
                             <RowDefinition Height="*" />
-                            <RowDefinition Height="58" />
+                            <RowDefinition Height="92" />
                         </Grid.RowDefinitions>
 
                         <Grid Grid.Row="0" Margin="18,0">
@@ -344,6 +524,15 @@
                                            Text="Your newest saved clip will appear here." TextTrimming="CharacterEllipsis" />
                             </StackPanel>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Border Margin="0,0,8,0" Padding="9,5" Background="{StaticResource SuccessSoftBrush}"
+                                        CornerRadius="8">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Ellipse Width="6" Height="6" Margin="0,0,6,0" VerticalAlignment="Center"
+                                                 Fill="{StaticResource SuccessBrush}" />
+                                        <TextBlock FontSize="10" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource SuccessBrush}" Text="LOCAL PLAYER" />
+                                    </StackPanel>
+                                </Border>
                                 <Button x:Name="RefreshLibraryButton" Width="40" Height="40" Margin="0,0,6,0" Padding="0"
                                         Content="↻" Click="RefreshLibraryButton_Click" Style="{StaticResource QuietButtonStyle}"
                                         ToolTip="Refresh clips" />
@@ -356,8 +545,16 @@
                             <Grid>
                                 <MediaElement x:Name="ClipPlayer" LoadedBehavior="Manual" UnloadedBehavior="Manual"
                                               Stretch="Uniform" ScrubbingEnabled="True" Volume="0.8"
+                                              Cursor="Hand" MouseLeftButtonUp="ClipPlayer_MouseLeftButtonUp"
+                                              AutomationProperties.Name="Clip preview player"
+                                              AutomationProperties.HelpText="Click to play or pause the selected clip"
                                               MediaOpened="ClipPlayer_MediaOpened" MediaEnded="ClipPlayer_MediaEnded"
                                               MediaFailed="ClipPlayer_MediaFailed" />
+                                <Button x:Name="PlayerSurfacePlayButton" Width="70" Height="70" Padding="0"
+                                        HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed"
+                                        Content="&#x25B6;" FontSize="24" Click="PlayPauseButton_Click"
+                                        Style="{StaticResource AnimatedPrimaryButtonStyle}"
+                                        AutomationProperties.Name="Play selected clip" />
                                 <Grid x:Name="PlayerEmptyState" Background="#D9070910">
                                     <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
                                         <Border Width="62" Height="62" Background="{StaticResource AccentSoftBrush}" CornerRadius="31">
@@ -374,20 +571,69 @@
                             </Grid>
                         </Border>
 
-                        <Grid Grid.Row="2" Margin="14,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <Button x:Name="PlayPauseButton" Width="42" Height="40" Padding="0" Content="▶"
-                                    Click="PlayPauseButton_Click" IsEnabled="False" Style="{StaticResource PrimaryButtonStyle}" />
-                            <Button x:Name="RestartClipButton" Grid.Column="1" Width="42" Height="40" Margin="6,0,0,0"
-                                    Padding="0" Content="↺" Click="RestartClipButton_Click" IsEnabled="False"
-                                    Style="{StaticResource QuietButtonStyle}" ToolTip="Restart clip" />
-                            <TextBlock x:Name="PlayerTimeText" Grid.Column="3" VerticalAlignment="Center"
-                                       FontFamily="Consolas" FontSize="12" Foreground="{StaticResource TextMutedBrush}" Text="0:00 / 0:00" />
+                        <Grid Grid.Row="2" Margin="16,5,16,8">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="28" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Slider x:Name="PlayerSeekSlider" Minimum="0" Maximum="1" Value="0"
+                                        IsEnabled="False" SmallChange="1" LargeChange="10"
+                                        ValueChanged="PlayerSeekSlider_ValueChanged"
+                                        PreviewMouseLeftButtonDown="PlayerSeekSlider_PreviewMouseLeftButtonDown"
+                                        PreviewMouseLeftButtonUp="PlayerSeekSlider_PreviewMouseLeftButtonUp"
+                                        PreviewKeyDown="PlayerSeekSlider_PreviewKeyDown"
+                                        Style="{StaticResource TransportSliderStyle}"
+                                        AutomationProperties.Name="Clip position"
+                                        AutomationProperties.HelpText="Seek through the selected clip" />
+                                <TextBlock x:Name="PlayerTimeText" Grid.Column="1" MinWidth="108" Margin="12,0,0,0"
+                                           VerticalAlignment="Center" TextAlignment="Right" FontFamily="Consolas" FontSize="12"
+                                           Foreground="{StaticResource TextSecondaryBrush}" Text="0:00 / 0:00" />
+                            </Grid>
+
+                            <Grid Grid.Row="1" Margin="0,4,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="112" />
+                                </Grid.ColumnDefinitions>
+                                <Button x:Name="PlayPauseButton" Width="48" Height="44" Padding="0" Content="&#x25B6;"
+                                        Click="PlayPauseButton_Click" IsEnabled="False"
+                                        Style="{StaticResource AnimatedPrimaryButtonStyle}" ToolTip="Play clip"
+                                        AutomationProperties.Name="Play selected clip" />
+                                <Button x:Name="RestartClipButton" Grid.Column="1" Width="42" Height="42" Margin="6,0,0,0"
+                                        Padding="0" Content="&#x21BA;" Click="RestartClipButton_Click" IsEnabled="False"
+                                        Style="{StaticResource AnimatedQuietButtonStyle}" ToolTip="Replay from the beginning"
+                                        AutomationProperties.Name="Replay clip from the beginning" />
+                                <Button x:Name="BackTenSecondsButton" Grid.Column="2" Width="52" Height="42" Margin="6,0,0,0"
+                                        Padding="0" Content="&#x2212;10" Click="BackTenSecondsButton_Click" IsEnabled="False"
+                                        Style="{StaticResource AnimatedQuietButtonStyle}" ToolTip="Back 10 seconds"
+                                        AutomationProperties.Name="Move back 10 seconds" />
+                                <Button x:Name="ForwardTenSecondsButton" Grid.Column="3" Width="52" Height="42" Margin="6,0,0,0"
+                                        Padding="0" Content="+10" Click="ForwardTenSecondsButton_Click" IsEnabled="False"
+                                        Style="{StaticResource AnimatedQuietButtonStyle}" ToolTip="Forward 10 seconds"
+                                        AutomationProperties.Name="Move forward 10 seconds" />
+                                <Button x:Name="MutePlayerButton" Grid.Column="5" Width="46" Height="42" Margin="8,0,4,0"
+                                        Padding="0" Content="&#x1F50A;" Click="MutePlayerButton_Click" IsEnabled="False"
+                                        Style="{StaticResource AnimatedQuietButtonStyle}" ToolTip="Mute clip audio"
+                                        AutomationProperties.Name="Mute clip audio" />
+                                <Slider x:Name="PlayerVolumeSlider" Grid.Column="6" Margin="4,0,0,0"
+                                        Minimum="0" Maximum="100" Value="80" SmallChange="5" LargeChange="10"
+                                        IsEnabled="False"
+                                        ValueChanged="PlayerVolumeSlider_ValueChanged"
+                                        Style="{StaticResource TransportSliderStyle}"
+                                        AutomationProperties.Name="Clip volume"
+                                        AutomationProperties.HelpText="Adjust clip playback volume" />
+                            </Grid>
                         </Grid>
                     </Grid>
                 </Border>

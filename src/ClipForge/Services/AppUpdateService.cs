@@ -73,7 +73,7 @@ public sealed class AppUpdateService : IDisposable
                     _manager.CurrentVersion?.ToString() ?? ReleaseInfo.Version,
                     _readyAsset.Version.ToString(),
                     100,
-                    "An update is downloaded and ready to install.");
+                    "An update is downloaded. Select Restart to update to install it.");
         }
         catch (Exception exception)
         {
@@ -118,7 +118,7 @@ public sealed class AppUpdateService : IDisposable
                     _manager.CurrentVersion?.ToString() ?? ReleaseInfo.Version,
                     _readyAsset.Version.ToString(),
                     100,
-                    "An update is downloaded and ready to install."));
+                    "An update is downloaded. Select Restart to update to install it."));
                 return;
             }
 
@@ -196,7 +196,7 @@ public sealed class AppUpdateService : IDisposable
                 _manager.CurrentVersion?.ToString() ?? ReleaseInfo.Version,
                 targetVersion,
                 100,
-                "Update downloaded. Restart ClipForge to install it."));
+                "Update downloaded. Select Restart to update to install it."));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -264,10 +264,20 @@ public sealed class AppUpdateService : IDisposable
             return new UpdateManager(new GithubSource(
                 updateUrl,
                 accessToken: null,
-                prerelease: false));
+                prerelease: ShouldIncludePrereleases(ReleaseInfo.Version)));
         }
 
         return new UpdateManager(updateUrl);
+    }
+
+    /// <summary>
+    /// Stable installations stay on stable releases, while beta installations can
+    /// discover the next beta and eventually move forward to the stable build.
+    /// </summary>
+    internal static bool ShouldIncludePrereleases(string version)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(version);
+        return version.Contains('-', StringComparison.Ordinal);
     }
 
     private void Publish(AppUpdateSnapshot snapshot)

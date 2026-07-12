@@ -1,6 +1,6 @@
 # ClipForge privacy
 
-ClipForge is a local-first desktop application. Screen frames, selected audio, rolling replay segments, thumbnails, and saved clips stay on the Windows PC in local memory, local named pipes, ClipForge's temporary buffer, thumbnail cache, and the save folder chosen by the user. ClipForge has no account system, telemetry, analytics, advertising, social feed, cloud storage, or clip-upload feature.
+ClipForge is a local-first desktop application. Screen frames, selected audio, rolling replay segments, thumbnails, saved clips, player state, and the selected background color stay on the Windows PC in local memory, local named pipes, ClipForge's temporary buffer, thumbnail cache, the save folder chosen by the user, and the local settings file. ClipForge has no account system, telemetry, analytics, advertising, social feed, cloud storage, or clip-upload feature.
 
 ClipForge makes network requests only for these visible maintenance operations:
 
@@ -12,8 +12,8 @@ Normal HTTPS connection metadata, such as the user's IP address, request headers
 - GitHub hosts the configured ClipForge update feed and publishes the [GitHub General Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
 - [Gyan.dev](https://www.gyan.dev/ffmpeg/builds/) hosts the optional FFmpeg archive. Its published site notice states that the site author does not solicit or store personal information. The application requests the archive directly and does not load the site's webpages, advertising, or web fonts.
 
-Automatic update checks default to off for a new installation and can be enabled explicitly in ClipForge. Users can turn them off again at any time and can provide a local FFmpeg executable instead of using the downloader. Update and FFmpeg requests do not contain screen frames, audio, thumbnails, clips, filenames, save-folder paths, or ClipForge settings.
+Automatic update checks default to off for a new installation and can be enabled explicitly in ClipForge. Users can turn them off again at any time and can install the pinned FFmpeg/FFprobe pair locally instead of using the downloader. Checking automatically does not automatically apply a downloaded package at startup; applying an update still requires the user-visible **Restart to update** action. Update and FFmpeg requests do not contain screen frames, audio, thumbnails, clips, filenames, save-folder paths, player position, background color, or other ClipForge settings.
 
-A development build without a configured update feed does not make update requests. Choosing a folder managed by OneDrive, Dropbox, or another synchronization product can cause that separate product to upload saved clips; ClipForge does not control or initiate that synchronization.
+A development build without a configured update feed does not make update requests. The embedded gallery automatically considers only ClipForge-named top-level MP4 files and invokes FFprobe/FFmpeg with local-file-only media input; neither gallery discovery nor playback uploads a clip. Choosing a folder managed by OneDrive, Dropbox, or another synchronization product can cause that separate product to upload saved clips; ClipForge does not control or initiate that synchronization.
 
 Local data locations are documented in [README.md](README.md#privacy-and-local-data), and complete removal steps are documented in [README.md](README.md#uninstalling-and-removing-local-data). Security boundaries and vulnerability reporting are documented in [SECURITY.md](SECURITY.md).
