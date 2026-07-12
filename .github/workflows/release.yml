@@ -54,6 +54,7 @@ jobs:
         shell: pwsh
         run: |
           dotnet restore .\ClipForge.slnx --locked-mode
+          dotnet restore .\src\ClipForge\ClipForge.csproj --runtime win-x64 --locked-mode
           dotnet tool restore
 
       - name: Select signing mode
