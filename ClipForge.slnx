@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="src/ClipForge/ClipForge.csproj" />
+  <Project Path="tests/ClipForge.CaptureSmoke/ClipForge.CaptureSmoke.csproj" />
   <Project Path="tests/ClipForge.Tests/ClipForge.Tests.csproj" />
 </Solution>

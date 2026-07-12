@@ -7,8 +7,8 @@ public sealed record DisplayOption(
     int Top,
     int Width,
     int Height,
-    bool IsPrimary)
+    bool IsPrimary,
+    int MonitorIndex = 0)
 {
     public override string ToString() => $"{Label} · {Width}×{Height}";
 }
-

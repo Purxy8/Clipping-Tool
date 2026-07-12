@@ -48,6 +48,13 @@
         <GradientStop Color="#201B39" Offset="1" />
     </LinearGradientBrush>
 
+    <DropShadowEffect x:Key="OverlayShadowEffect"
+                      BlurRadius="28"
+                      ShadowDepth="8"
+                      Direction="270"
+                      Color="#000000"
+                      Opacity="0.48" />
+
     <!-- Typography -->
     <Style TargetType="{x:Type Window}">
         <Setter Property="Background" Value="{StaticResource WindowBrush}" />
@@ -129,6 +136,12 @@
         <Setter Property="Padding" Value="14" />
     </Style>
 
+    <Style x:Key="SidebarSectionStyle" TargetType="{x:Type Border}" BasedOn="{StaticResource CardStyle}">
+        <Setter Property="Padding" Value="14" />
+        <Setter Property="CornerRadius" Value="12" />
+        <Setter Property="Background" Value="#A1181C26" />
+    </Style>
+
     <!-- Buttons -->
     <Style TargetType="{x:Type Button}">
         <Setter Property="MinHeight" Value="42" />
@@ -198,6 +211,47 @@
         <Setter Property="Background" Value="Transparent" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}" />
+    </Style>
+
+    <Style x:Key="HotkeyButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource SecondaryButtonStyle}">
+        <Setter Property="Padding" Value="12,9" />
+        <Setter Property="FontWeight" Value="Normal" />
+    </Style>
+
+    <Style x:Key="GalleryCardButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
+        <Setter Property="MinHeight" Value="104" />
+        <Setter Property="Background" Value="#090B10" />
+        <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+        <Setter Property="RenderTransformOrigin" Value="0.5,0.5" />
+        <Setter Property="RenderTransform">
+            <Setter.Value>
+                <ScaleTransform ScaleX="1" ScaleY="1" />
+            </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Trigger.EnterActions>
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(ScaleTransform.ScaleX)"
+                                             To="1.025" Duration="0:0:0.14" />
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(ScaleTransform.ScaleY)"
+                                             To="1.025" Duration="0:0:0.14" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </Trigger.EnterActions>
+                <Trigger.ExitActions>
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(ScaleTransform.ScaleX)"
+                                             To="1" Duration="0:0:0.16" />
+                            <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(ScaleTransform.ScaleY)"
+                                             To="1" Duration="0:0:0.16" />
+                        </Storyboard>
+                    </BeginStoryboard>
+                </Trigger.ExitActions>
+            </Trigger>
+        </Style.Triggers>
     </Style>
 
     <!-- Text input -->

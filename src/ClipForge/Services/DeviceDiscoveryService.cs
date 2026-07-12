@@ -20,7 +20,8 @@ public sealed class DeviceDiscoveryService
                 screen.Bounds.Top,
                 screen.Bounds.Width,
                 screen.Bounds.Height,
-                screen.Primary))
+                screen.Primary,
+                index))
             .OrderByDescending(display => display.IsPrimary)
             .ThenBy(display => display.Left)
             .ThenBy(display => display.Top)

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
@@ -14,16 +15,20 @@ namespace ClipForge.Capture;
 /// </summary>
 internal sealed class WasapiAudioPipe : IAsyncDisposable
 {
+    internal const PipeOptions ServerPipeOptions =
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
+
     private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00AA00389B71");
     private static readonly Guid PcmSubtype = new("00000001-0000-0010-8000-00AA00389B71");
 
     private readonly MMDevice _device;
     private readonly IWaveIn _capture;
     private readonly NamedPipeServerStream _pipe;
-    private readonly Channel<byte[]> _samples;
+    private readonly Channel<AudioSampleBlock> _samples;
     private readonly CancellationTokenSource _disposeCancellation = new();
 
     private Task? _writerTask;
+    private long _droppedSampleBlocks;
     private int _started;
     private int _disposed;
 
@@ -44,11 +49,11 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
             PipeDirection.Out,
             maxNumberOfServerInstances: 1,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous,
+            ServerPipeOptions,
             inBufferSize: 64 * 1024,
             outBufferSize: 64 * 1024);
 
-        _samples = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(128)
+        _samples = Channel.CreateBounded<AudioSampleBlock>(new BoundedChannelOptions(32)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -69,6 +74,8 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
     public string PipePath { get; }
 
     public AudioInputSpecification Specification { get; }
+
+    internal long DroppedSampleBlocks => Interlocked.Read(ref _droppedSampleBlocks);
 
     public Task Completion => _writerTask ?? Task.CompletedTask;
 
@@ -139,6 +146,11 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
             }
         }
 
+        while (_samples.Reader.TryRead(out var remaining))
+        {
+            ArrayPool<byte>.Shared.Return(remaining.Buffer, clearArray: true);
+        }
+
         _pipe.Dispose();
         _capture.Dispose();
         _device.Dispose();
@@ -152,11 +164,12 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
             return;
         }
 
-        var copy = eventArgs.Buffer.AsSpan(0, eventArgs.BytesRecorded).ToArray();
-        if (!_samples.Writer.TryWrite(copy))
+        var buffer = ArrayPool<byte>.Shared.Rent(eventArgs.BytesRecorded);
+        eventArgs.Buffer.AsSpan(0, eventArgs.BytesRecorded).CopyTo(buffer);
+        if (!_samples.Writer.TryWrite(new AudioSampleBlock(buffer, eventArgs.BytesRecorded)))
         {
-            _samples.Writer.TryComplete(new IOException(
-                "The audio encoder could not keep up with the selected endpoint."));
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+            Interlocked.Increment(ref _droppedSampleBlocks);
         }
     }
 
@@ -170,8 +183,7 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
             format.BlockAlign,
             format.AverageBytesPerSecond / 50 / format.BlockAlign * format.BlockAlign);
         var output = new byte[bytesPerTick];
-        var queuedSamples = new Queue<byte[]>();
-        byte[]? currentSample = null;
+        AudioSampleBlock? currentSample = null;
         var currentOffset = 0;
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(20));
 
@@ -179,18 +191,6 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
         {
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                while (_samples.Reader.TryRead(out var sample))
-                {
-                    queuedSamples.Enqueue(sample);
-                }
-
-                if (currentSample is null && queuedSamples.Count == 0 &&
-                    _samples.Reader.Completion.IsCompleted)
-                {
-                    await _samples.Reader.Completion.ConfigureAwait(false);
-                    return;
-                }
-
                 if (Specification.FfmpegSampleFormat == "u8")
                 {
                     Array.Fill(output, (byte)0x80);
@@ -205,28 +205,38 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
                 {
                     if (currentSample is null)
                     {
-                        if (queuedSamples.Count == 0)
+                        if (!_samples.Reader.TryRead(out var sample))
                         {
                             break;
                         }
 
-                        currentSample = queuedSamples.Dequeue();
+                        currentSample = sample;
                         currentOffset = 0;
                     }
 
+                    var sampleBlock = currentSample.Value;
                     var bytesToCopy = Math.Min(
                         output.Length - outputOffset,
-                        currentSample.Length - currentOffset);
-                    currentSample.AsSpan(currentOffset, bytesToCopy)
+                        sampleBlock.Count - currentOffset);
+                    sampleBlock.Buffer.AsSpan(currentOffset, bytesToCopy)
                         .CopyTo(output.AsSpan(outputOffset));
                     outputOffset += bytesToCopy;
                     currentOffset += bytesToCopy;
 
-                    if (currentOffset >= currentSample.Length)
+                    if (currentOffset >= sampleBlock.Count)
                     {
+                        ArrayPool<byte>.Shared.Return(sampleBlock.Buffer, clearArray: true);
                         currentSample = null;
                         currentOffset = 0;
                     }
+                }
+
+                if (outputOffset == 0 &&
+                    currentSample is null &&
+                    _samples.Reader.Completion.IsCompleted)
+                {
+                    await _samples.Reader.Completion.ConfigureAwait(false);
+                    return;
                 }
 
                 await _pipe.WriteAsync(output, cancellationToken).ConfigureAwait(false);
@@ -234,9 +244,21 @@ internal sealed class WasapiAudioPipe : IAsyncDisposable
         }
         finally
         {
+            if (currentSample is { } sample)
+            {
+                ArrayPool<byte>.Shared.Return(sample.Buffer, clearArray: true);
+            }
+
+            while (_samples.Reader.TryRead(out var remaining))
+            {
+                ArrayPool<byte>.Shared.Return(remaining.Buffer, clearArray: true);
+            }
+
             _pipe.Dispose();
         }
     }
+
+    private readonly record struct AudioSampleBlock(byte[] Buffer, int Count);
 
     private static string GetFfmpegSampleFormat(WaveFormat format)
     {

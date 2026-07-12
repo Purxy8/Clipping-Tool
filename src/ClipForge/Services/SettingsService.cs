@@ -10,6 +10,7 @@ namespace ClipForge.Services;
 public sealed class SettingsService : IDisposable
 {
     private const string SettingsFileName = "settings.json";
+    private const long MaximumSettingsBytes = 1024 * 1024;
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -55,6 +56,11 @@ public sealed class SettingsService : IDisposable
 
             try
             {
+                if (new FileInfo(SettingsPath).Length > MaximumSettingsBytes)
+                {
+                    return new AppSettings();
+                }
+
                 await using var stream = new FileStream(
                     SettingsPath,
                     FileMode.Open,

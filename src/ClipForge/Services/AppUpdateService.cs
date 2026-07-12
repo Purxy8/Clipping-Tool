@@ -246,8 +246,20 @@ public sealed class AppUpdateService : IDisposable
 
     private static UpdateManager CreateManager(string updateUrl)
     {
-        if (Uri.TryCreate(updateUrl, UriKind.Absolute, out var uri) &&
-            uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+        if (Path.IsPathFullyQualified(updateUrl))
+        {
+            return new UpdateManager(updateUrl);
+        }
+
+        if (!Uri.TryCreate(updateUrl, UriKind.Absolute, out var uri) ||
+            !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            !string.IsNullOrEmpty(uri.UserInfo))
+        {
+            throw new InvalidOperationException(
+                "ClipForge updates require an HTTPS release address or a fully qualified local test path.");
+        }
+
+        if (uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
         {
             return new UpdateManager(new GithubSource(
                 updateUrl,

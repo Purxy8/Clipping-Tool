@@ -33,18 +33,12 @@ jobs:
     env:
       RELEASE_DIRECTORY: artifacts\Distribution
       UPDATE_URL: https://github.com/${{ github.repository }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
-      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
-      AZURE_SIGNING_METADATA_JSON: ${{ secrets.AZURE_SIGNING_METADATA_JSON }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install .NET SDKs
         uses: actions/setup-dotnet@v4
@@ -62,10 +56,17 @@ jobs:
       - name: Select signing mode
         id: signing
         shell: pwsh
+        env:
+          HAS_WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 != '' }}
+          HAS_WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD != '' }}
+          HAS_AZURE_SIGNING_METADATA: ${{ secrets.AZURE_SIGNING_METADATA_JSON != '' }}
+          HAS_AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID != '' }}
+          HAS_AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID != '' }}
+          HAS_AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID != '' }}
         run: |
-          $hasPfx = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_BASE64)
-          $hasPfxPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_PASSWORD)
-          $hasAzure = -not [string]::IsNullOrWhiteSpace($env:AZURE_SIGNING_METADATA_JSON)
+          $hasPfx = [Convert]::ToBoolean($env:HAS_WINDOWS_SIGNING_PFX)
+          $hasPfxPassword = [Convert]::ToBoolean($env:HAS_WINDOWS_SIGNING_PASSWORD)
+          $hasAzure = [Convert]::ToBoolean($env:HAS_AZURE_SIGNING_METADATA)
 
           if ($hasPfx -ne $hasPfxPassword) {
             throw "Configure both WINDOWS_SIGNING_PFX_BASE64 and WINDOWS_SIGNING_PFX_PASSWORD, or neither."
@@ -75,9 +76,10 @@ jobs:
           }
 
           if ($hasAzure) {
-            $missingAzureCredential = [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -or
-              [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -or
-              [string]::IsNullOrWhiteSpace($env:AZURE_SUBSCRIPTION_ID)
+            $missingAzureCredential = (
+              -not [Convert]::ToBoolean($env:HAS_AZURE_CLIENT_ID) -or
+              -not [Convert]::ToBoolean($env:HAS_AZURE_TENANT_ID) -or
+              -not [Convert]::ToBoolean($env:HAS_AZURE_SUBSCRIPTION_ID))
             if ($missingAzureCredential) {
               throw "Azure signing also requires AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_SUBSCRIPTION_ID."
             }
@@ -99,38 +101,43 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Prepare signing material
-        if: steps.signing.outputs.mode != 'unsigned'
+      - name: Prepare PFX signing material
+        if: steps.signing.outputs.mode == 'pfx'
         shell: pwsh
         env:
-          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
-          if ($env:SIGNING_MODE -eq "pfx") {
-            $pfxPath = Join-Path $env:RUNNER_TEMP "clipforge-signing.pfx"
-            [System.IO.File]::WriteAllBytes(
-              $pfxPath,
-              [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+          $pfxPath = Join-Path $env:RUNNER_TEMP "clipforge-signing.pfx"
+          [System.IO.File]::WriteAllBytes(
+            $pfxPath,
+            [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
 
-            $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
-            $certificate = Import-PfxCertificate `
-              -FilePath $pfxPath `
-              -CertStoreLocation Cert:\CurrentUser\My `
-              -Password $password
-            "SIGNING_THUMBPRINT=$($certificate.Thumbprint)" |
-              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-          else {
-            $metadataPath = Join-Path $env:RUNNER_TEMP "clipforge-azure-signing.json"
-            [System.IO.File]::WriteAllText(
-              $metadataPath,
-              $env:AZURE_SIGNING_METADATA_JSON,
-              [System.Text.UTF8Encoding]::new($false))
-          }
+          $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $pfxPath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          "SIGNING_THUMBPRINT=$($certificate.Thumbprint)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Prepare Azure signing metadata
+        if: steps.signing.outputs.mode == 'azure'
+        shell: pwsh
+        env:
+          AZURE_SIGNING_METADATA_JSON: ${{ secrets.AZURE_SIGNING_METADATA_JSON }}
+        run: |
+          $metadataPath = Join-Path $env:RUNNER_TEMP "clipforge-azure-signing.json"
+          [System.IO.File]::WriteAllText(
+            $metadataPath,
+            $env:AZURE_SIGNING_METADATA_JSON,
+            [System.Text.UTF8Encoding]::new($false))
 
       - name: Download the previous Velopack release
         shell: pwsh
         env:
           CLIPFORGE_VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $headers = @{
             Authorization = "Bearer $env:GITHUB_TOKEN"
@@ -169,6 +176,9 @@ jobs:
           CLIPFORGE_VERSION: ${{ inputs.version }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
           SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          AZURE_CLIENT_ID: ${{ steps.signing.outputs.mode == 'azure' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_TENANT_ID: ${{ steps.signing.outputs.mode == 'azure' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_SUBSCRIPTION_ID: ${{ steps.signing.outputs.mode == 'azure' && secrets.AZURE_SUBSCRIPTION_ID || '' }}
         run: |
           $releaseArguments = @{
             Version = $env:CLIPFORGE_VERSION
@@ -216,6 +226,8 @@ jobs:
           CLIPFORGE_VERSION: ${{ inputs.version }}
           PUBLISH_RELEASE: ${{ inputs.publish }}
           SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $publishRelease = [Convert]::ToBoolean($env:PUBLISH_RELEASE)
           if ($publishRelease -and $env:SIGNING_MODE -eq "unsigned") {
@@ -248,6 +260,7 @@ jobs:
           & gh release upload `
             "v$env:CLIPFORGE_VERSION" `
             (Join-Path $env:RELEASE_DIRECTORY "ClipForge-Setup.exe") `
+            (Join-Path $env:RELEASE_DIRECTORY "ClipForge.Desktop-stable-Portable.zip") `
             (Join-Path $env:RELEASE_DIRECTORY "SHA256SUMS.txt") `
             --repo $env:GITHUB_REPOSITORY `
             --clobber
@@ -265,6 +278,7 @@ jobs:
           path: |
             artifacts/Distribution/ClipForge-Setup.exe
             artifacts/Distribution/ClipForge.Desktop-stable-Setup.exe
+            artifacts/Distribution/ClipForge.Desktop-stable-Portable.zip
             artifacts/Distribution/ClipForge.Desktop-${{ inputs.version }}-*.nupkg
             artifacts/Distribution/releases.*.json*
             artifacts/Distribution/SHA256SUMS.txt

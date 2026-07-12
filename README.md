@@ -1,8 +1,8 @@
 # ClipForge
 
-ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. The MVP is designed around a single, friendly window and local-only capture.
+ClipForge is a Windows instant-replay recorder: leave a private rolling buffer running, then save the moments that already happened as an MP4. Version 1.1 keeps capture local while adding adaptive hardware encoding, an in-app clip library, configurable global shortcuts, and a compact overlay/tray workflow.
 
-## MVP features
+## Features
 
 - Replay lengths: 30 seconds; 1, 2, 3, 5, 10, 20, 30, or 40 minutes; and 1 hour.
 - One selected display, captured at source resolution, 720p, 1080p, 1440p, or 2160p.
@@ -10,7 +10,12 @@ ClipForge is a Windows instant-replay recorder: leave a private rolling buffer r
 - Optional desktop audio from a selected Windows output device.
 - Optional microphone audio from any active Windows capture device.
 - A configurable clips folder, defaulting to `%USERPROFILE%\Videos\ClipForge`.
-- Save from the app or anywhere in Windows with **Ctrl+Shift+F10**.
+- Save from the app or anywhere in Windows with a configurable global shortcut (**Ctrl+Shift+F10** by default).
+- Toggle a compact, always-on-top replay overlay with a second configurable shortcut (**Ctrl+Shift+F9** by default).
+- Close the main window to the notification area while replay continues; use the tray menu to reopen ClipForge, save a clip, or exit.
+- A second launch reopens the existing ClipForge instance instead of competing for capture devices or global shortcuts.
+- Play the latest saved clip in the app and browse the four most recent clips as a thumbnail gallery.
+- Runtime-tested NVIDIA NVENC, Intel Quick Sync, and AMD AMF H.264 encoding, with software H.264 as a compatibility fallback.
 - A live estimate of the disk space needed by the selected rolling buffer.
 - Settings remembered between launches.
 
@@ -64,11 +69,19 @@ For a managed or offline installation, set `CLIPFORGE_FFMPEG_PATH` to either an 
 3. Enable desktop audio and/or microphone capture, then select the desired devices.
 4. Choose the save folder.
 5. Select **Start replay**. ClipForge begins building the rolling buffer on local disk.
-6. Select **Save last clip** or press **Ctrl+Shift+F10** after the buffer has content.
+6. Select **Save last clip** or use the configured Save Clip shortcut after the buffer has content.
 
-The saved MP4 goes to the selected folder. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
+The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
 
-If another application already owns Ctrl+Shift+F10, ClipForge continues to work from its window but reports that the global shortcut could not be registered.
+Select either shortcut in the left settings panel and press a new combination to change it. Each shortcut must contain at least one modifier and a non-modifier key, and Save Clip and Toggle Overlay must be different. If another application owns a chosen combination, ClipForge keeps the previous working registration and reports the conflict.
+
+Closing the main window hides it to the notification area rather than stopping capture. The ClipForge process and FFmpeg capture process must remain running for instant replay to work; choose **Exit ClipForge** from the tray menu when you want them to stop. The compact overlay is a desktop control surface, not an injected in-game overlay, so exclusive-fullscreen applications may display above it.
+
+## Capture performance
+
+At replay startup, ClipForge runs short, real encoding probes instead of assuming that an encoder compiled into FFmpeg is usable with the installed driver. It tries NVIDIA NVENC, Intel Quick Sync, and AMD AMF in that order, then falls back to software H.264. For a verified hardware encoder it tries direct Windows Graphics Capture first, a multi-GPU-compatible Windows Graphics Capture transfer second, and GDI desktop capture last. The active strategy is shown in the interface.
+
+The FFmpeg capture process runs at below-normal priority, and desktop/microphone PCM transfer is bounded so capture cannot grow an unlimited in-memory queue. Hardware encoding generally reduces CPU pressure, but performance still depends on the GPU driver, resolution, frame rate, game, and other software. The release smoke test samples normalized FFmpeg CPU use, working set, and process priority while producing and validating a real six-second clip; that diagnostic is evidence for the test machine, not a guarantee of zero input latency on every PC. Test the intended games, especially at 1440p/2160p or 60 FPS, before relying on a configuration.
 
 ## Privacy and local data
 
@@ -95,7 +108,7 @@ Choosing a cloud-synced save folder, such as a OneDrive folder, can cause the op
 
 ## Storage estimates
 
-ClipForge estimates video at `width × height × FPS × 0.14` bits per second, clamped between 3 and 55 Mbps, plus 192 Kbps when audio is enabled. FFmpeg uses quality-based H.264 encoding, so actual use depends on motion and scene complexity.
+ClipForge estimates video at `width × height × FPS × 0.14` bits per second, clamped between 3 and 55 Mbps, plus 192 Kbps when audio is enabled. FFmpeg uses quality-based H.264 encoding, so actual use depends on motion, scene complexity, and the selected encoder.
 
 Approximate storage for **1080p, 30 FPS, with audio**:
 
@@ -135,13 +148,13 @@ Restore the pinned Velopack 1.2.0 tool and create a versioned Windows installer:
 ```powershell
 dotnet tool restore
 .\scripts\release.ps1 `
-  -Version 1.0.0 `
+  -Version 1.1.0 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY
 ```
 
-The release output contains `ClipForge-Setup.exe`, the full update package, Velopack feed metadata, and `SHA256SUMS.txt`. Use a permanent update URL: it is embedded in the installed application. Every published build must use a new semantic version; do not replace release files for a version users may already have installed.
+The release output contains `ClipForge-Setup.exe`, a portable ZIP, the full update package, Velopack feed metadata, and `SHA256SUMS.txt`. Use a permanent update URL: it is embedded in the installed application. Every published build must use a new semantic version; do not replace release files for a version users may already have installed.
 
-The manual GitHub Actions release workflow downloads the previous feed, builds and tests ClipForge, optionally signs the installer, and uploads a draft or public GitHub Release. It also attaches a stable friendly download name:
+The manual GitHub Actions release workflow downloads the previous feed, builds and tests ClipForge, optionally signs the installer, and uploads a draft or public GitHub Release. Separate CI and CodeQL workflows verify pushes and pull requests, while Dependabot monitors NuGet, .NET SDK, and GitHub Actions dependencies. The release also attaches a stable friendly download name:
 
 ```text
 https://github.com/OWNER/REPOSITORY/releases/latest/download/ClipForge-Setup.exe
@@ -151,13 +164,15 @@ Unsigned installers are appropriate for internal testing, but should not be desc
 
 See [docs/RELEASING.md](docs/RELEASING.md) for signing secrets, the GitHub workflow, release verification, and recovery guidance.
 
-## MVP limitations
+## Current limitations
 
-- Capture uses Windows desktop capture, not a game-specific hook. Windowed and borderless games are the intended target; exclusive-fullscreen games may not be captured reliably.
+- Capture uses direct or compatibility-transfer Windows Graphics Capture when runtime verification succeeds, otherwise GDI desktop capture. None is a game-specific hook; windowed and borderless games are the intended target, and exclusive-fullscreen games may not be captured reliably.
 - HDR/10-bit capture and tone mapping are not implemented. Output is SDR H.264 (`yuv420p`) with AAC audio.
-- Encoding uses CPU-based `libx264`; NVIDIA NVENC, AMD AMF, and Intel Quick Sync are future improvements.
-- One display is captured at a time. There is no window/region picker, overlay, tray mode, clip editor, clip library, or automatic upload yet.
+- Hardware H.264 is used only after a successful runtime probe. Unsupported encoders or drivers fall back automatically; software encoding can be expensive at high resolution or frame rate.
+- One display is captured at a time. There is no window/region picker, clip editor, or automatic upload.
 - Desktop and microphone audio are mixed into one stereo track. Per-application audio and separate editable tracks are not available.
 - Protected/DRM video and some overlays may appear blank.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details and extension points, and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency notices.
+
+See [PRIVACY.md](PRIVACY.md) for the concise network and local-media policy, [SECURITY.md](SECURITY.md) for security boundaries and reporting, and [CHANGELOG.md](CHANGELOG.md) for release history.

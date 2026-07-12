@@ -11,8 +11,10 @@ namespace ClipForge.Services;
 public sealed class ReplayBufferService : IAsyncDisposable
 {
     private const int MaximumDiagnosticLines = 60;
+    private const int MaximumDiagnosticLineCharacters = 1000;
 
     private readonly FfmpegSetupService _ffmpegSetupService;
+    private readonly FfmpegCapabilityProbe _capabilityProbe = new();
     private readonly string _bufferRoot;
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim _saveGate = new(1, 1);
@@ -34,6 +36,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         TimeSpan.FromMinutes(2),
         0);
     private string? _lastSavedPath;
+    private string? _activeEncoderDescription;
+    private long _reportedDroppedAudioBlocks;
     private int _isRunning;
     private int _isSaving;
     private int _isStopping;
@@ -53,6 +57,29 @@ public sealed class ReplayBufferService : IAsyncDisposable
     public event EventHandler<ReplayStateSnapshot>? StateChanged;
 
     public bool IsRunning => Volatile.Read(ref _isRunning) != 0;
+
+    public string? ActiveEncoderDescription => _activeEncoderDescription;
+
+    public int? CaptureProcessId
+    {
+        get
+        {
+            var process = _captureProcess;
+            if (process is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return process.Id;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+    }
 
     public async Task StartAsync(
         CaptureConfiguration configuration,
@@ -97,15 +124,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
                 Directory.CreateDirectory(_segmentDirectory);
                 _sessionCancellation = new CancellationTokenSource();
+                _reportedDroppedAudioBlocks = 0;
                 lock (_diagnosticGate)
                 {
                     _diagnosticLines.Clear();
                 }
 
+                var capabilitySelection = await _capabilityProbe
+                    .SelectAsync(ffmpegPath, configuration, cancellationToken)
+                    .ConfigureAwait(false);
+                _activeEncoderDescription = capabilitySelection.Strategy.Description;
+                EnqueueDiagnostic(capabilitySelection.Diagnostics);
+
                 CreateAudioPipes(configuration);
                 var arguments = FfmpegArgumentBuilder.BuildCaptureArguments(
                     configuration,
                     _audioPipes.Select(pipe => pipe.Specification).ToArray(),
+                    capabilitySelection.Strategy,
                     _segmentDirectory);
 
                 var captureProcess = CreateProcess(ffmpegPath, arguments, redirectStandardInput: true);
@@ -123,6 +158,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 _captureProcess = captureProcess;
+                if (!ProcessTuning.TryApplyLowImpactPriority(captureProcess))
+                {
+                    EnqueueDiagnostic("Windows did not allow ClipForge to lower FFmpeg's process priority.");
+                }
+
                 captureProcess.StandardInput.AutoFlush = true;
                 _diagnosticTask = PumpDiagnosticsAsync(captureProcess);
                 Volatile.Write(ref _isRunning, 1);
@@ -152,7 +192,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     TimeSpan.Zero,
                     _retention,
                     0,
-                    "Instant Replay is filling its buffer."));
+                    $"Instant Replay is filling its buffer using {_activeEncoderDescription}."));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -560,6 +600,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     return;
                 }
 
+                var droppedAudioBlocks = _audioPipes.Sum(pipe => pipe.DroppedSampleBlocks);
+                if (droppedAudioBlocks > _reportedDroppedAudioBlocks)
+                {
+                    EnqueueDiagnostic(
+                        $"Audio backpressure dropped {droppedAudioBlocks - _reportedDroppedAudioBlocks} input block(s); memory remained bounded.");
+                    _reportedDroppedAudioBlocks = droppedAudioBlocks;
+                }
+
                 RefreshBufferState();
             }
         }
@@ -653,10 +701,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
             _retention,
             bytes,
             replayState == ReplayState.Ready
-                ? "Instant Replay is ready."
+                ? $"Instant Replay is ready using {_activeEncoderDescription}."
                 : replayState == ReplayState.Saving
                     ? "Saving your clip…"
-                    : "Instant Replay is filling its buffer.",
+                    : $"Instant Replay is filling its buffer using {_activeEncoderDescription}.",
             lastSavedPath ?? _lastSavedPath));
     }
 
@@ -711,18 +759,29 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         while (await process.StandardError.ReadLineAsync().ConfigureAwait(false) is { } line)
         {
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
+            EnqueueDiagnostic(line);
+        }
+    }
 
-            lock (_diagnosticGate)
+    private void EnqueueDiagnostic(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return;
+        }
+
+        var trimmed = line.Trim();
+        if (trimmed.Length > MaximumDiagnosticLineCharacters)
+        {
+            trimmed = trimmed[^MaximumDiagnosticLineCharacters..];
+        }
+
+        lock (_diagnosticGate)
+        {
+            _diagnosticLines.Enqueue(trimmed);
+            while (_diagnosticLines.Count > MaximumDiagnosticLines)
             {
-                _diagnosticLines.Enqueue(line.Trim());
-                while (_diagnosticLines.Count > MaximumDiagnosticLines)
-                {
-                    _ = _diagnosticLines.Dequeue();
-                }
+                _ = _diagnosticLines.Dequeue();
             }
         }
     }
@@ -732,12 +791,46 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string? detail;
         lock (_diagnosticGate)
         {
-            detail = _diagnosticLines.LastOrDefault();
+            detail = SelectMostUsefulDiagnostic(_diagnosticLines);
         }
 
+        var engine = string.IsNullOrWhiteSpace(_activeEncoderDescription)
+            ? "The capture engine"
+            : $"The capture engine ({_activeEncoderDescription})";
         return string.IsNullOrWhiteSpace(detail)
-            ? "The capture engine stopped unexpectedly. Check that the selected display and audio devices are available."
-            : $"The capture engine stopped unexpectedly. {detail}";
+            ? $"{engine} stopped unexpectedly. Check that the selected display and audio devices are available."
+            : $"{engine} stopped unexpectedly. {detail}";
+    }
+
+    internal static string? SelectMostUsefulDiagnostic(IEnumerable<string> diagnostics)
+    {
+        ArgumentNullException.ThrowIfNull(diagnostics);
+        var lines = diagnostics.Where(line => !string.IsNullOrWhiteSpace(line)).ToArray();
+        string[] highValueMarkers =
+        [
+            "failed to capture",
+            "error opening input",
+            "error while opening encoder",
+            "failed to setup",
+            "no capable devices",
+            "access is denied",
+            "permission denied"
+        ];
+
+        foreach (var marker in highValueMarkers)
+        {
+            var match = lines.LastOrDefault(line =>
+                line.Contains(marker, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+            {
+                return match;
+            }
+        }
+
+        return lines.LastOrDefault(line =>
+                   !line.Contains("nothing was written", StringComparison.OrdinalIgnoreCase) &&
+                   !line.Contains("output file does not contain", StringComparison.OrdinalIgnoreCase))
+               ?? lines.LastOrDefault();
     }
 
     private static async Task RunExportProcessAsync(
@@ -750,6 +843,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         {
             throw new InvalidOperationException("Windows could not start the clip exporter.");
         }
+
+        _ = ProcessTuning.TryApplyLowImpactPriority(process);
 
         var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
         try
@@ -866,17 +961,52 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         try
         {
-            var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
-            var allowedRoot = _bufferRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            if (fullPath.StartsWith(allowedRoot, StringComparison.OrdinalIgnoreCase) &&
-                Directory.Exists(fullPath))
+            var directory = new DirectoryInfo(Path.GetFullPath(path));
+            if (directory.Exists &&
+                IsSafeBufferDirectoryPath(_bufferRoot, directory.FullName, directory.Attributes))
             {
-                Directory.Delete(fullPath, recursive: true);
+                Directory.Delete(directory.FullName, recursive: true);
             }
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
             // A later startup can retry stale session cleanup.
+        }
+    }
+
+    /// <summary>
+    /// Restricts recursive deletion to regular, top-level session directories under the configured
+    /// buffer root. In particular, junctions and symbolic links are never followed by cleanup.
+    /// </summary>
+    internal static bool IsSafeBufferDirectoryPath(
+        string bufferRoot,
+        string candidatePath,
+        FileAttributes attributes)
+    {
+        if ((attributes & FileAttributes.Directory) == 0 ||
+            (attributes & FileAttributes.ReparsePoint) != 0 ||
+            !Path.IsPathFullyQualified(bufferRoot) ||
+            !Path.IsPathFullyQualified(candidatePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(bufferRoot));
+            var normalizedCandidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidatePath));
+            var parent = Path.GetDirectoryName(normalizedCandidate);
+            var name = Path.GetFileName(normalizedCandidate);
+
+            return normalizedRoot.Equals(parent, StringComparison.OrdinalIgnoreCase) &&
+                   name.StartsWith("session-", StringComparison.OrdinalIgnoreCase) &&
+                   name.Length > "session-".Length;
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            return false;
         }
     }
 

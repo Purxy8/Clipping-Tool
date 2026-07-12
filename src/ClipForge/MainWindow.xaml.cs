@@ -1,10 +1,14 @@
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
 using ClipForge.Models;
 using ClipForge.Services;
 using Microsoft.Win32;
+using Button = System.Windows.Controls.Button;
 using Brush = System.Windows.Media.Brush;
+using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 
 namespace ClipForge;
 
@@ -17,9 +21,13 @@ public partial class MainWindow : Window
     private readonly FfmpegSetupService _ffmpegSetupService = new();
     private readonly AppUpdateService _appUpdateService = new();
     private readonly ReplayBufferService _replayBufferService;
+    private readonly ClipLibraryService _clipLibraryService;
     private readonly GlobalHotkeyService _hotkeyService = new();
+    private readonly TrayIconService _trayIconService;
+    private readonly DispatcherTimer _playerTimer;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _captureCommandGate = new(1, 1);
+    private readonly SemaphoreSlim _libraryRefreshGate = new(1, 1);
 
     private AppSettings _settings = new();
     private ReplayStateSnapshot _latestState = new(
@@ -29,17 +37,38 @@ public partial class MainWindow : Window
         0);
     private bool _isInitializing = true;
     private bool _isClosing;
+    private bool _exitRequested;
+    private bool _backgroundHintShown;
+    private bool _isPlayerPlaying;
+    private bool _playWhenOpened;
     private string? _lastSavedPath;
+    private ClipLibraryItem? _currentClip;
+    private OverlayWindow? _overlayWindow;
+    private GlobalHotkeyAction? _capturingHotkeyAction;
 
     public MainWindow()
     {
         _replayBufferService = new ReplayBufferService(_ffmpegSetupService);
+        _clipLibraryService = new ClipLibraryService(_ffmpegSetupService);
         _replayBufferService.StateChanged += ReplayBufferService_StateChanged;
         _appUpdateService.StateChanged += AppUpdateService_StateChanged;
 
         InitializeComponent();
+        _trayIconService = new TrayIconService();
+        _trayIconService.ShowRequested += TrayIconService_ShowRequested;
+        _trayIconService.SaveClipRequested += TrayIconService_SaveClipRequested;
+        _trayIconService.ExitRequested += TrayIconService_ExitRequested;
+
+        _playerTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(250)
+        };
+        _playerTimer.Tick += PlayerTimer_Tick;
+
         Loaded += MainWindow_Loaded;
         Closing += MainWindow_Closing;
+        PreviewKeyDown += MainWindow_PreviewKeyDown;
+        System.Windows.Application.Current.SessionEnding += Application_SessionEnding;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -49,21 +78,27 @@ public partial class MainWindow : Window
         try
         {
             _settings = await _settingsService.LoadAsync(_lifetimeCancellation.Token);
+            _settings.SaveClipHotkey ??= HotkeyGesture.DefaultSaveClip;
+            _settings.ToggleOverlayHotkey ??= HotkeyGesture.DefaultToggleOverlay;
             PopulateControls();
             EnsureSaveDirectory();
             RefreshEngineState();
             UpdateStorageText();
             InitializeUpdateControls();
 
-            _hotkeyService.Pressed += HotkeyService_Pressed;
+            _hotkeyService.SaveClipPressed += HotkeyService_SaveClipPressed;
+            _hotkeyService.ToggleOverlayPressed += HotkeyService_ToggleOverlayPressed;
+            _hotkeyService.RegistrationFailed += HotkeyService_RegistrationFailed;
             try
             {
-                _hotkeyService.Register(this);
+                _hotkeyService.Register(
+                    this,
+                    _settings.SaveClipHotkey,
+                    _settings.ToggleOverlayHotkey);
             }
             catch (Exception exception)
             {
-                ShowError($"The global shortcut could not be registered. {exception.Message}");
-                HotkeyText.Text = "Unavailable";
+                ShowError($"The global shortcuts could not be registered. {exception.Message}");
             }
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
@@ -79,6 +114,7 @@ public partial class MainWindow : Window
             _isInitializing = false;
             UpdateControlsForState(_latestState);
             _ = RunAutomaticUpdateCheckAsync();
+            _ = RefreshClipLibraryAsync();
         }
     }
 
@@ -124,6 +160,8 @@ public partial class MainWindow : Window
             ? AppSettings.GetDefaultSaveDirectory()
             : _settings.SaveDirectory;
         AutoUpdateCheckBox.IsChecked = _settings.CheckForUpdatesAutomatically;
+        HotkeyText.Text = _settings.SaveClipHotkey.DisplayText;
+        OverlayHotkeyText.Text = _settings.ToggleOverlayHotkey.DisplayText;
 
         UpdatePrimaryActionText();
     }
@@ -481,7 +519,7 @@ public partial class MainWindow : Window
 
     private void ReplayBufferService_StateChanged(object? sender, ReplayStateSnapshot snapshot)
     {
-        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
         {
             return;
         }
@@ -508,7 +546,7 @@ public partial class MainWindow : Window
 
     private void UpdateControlsForState(ReplayStateSnapshot snapshot)
     {
-        if (_isInitializing)
+        if (_isInitializing || _isClosing)
         {
             return;
         }
@@ -551,6 +589,20 @@ public partial class MainWindow : Window
                                    !isSaving &&
                                    snapshot.AvailableDuration >= TimeSpan.FromSeconds(1) &&
                                    !_isClosing;
+        if (_replayBufferService.ActiveEncoderDescription is { Length: > 0 } encoderDescription)
+        {
+            EncoderStatusText.Text = $"Performance mode: {encoderDescription}";
+            EncoderStatusText.Foreground = Brush(
+                encoderDescription.Contains("software", StringComparison.OrdinalIgnoreCase)
+                    ? "WarningBrush"
+                    : "SuccessBrush");
+        }
+
+        _trayIconService.UpdateStatus(StatusText.Text, SaveClipButton.IsEnabled);
+        _overlayWindow?.UpdateState(
+            snapshot,
+            isRunning,
+            _settings.SaveClipHotkey.DisplayText);
         UpdateStorageText();
     }
 
@@ -639,6 +691,7 @@ public partial class MainWindow : Window
         EnsureSaveDirectory();
         UpdateStorageText();
         await PersistSettingsAsync();
+        await RefreshClipLibraryAsync();
     }
 
     private void OpenFolderButton_Click(object sender, RoutedEventArgs e)
@@ -674,18 +727,28 @@ public partial class MainWindow : Window
 
     private static void OpenPath(string path)
     {
+        if (!Path.IsPathFullyQualified(path) || (!File.Exists(path) && !Directory.Exists(path)))
+        {
+            throw new FileNotFoundException("The requested local file or folder does not exist.", path);
+        }
+
         _ = Process.Start(new ProcessStartInfo
         {
-            FileName = path,
+            FileName = Path.GetFullPath(path),
             UseShellExecute = true
         });
     }
 
     private void ShowLastSaved(string path)
     {
+        var changed = !string.Equals(_lastSavedPath, path, StringComparison.OrdinalIgnoreCase);
         _lastSavedPath = path;
-        LastSavedText.Text = $"{Path.GetFileName(path)} · {Path.GetDirectoryName(path)}";
+        LastSavedText.Text = $"{Path.GetFileName(path)} · saved";
         LastSavedPanel.Visibility = Visibility.Visible;
+        if (changed)
+        {
+            _ = RefreshClipLibraryAsync(path);
+        }
     }
 
     private void ShowError(string message)
@@ -738,6 +801,7 @@ public partial class MainWindow : Window
 
                 case AppUpdateState.ReadyToRestart:
                     _appUpdateService.ScheduleApplyAndRestart();
+                    _exitRequested = true;
                     Close();
                     break;
 
@@ -773,7 +837,7 @@ public partial class MainWindow : Window
 
     private void AppUpdateService_StateChanged(object? sender, AppUpdateSnapshot snapshot)
     {
-        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
         {
             return;
         }
@@ -810,16 +874,483 @@ public partial class MainWindow : Window
         };
     }
 
-    private void HotkeyService_Pressed(object? sender, EventArgs e)
+    private void HideToTrayButton_Click(object sender, RoutedEventArgs e) => HideToTray();
+
+    private void DismissErrorButton_Click(object sender, RoutedEventArgs e) => HideError();
+
+    private void TrayIconService_ShowRequested(object? sender, EventArgs e) =>
+        DispatchToUi(ShowMainWindow);
+
+    private void TrayIconService_SaveClipRequested(object? sender, EventArgs e) =>
+        DispatchToUi(() => _ = SaveClipFromShortcutAsync());
+
+    private void TrayIconService_ExitRequested(object? sender, EventArgs e)
+        => DispatchToUi(RequestExit);
+
+    private void RequestExit()
     {
+        _exitRequested = true;
+        Close();
+    }
+
+    private void Application_SessionEnding(object sender, SessionEndingCancelEventArgs e)
+    {
+        _exitRequested = true;
+        Close();
+    }
+
+    private void HotkeyService_SaveClipPressed(object? sender, EventArgs e) =>
+        _ = SaveClipFromShortcutAsync();
+
+    private void HotkeyService_ToggleOverlayPressed(object? sender, EventArgs e) => ToggleOverlay();
+
+    private void HotkeyService_RegistrationFailed(
+        object? sender,
+        GlobalHotkeyRegistrationFailedEventArgs e) =>
+        ShowError(e.Error.Message);
+
+    private async Task SaveClipFromShortcutAsync()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
         if (_replayBufferService.IsRunning)
         {
-            _ = SaveClipAsync();
+            await SaveClipAsync();
         }
         else
         {
-            ShowError("Instant Replay is off. Start it before using Ctrl + Shift + F10.");
+            ShowError($"Instant Replay is off. Start it before using {_settings.SaveClipHotkey.DisplayText}.");
         }
+    }
+
+    private void SaveHotkeyButton_Click(object sender, RoutedEventArgs e) =>
+        BeginHotkeyCapture(GlobalHotkeyAction.SaveClip, SaveHotkeyButton);
+
+    private void OverlayHotkeyButton_Click(object sender, RoutedEventArgs e) =>
+        BeginHotkeyCapture(GlobalHotkeyAction.ToggleOverlay, OverlayHotkeyButton);
+
+    private void BeginHotkeyCapture(GlobalHotkeyAction action, Button sourceButton)
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        _capturingHotkeyAction = action;
+        HotkeyCaptureHint.Text = action == GlobalHotkeyAction.SaveClip
+            ? "Press the new Save Clip combination now. Esc cancels."
+            : "Press the new Toggle Overlay combination now. Esc cancels.";
+        HotkeyCaptureHint.Foreground = Brush("AccentHoverBrush");
+        HotkeyCaptureHint.Visibility = Visibility.Visible;
+        sourceButton.Focus();
+    }
+
+    private async void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_capturingHotkeyAction is not { } action)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key == Key.Escape && Keyboard.Modifiers == ModifierKeys.None)
+        {
+            EndHotkeyCapture("Shortcut change cancelled.", isError: false);
+            return;
+        }
+
+        var gesture = new HotkeyGesture(GetHotkeyModifiers(Keyboard.Modifiers), key);
+        if (!gesture.TryValidate(out var validationError))
+        {
+            HotkeyCaptureHint.Text = validationError ?? "Press at least one modifier and a non-modifier key.";
+            HotkeyCaptureHint.Foreground = Brush("WarningBrush");
+            return;
+        }
+
+        var saveGesture = action == GlobalHotkeyAction.SaveClip
+            ? gesture
+            : _settings.SaveClipHotkey;
+        var overlayGesture = action == GlobalHotkeyAction.ToggleOverlay
+            ? gesture
+            : _settings.ToggleOverlayHotkey;
+
+        try
+        {
+            if (_hotkeyService.IsSaveClipRegistered || _hotkeyService.IsToggleOverlayRegistered)
+            {
+                _hotkeyService.ReRegister(saveGesture, overlayGesture);
+            }
+            else
+            {
+                _hotkeyService.Register(this, saveGesture, overlayGesture);
+            }
+
+            _settings.SaveClipHotkey = saveGesture;
+            _settings.ToggleOverlayHotkey = overlayGesture;
+            HotkeyText.Text = saveGesture.DisplayText;
+            OverlayHotkeyText.Text = overlayGesture.DisplayText;
+            _overlayWindow?.UpdateState(_latestState, _replayBufferService.IsRunning, saveGesture.DisplayText);
+            EndHotkeyCapture($"Shortcut set to {gesture.DisplayText}.", isError: false);
+            await PersistSettingsAsync();
+        }
+        catch (Exception exception) when (
+            exception is GlobalHotkeyRegistrationException or ArgumentException or InvalidOperationException)
+        {
+            EndHotkeyCapture(exception.Message, isError: true);
+            ShowError(exception.Message);
+        }
+    }
+
+    private void EndHotkeyCapture(string message, bool isError)
+    {
+        _capturingHotkeyAction = null;
+        HotkeyCaptureHint.Text = message;
+        HotkeyCaptureHint.Foreground = Brush(isError ? "ErrorBrush" : "TextMutedBrush");
+        Keyboard.ClearFocus();
+    }
+
+    private static HotkeyModifiers GetHotkeyModifiers(ModifierKeys modifiers)
+    {
+        var result = HotkeyModifiers.None;
+        if (modifiers.HasFlag(ModifierKeys.Control))
+        {
+            result |= HotkeyModifiers.Control;
+        }
+
+        if (modifiers.HasFlag(ModifierKeys.Alt))
+        {
+            result |= HotkeyModifiers.Alt;
+        }
+
+        if (modifiers.HasFlag(ModifierKeys.Shift))
+        {
+            result |= HotkeyModifiers.Shift;
+        }
+
+        if (modifiers.HasFlag(ModifierKeys.Windows))
+        {
+            result |= HotkeyModifiers.Windows;
+        }
+
+        return result;
+    }
+
+    private void ToggleOverlay()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        var overlay = EnsureOverlayWindow();
+        if (overlay.IsVisible)
+        {
+            overlay.Hide();
+            return;
+        }
+
+        overlay.UpdateState(_latestState, _replayBufferService.IsRunning, _settings.SaveClipHotkey.DisplayText);
+        overlay.Show();
+    }
+
+    private OverlayWindow EnsureOverlayWindow()
+    {
+        if (_overlayWindow is not null)
+        {
+            return _overlayWindow;
+        }
+
+        _overlayWindow = new OverlayWindow();
+        _overlayWindow.SaveRequested += (_, _) => _ = SaveClipFromShortcutAsync();
+        _overlayWindow.ShowAppRequested += (_, _) => ShowMainWindow();
+        _overlayWindow.Closing += (_, args) =>
+        {
+            if (!_exitRequested)
+            {
+                args.Cancel = true;
+                _overlayWindow.Hide();
+            }
+        };
+        return _overlayWindow;
+    }
+
+    private void HideToTray()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        if (_isPlayerPlaying)
+        {
+            ClipPlayer.Pause();
+            SetPlayerPlaying(false);
+        }
+
+        Hide();
+        if (!_backgroundHintShown)
+        {
+            _backgroundHintShown = true;
+            _trayIconService.ShowBackgroundHint();
+        }
+    }
+
+    private void ShowMainWindow()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        Show();
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
+    }
+
+    internal void ShowFromSecondaryInstance()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        _overlayWindow?.Hide();
+        ShowMainWindow();
+    }
+
+    private void DispatchToUi(Action action)
+    {
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        if (Dispatcher.CheckAccess())
+        {
+            action();
+        }
+        else
+        {
+            _ = Dispatcher.BeginInvoke(action);
+        }
+    }
+
+    private async void RefreshLibraryButton_Click(object sender, RoutedEventArgs e) =>
+        await RefreshClipLibraryAsync();
+
+    private void OpenCurrentClipButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentClip is null || !File.Exists(_currentClip.FullPath))
+        {
+            ShowError("The selected clip is no longer available.");
+            return;
+        }
+
+        OpenPath(_currentClip.FullPath);
+    }
+
+    private void RecentClipButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: ClipLibraryItem clip })
+        {
+            SelectClip(clip, autoplay: true);
+        }
+    }
+
+    private async Task RefreshClipLibraryAsync(string? preferredPath = null)
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        var gateEntered = false;
+        try
+        {
+            await _libraryRefreshGate.WaitAsync(_lifetimeCancellation.Token);
+            gateEntered = true;
+            var snapshot = await _clipLibraryService.LoadAsync(
+                _settings.SaveDirectory,
+                count: 5,
+                includeThumbnails: true,
+                _lifetimeCancellation.Token);
+
+            RecentClipsItemsControl.ItemsSource = snapshot.GalleryClips;
+            var selected = preferredPath is { Length: > 0 }
+                ? snapshot.Clips.FirstOrDefault(clip =>
+                    clip.FullPath.Equals(preferredPath, StringComparison.OrdinalIgnoreCase))
+                : _currentClip is not null
+                    ? snapshot.Clips.FirstOrDefault(clip =>
+                        clip.FullPath.Equals(_currentClip.FullPath, StringComparison.OrdinalIgnoreCase))
+                    : null;
+            selected ??= snapshot.LatestClip;
+
+            if (selected is null)
+            {
+                ClearPlayer();
+            }
+            else if (_currentClip is null ||
+                     !_currentClip.FullPath.Equals(selected.FullPath, StringComparison.OrdinalIgnoreCase) ||
+                     preferredPath is not null)
+            {
+                SelectClip(selected, autoplay: preferredPath is not null);
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Application shutdown.
+        }
+        catch (Exception exception)
+        {
+            ShowError($"The clip gallery could not be refreshed. {exception.Message}");
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                _libraryRefreshGate.Release();
+            }
+        }
+    }
+
+    private void SelectClip(ClipLibraryItem clip, bool autoplay)
+    {
+        if (!File.Exists(clip.FullPath))
+        {
+            ShowError("The selected clip is no longer available.");
+            return;
+        }
+
+        ClipPlayer.Stop();
+        _currentClip = clip;
+        _playWhenOpened = autoplay;
+        _isPlayerPlaying = false;
+        ClipPlayer.Source = new Uri(clip.FullPath, UriKind.Absolute);
+        LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
+        PlayerEmptyState.Visibility = Visibility.Collapsed;
+        OpenCurrentClipButton.IsEnabled = true;
+        PlayPauseButton.IsEnabled = true;
+        RestartClipButton.IsEnabled = true;
+        PlayPauseButton.Content = "▶";
+        PlayerTimeText.Text = clip.Duration is { } duration
+            ? $"0:00 / {FormatDuration(duration)}"
+            : "0:00 / --:--";
+        if (autoplay)
+        {
+            ClipPlayer.Play();
+            SetPlayerPlaying(true);
+        }
+    }
+
+    private void ClearPlayer()
+    {
+        ClipPlayer.Stop();
+        ClipPlayer.Source = null;
+        _currentClip = null;
+        _playWhenOpened = false;
+        SetPlayerPlaying(false);
+        LatestClipNameText.Text = "Your newest saved clip will appear here.";
+        PlayerEmptyState.Visibility = Visibility.Visible;
+        OpenCurrentClipButton.IsEnabled = false;
+        PlayPauseButton.IsEnabled = false;
+        RestartClipButton.IsEnabled = false;
+        PlayerTimeText.Text = "0:00 / 0:00";
+    }
+
+    private void PlayPauseButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentClip is null)
+        {
+            return;
+        }
+
+        if (_isPlayerPlaying)
+        {
+            ClipPlayer.Pause();
+            SetPlayerPlaying(false);
+        }
+        else
+        {
+            ClipPlayer.Play();
+            SetPlayerPlaying(true);
+        }
+    }
+
+    private void RestartClipButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentClip is null)
+        {
+            return;
+        }
+
+        ClipPlayer.Position = TimeSpan.Zero;
+        ClipPlayer.Play();
+        SetPlayerPlaying(true);
+    }
+
+    private void ClipPlayer_MediaOpened(object sender, RoutedEventArgs e)
+    {
+        PlayerEmptyState.Visibility = Visibility.Collapsed;
+        PlayPauseButton.IsEnabled = true;
+        RestartClipButton.IsEnabled = true;
+        var shouldAutoplay = _playWhenOpened;
+        _playWhenOpened = false;
+        if (shouldAutoplay)
+        {
+            ClipPlayer.Play();
+            SetPlayerPlaying(true);
+        }
+
+        UpdatePlayerTime();
+    }
+
+    private void ClipPlayer_MediaEnded(object sender, RoutedEventArgs e)
+    {
+        ClipPlayer.Pause();
+        ClipPlayer.Position = TimeSpan.Zero;
+        SetPlayerPlaying(false);
+        UpdatePlayerTime();
+    }
+
+    private void ClipPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        _playWhenOpened = false;
+        SetPlayerPlaying(false);
+        PlayPauseButton.IsEnabled = false;
+        RestartClipButton.IsEnabled = false;
+        ShowError($"This clip could not be played inside ClipForge. {e.ErrorException.Message}");
+    }
+
+    private void SetPlayerPlaying(bool isPlaying)
+    {
+        _isPlayerPlaying = isPlaying;
+        PlayPauseButton.Content = isPlaying ? "Ⅱ" : "▶";
+        if (isPlaying)
+        {
+            _playerTimer.Start();
+        }
+        else
+        {
+            _playerTimer.Stop();
+        }
+    }
+
+    private void PlayerTimer_Tick(object? sender, EventArgs e) => UpdatePlayerTime();
+
+    private void UpdatePlayerTime()
+    {
+        var total = ClipPlayer.NaturalDuration.HasTimeSpan
+            ? ClipPlayer.NaturalDuration.TimeSpan
+            : _currentClip?.Duration ?? TimeSpan.Zero;
+        PlayerTimeText.Text = $"{FormatDuration(ClipPlayer.Position)} / {(total > TimeSpan.Zero ? FormatDuration(total) : "--:--")}";
     }
 
     private static string FormatDuration(TimeSpan duration) =>
@@ -829,8 +1360,16 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Closing(object? sender, CancelEventArgs e)
     {
+        if (!_exitRequested && !_isClosing)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
         if (_isClosing)
         {
+            e.Cancel = true;
             return;
         }
 
@@ -865,7 +1404,23 @@ public partial class MainWindow : Window
         {
             _replayBufferService.StateChanged -= ReplayBufferService_StateChanged;
             _appUpdateService.StateChanged -= AppUpdateService_StateChanged;
-            _hotkeyService.Pressed -= HotkeyService_Pressed;
+            _hotkeyService.SaveClipPressed -= HotkeyService_SaveClipPressed;
+            _hotkeyService.ToggleOverlayPressed -= HotkeyService_ToggleOverlayPressed;
+            _hotkeyService.RegistrationFailed -= HotkeyService_RegistrationFailed;
+            _trayIconService.ShowRequested -= TrayIconService_ShowRequested;
+            _trayIconService.SaveClipRequested -= TrayIconService_SaveClipRequested;
+            _trayIconService.ExitRequested -= TrayIconService_ExitRequested;
+            System.Windows.Application.Current.SessionEnding -= Application_SessionEnding;
+            PreviewKeyDown -= MainWindow_PreviewKeyDown;
+            _playerTimer.Stop();
+            _playerTimer.Tick -= PlayerTimer_Tick;
+            ClipPlayer.Stop();
+            if (_overlayWindow is not null)
+            {
+                _overlayWindow.Close();
+            }
+
+            _trayIconService.Dispose();
             _appUpdateService.Dispose();
             _hotkeyService.Dispose();
             _settingsService.Dispose();

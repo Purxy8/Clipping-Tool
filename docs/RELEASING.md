@@ -32,13 +32,13 @@ Restore the pinned tool, then build an installer from the repository root:
 ```powershell
 dotnet tool restore
 .\scripts\release.ps1 `
-  -Version 1.0.0 `
+  -Version 1.1.0 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY
 ```
 
 The update URL is compiled into the application. Use the final, permanent repository URL for a distributable build. A build without `-UpdateUrl` can be used for local testing, but it cannot discover later releases.
 
-By default, local release assets are written to `artifacts\Releases`; the GitHub workflow explicitly uses the isolated `artifacts\Distribution` directory. They include the user-facing installer, the Velopack package and update-feed files, and `SHA256SUMS.txt`. The self-contained application includes the .NET runtime but does not bundle FFmpeg.
+By default, local release assets are written to `artifacts\Releases`; the GitHub workflow explicitly uses the isolated `artifacts\Distribution` directory. They include the user-facing installer, portable ZIP, Velopack package and update-feed files, and `SHA256SUMS.txt`. The self-contained application includes the .NET runtime but does not bundle FFmpeg.
 
 The script runs the Release build and tests before packaging. It refuses to overwrite an existing full package with the same version.
 
@@ -48,6 +48,14 @@ An unsigned installer is suitable for internal testing, but it is not an officia
 
 Two signing routes are supported by `scripts/release.ps1`:
 
+For a Bulgarian publisher, choose the identity route before purchasing anything:
+
+- A registered company or other legal organization in the EU can currently apply for Microsoft Azure Artifact Signing Public Trust, Microsoft's recommended direct-download option.
+- An individual publisher in Bulgaria is not currently eligible for Azure Artifact Signing Public Trust. Use a publicly trusted OV code-signing provider that explicitly supports individuals and unattended/cloud CI, or consider SignPath Foundation only if the project deliberately adopts an OSI-approved open-source license and meets its program conditions.
+- A self-signed certificate is useful only for private testing or centrally managed company PCs; it is not suitable for a public GitHub download.
+
+See Microsoft's current [Windows code-signing options](https://learn.microsoft.com/windows/apps/package-and-deploy/code-signing-options) and [Artifact Signing eligibility FAQ](https://learn.microsoft.com/azure/artifact-signing/faq) before ordering. Availability, validation rules, and pricing can change.
+
 ### Authenticode certificate
 
 First make the certificate available to `signtool.exe`, then pass the signing arguments without the `sign` verb:
@@ -55,7 +63,7 @@ First make the certificate available to `signtool.exe`, then pass the signing ar
 ```powershell
 $signing = '/sha1 CERTIFICATE_THUMBPRINT /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com'
 .\scripts\release.ps1 `
-  -Version 1.0.0 `
+  -Version 1.1.0 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY `
   -SignParams $signing
 ```
@@ -78,7 +86,7 @@ Pass it to the release script:
 
 ```powershell
 .\scripts\release.ps1 `
-  -Version 1.0.0 `
+  -Version 1.1.0 `
   -UpdateUrl https://github.com/OWNER/REPOSITORY `
   -AzureTrustedSignFile C:\secure\clipforge-signing.json
 ```
@@ -93,7 +101,7 @@ Artifact Signing also requires a valid Microsoft identity validation, certificat
 2. Downloads the previous Velopack GitHub release when a feed already exists, allowing Velopack to produce delta updates.
 3. Builds, tests, optionally signs, and packages ClipForge with `scripts/release.ps1`.
 4. Verifies that a requested signature is valid.
-5. Uploads the update assets through `vpk upload github` using GitHub's short-lived `GITHUB_TOKEN`, then attaches the friendly `ClipForge-Setup.exe` alias and checksum file to the same release.
+5. Uploads the update assets through `vpk upload github` using GitHub's short-lived `GITHUB_TOKEN`, then attaches the friendly `ClipForge-Setup.exe` alias, portable ZIP, and checksum file to the same release.
 6. Retains the primary release files as a workflow artifact for 14 days.
 
 To run it, open **Actions > Release ClipForge > Run workflow**, enter a new version and optional release notes, and decide whether to publish immediately. The `publish` option defaults to off, which creates a draft GitHub release. Review the assets and signature before publishing the draft. The workflow refuses immediate publishing when no signing configuration is present.
@@ -101,6 +109,8 @@ To run it, open **Actions > Release ClipForge > Run workflow**, enter a new vers
 No repository signing secret is required for an unsigned test run. Configure exactly one of the following sets for a trusted release.
 
 ### PFX secrets
+
+Use this mode only when the issuer provides an exportable, CI-suitable PFX. Many modern public code-signing products keep the private key in a hardware token or cloud HSM and require their own signing integration instead.
 
 | GitHub Actions secret | Content |
 | --- | --- |
