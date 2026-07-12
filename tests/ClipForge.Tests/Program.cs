@@ -4,6 +4,8 @@ using ClipForge.Models;
 using ClipForge.Services;
 using ClipForge.Capture;
 using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 
 namespace ClipForge.Tests;
 
@@ -35,6 +37,8 @@ internal static class Program
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
             ("Secure clip discovery and thumbnail cache", TestClipLibraryAsync),
             ("Clip path and media process hardening", TestClipLibrarySecurityPolicyAsync),
+            ("Race-resistant clip deletion", TestClipDeletionAsync),
+            ("Thumbnail decoding releases cache files", TestThumbnailDecoderReleasesFileAsync),
             ("Clip library fail-closed probing", TestClipLibraryFailClosedAsync),
             ("Clip library probe budget", TestClipLibraryProbeBudgetAsync),
             ("Runtime local-data boundaries", TestRuntimeLocalDataBoundariesAsync),
@@ -113,6 +117,16 @@ internal static class Program
             AppSettings.DefaultBackgroundColor,
             defaults.BackgroundColor,
             "The default background color is incorrect.");
+        Assert.Equal(4, defaults.RecentClipCount, "The recent clip gallery should default to four items.");
+        int[] expectedRecentClipCounts = [4, 8, 10, 15];
+        Assert.SequenceEqual(
+            expectedRecentClipCounts,
+            expectedRecentClipCounts.Select(AppSettings.NormalizeRecentClipCount),
+            "Supported recent clip counts should remain unchanged.");
+        Assert.Equal(
+            4,
+            AppSettings.NormalizeRecentClipCount(100),
+            "An unsupported persisted recent clip count must fall back to four.");
         Assert.Equal(HotkeyGesture.DefaultSaveClip, defaults.SaveClipHotkey, "The Save Clip hotkey default is incorrect.");
         Assert.Equal(
             HotkeyGesture.DefaultToggleOverlay,
@@ -254,7 +268,8 @@ internal static class Program
             [],
             new VideoEncodingStrategy(VideoEncoderKind.NvidiaNvenc, DesktopCaptureBackend.Gdi),
             @"C:\Buffer");
-        Assert.ContainsSequence(nvenc, "-c:v", "h264_nvenc", "-preset", "p4");
+        Assert.ContainsSequence(nvenc, "-c:v", "h264_nvenc", "-preset", "p2");
+        Assert.ContainsSequence(nvenc, "-multipass", "disabled", "-rc-lookahead", "0");
         Assert.ContainsSequence(nvenc, "-rc-lookahead", "0", "-surfaces", "4", "-bf", "0");
         Assert.ContainsSequence(nvenc, "-forced-idr", "1");
         Assert.True(
@@ -685,6 +700,7 @@ internal static class Program
                 MicrophoneDeviceId = "microphone-device",
                 CheckForUpdatesAutomatically = false,
                 BackgroundColor = "#161321",
+                RecentClipCount = 10,
                 SaveClipHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Alt, Key.F8),
                 ToggleOverlayHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Shift, Key.O),
                 SaveDirectory = Path.Combine(testDirectory, "Clips")
@@ -710,6 +726,10 @@ internal static class Program
                 expected.BackgroundColor,
                 actual.BackgroundColor,
                 "Background color did not roundtrip.");
+            Assert.Equal(
+                expected.RecentClipCount,
+                actual.RecentClipCount,
+                "Recent clip count did not roundtrip.");
             Assert.Equal(expected.SaveClipHotkey, actual.SaveClipHotkey, "Save Clip hotkey did not roundtrip.");
             Assert.Equal(
                 expected.ToggleOverlayHotkey,
@@ -911,7 +931,365 @@ internal static class Program
             thumbnailArguments,
             "-nostdin", "-y", "-threads", "1", "-protocol_whitelist", "file", "-f", "mov");
         Assert.ContainsSequence(thumbnailArguments, "-i", valid, "-map", "0:v:0");
+        Assert.True(
+            !ClipLibraryService.HasUsableFileId(new ClipFileIdentity(42, 0, 0, 1)),
+            "An all-zero filesystem file ID must fail closed.");
+        Assert.True(
+            ClipLibraryService.HasUsableFileId(new ClipFileIdentity(42, 1, 0, 1)),
+            "A non-zero filesystem file ID should be accepted.");
         return Task.CompletedTask;
+    }
+
+    private static async Task TestClipDeletionAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var cacheDirectory = Path.Combine(testDirectory, "Cache");
+        string? linkedCacheDirectory = null;
+
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(cacheDirectory);
+            var ffmpegPath = Path.Combine(testDirectory, "ffmpeg.exe");
+            await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
+            var runner = new FakeClipMediaProcessRunner();
+            var service = new ClipLibraryService(
+                () => ffmpegPath,
+                () => null,
+                runner,
+                cacheDirectory,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+            var clipPath = Path.Combine(clipsDirectory, "Clip_2026-07-12_20-00-00.mp4");
+            await File.WriteAllBytesAsync(clipPath, [1, 2, 3, 4, 5]).ConfigureAwait(false);
+            var info = new FileInfo(clipPath);
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(clipPath, out var identity),
+                "A discovered clip should receive a stable Windows file identity.");
+            var clip = new ClipLibraryItem(
+                info.Name,
+                info.FullName,
+                new DateTimeOffset(DateTime.SpecifyKind(info.LastWriteTimeUtc, DateTimeKind.Utc)),
+                info.Length,
+                TimeSpan.FromSeconds(1))
+            {
+                FileIdentity = identity
+            };
+            var thumbnailPath = service.GetDeterministicThumbnailPath(clip);
+            var legacyThumbnailPath = service.GetLegacyThumbnailPath(clip);
+            var legacyKeyMaterial = string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"{clip.FullPath.ToUpperInvariant()}\n{clip.FileSizeBytes}\n{clip.RecordedAtUtc.UtcDateTime.Ticks}");
+            var expectedLegacyName = $"{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(legacyKeyMaterial)))}.jpg";
+            Assert.Equal(
+                expectedLegacyName,
+                Path.GetFileName(legacyThumbnailPath),
+                "The legacy key must remain byte-compatible with ClipForge v1.2 path/size/mtime hashing.");
+            await File.WriteAllBytesAsync(thumbnailPath, [0xFF, 0xD8, 0xFF, 0xFF, 0xD9]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(legacyThumbnailPath, [0xFF, 0xD8, 0xFF, 0xFF, 0xD9]).ConfigureAwait(false);
+            clip = clip with { ThumbnailPath = thumbnailPath };
+
+            Assert.Equal(
+                thumbnailPath,
+                await service.GetThumbnailAsync(clipsDirectory, clip).ConfigureAwait(false),
+                "The identity-bound thumbnail should be reused without invoking FFmpeg.");
+            Assert.True(
+                !File.Exists(legacyThumbnailPath),
+                "Loading the current thumbnail should prune exactly its legacy v1.2 cache key.");
+            Assert.Equal(0, runner.ThumbnailRunCount, "A current cache hit must not invoke FFmpeg.");
+            await File.WriteAllBytesAsync(
+                    legacyThumbnailPath,
+                    [0xFF, 0xD8, 0xFF, 0xFF, 0xD9])
+                .ConfigureAwait(false);
+
+            Assert.True(
+                ClipLibraryService.TryGetCurrentClipPath(clipsDirectory, clip, out var validatedPath),
+                "An unchanged ClipForge-owned gallery item should revalidate before an action.");
+            Assert.Equal(info.FullName, validatedPath, "The revalidated clip path should stay normalized.");
+            Assert.Equal(
+                ClipDeletionResult.Deleted,
+                ClipLibraryService.DeleteCurrentClip(clipsDirectory, clip),
+                "The exact revalidated clip should be deleted by handle.");
+            Assert.True(!File.Exists(clipPath), "The deleted clip should no longer exist.");
+            service.RemoveCachedThumbnail(clip);
+            Assert.True(
+                !File.Exists(thumbnailPath),
+                "Permanently deleting a clip should remove its cached visual thumbnail.");
+            Assert.True(
+                !File.Exists(legacyThumbnailPath),
+                "Permanently deleting a clip should also remove its legacy v1.2 thumbnail.");
+
+            await File.WriteAllBytesAsync(clipPath, [6, 7, 8, 9, 10]).ConfigureAwait(false);
+            info.Refresh();
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(clipPath, out var staleIdentity),
+                "The replacement test clip should receive a Windows file identity.");
+            var staleClip = new ClipLibraryItem(
+                info.Name,
+                info.FullName,
+                new DateTimeOffset(DateTime.SpecifyKind(info.LastWriteTimeUtc, DateTimeKind.Utc)),
+                info.Length,
+                TimeSpan.FromSeconds(1))
+            {
+                FileIdentity = staleIdentity
+            };
+            var staleThumbnailPath = service.GetDeterministicThumbnailPath(staleClip);
+            await File.WriteAllBytesAsync(
+                    staleThumbnailPath,
+                    [0xFF, 0xD8, 0xFF, 0xFF, 0xD9])
+                .ConfigureAwait(false);
+            var preservedTimestamp = info.LastWriteTimeUtc;
+            File.Delete(clipPath);
+            await File.WriteAllBytesAsync(clipPath, [11, 12, 13, 14, 15]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(clipPath, preservedTimestamp);
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(clipPath, out var replacementIdentity) &&
+                replacementIdentity != staleIdentity,
+                "A same-size, same-time replacement must still have a different file identity.");
+            var replacementClip = staleClip with { FileIdentity = replacementIdentity };
+            Assert.True(
+                !service.GetDeterministicThumbnailPath(replacementClip)
+                    .Equals(staleThumbnailPath, StringComparison.OrdinalIgnoreCase),
+                "Thumbnail cache keys must include the stable file identity.");
+            Assert.Equal(
+                null,
+                await service.GetThumbnailAsync(clipsDirectory, staleClip).ConfigureAwait(false),
+                "A stale item must not reuse a cached thumbnail after same-metadata replacement.");
+            Assert.Equal(
+                0,
+                runner.ThumbnailRunCount,
+                "A stale file identity must be rejected before launching the thumbnail helper.");
+
+            Assert.Equal(
+                ClipDeletionResult.ChangedOrUnsafe,
+                ClipLibraryService.DeleteCurrentClip(clipsDirectory, staleClip),
+                "A same-metadata replacement must not be deleted.");
+            Assert.True(File.Exists(clipPath), "The replacement clip must remain on disk after deletion is rejected.");
+            service.RemoveCachedThumbnail(staleClip);
+            Assert.True(
+                !File.Exists(staleThumbnailPath),
+                "Identity-bound stale thumbnails should still be removable by their trusted cache key.");
+
+            var writeBlocked = false;
+            var clipRenameBlocked = false;
+            var rootRenameBlocked = false;
+            var cacheRootRenameBlocked = false;
+            var movedClipPath = Path.Combine(clipsDirectory, "Clip_2026-07-12_20-00-00_moved.mp4");
+            var movedRootPath = Path.Combine(testDirectory, "Clips-Moved");
+            var pinnedCacheDirectory = Path.Combine(testDirectory, "PinnedCache");
+            var movedCachePath = Path.Combine(testDirectory, "PinnedCache-Moved");
+            var pinnedRunner = new FakeClipMediaProcessRunner
+            {
+                BeforeThumbnailWrite = _ =>
+                {
+                    try
+                    {
+                        using var writer = new FileStream(
+                            clipPath,
+                            FileMode.Open,
+                            FileAccess.Write,
+                            FileShare.ReadWrite | FileShare.Delete);
+                    }
+                    catch (IOException)
+                    {
+                        writeBlocked = true;
+                    }
+
+                    try
+                    {
+                        File.Move(clipPath, movedClipPath);
+                        File.Move(movedClipPath, clipPath);
+                    }
+                    catch (IOException)
+                    {
+                        clipRenameBlocked = true;
+                    }
+
+                    try
+                    {
+                        Directory.Move(clipsDirectory, movedRootPath);
+                        Directory.Move(movedRootPath, clipsDirectory);
+                    }
+                    catch (IOException)
+                    {
+                        rootRenameBlocked = true;
+                    }
+
+                    try
+                    {
+                        Directory.Move(pinnedCacheDirectory, movedCachePath);
+                        Directory.Move(movedCachePath, pinnedCacheDirectory);
+                    }
+                    catch (IOException)
+                    {
+                        cacheRootRenameBlocked = true;
+                    }
+                }
+            };
+            var pinnedService = new ClipLibraryService(
+                () => ffmpegPath,
+                () => null,
+                pinnedRunner,
+                pinnedCacheDirectory,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+            var multiLinkReadClip = replacementClip with
+            {
+                FileIdentity = replacementIdentity with { NumberOfLinks = 2 }
+            };
+            Directory.CreateDirectory(pinnedCacheDirectory);
+            var generatedLegacyPath = pinnedService.GetLegacyThumbnailPath(multiLinkReadClip);
+            await File.WriteAllBytesAsync(
+                    generatedLegacyPath,
+                    [0xFF, 0xD8, 0xFF, 0xFF, 0xD9])
+                .ConfigureAwait(false);
+            var pinnedThumbnail = await pinnedService.GetThumbnailAsync(
+                    clipsDirectory,
+                    multiLinkReadClip)
+                .ConfigureAwait(false);
+            Assert.True(
+                pinnedThumbnail is not null && File.Exists(pinnedThumbnail),
+                "Thumbnail reads should permit a stable identity with multiple links.");
+            Assert.True(
+                !File.Exists(generatedLegacyPath),
+                "Generating a current thumbnail should prune its single legacy v1.2 cache key.");
+            Assert.True(writeBlocked, "The pinned clip handle must block writes while FFmpeg reads by pathname.");
+            Assert.True(clipRenameBlocked, "The pinned clip handle must block rename/delete access during FFmpeg.");
+            Assert.True(rootRenameBlocked, "The pinned root handle must block replacement during FFmpeg.");
+            Assert.True(cacheRootRenameBlocked, "The pinned cache root must remain stable through helper and commit.");
+            using (new FileStream(
+                       clipPath,
+                       FileMode.Open,
+                       FileAccess.Write,
+                       FileShare.ReadWrite | FileShare.Delete))
+            {
+                // Opening succeeds only after the pinned read handle is disposed.
+            }
+
+            File.Move(clipPath, movedClipPath);
+            File.Move(movedClipPath, clipPath);
+            Directory.Move(clipsDirectory, movedRootPath);
+            Directory.Move(movedRootPath, clipsDirectory);
+            Directory.Move(pinnedCacheDirectory, movedCachePath);
+            Directory.Move(movedCachePath, pinnedCacheDirectory);
+            Assert.Equal(
+                ClipDeletionResult.ChangedOrUnsafe,
+                ClipLibraryService.DeleteCurrentClip(clipsDirectory, multiLinkReadClip),
+                "Permanent deletion must retain the single-link requirement.");
+
+            var linkedCacheTarget = Path.Combine(testDirectory, "LinkedCacheTarget");
+            Directory.CreateDirectory(linkedCacheTarget);
+            linkedCacheDirectory = Path.Combine(testDirectory, "LinkedCache");
+            try
+            {
+                Directory.CreateSymbolicLink(linkedCacheDirectory, linkedCacheTarget);
+                var linkedService = new ClipLibraryService(
+                    () => ffmpegPath,
+                    () => null,
+                    runner,
+                    linkedCacheDirectory,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(1));
+                var linkedThumbnailPath = linkedService.GetDeterministicThumbnailPath(replacementClip);
+                var linkedTargetPath = Path.Combine(linkedCacheTarget, Path.GetFileName(linkedThumbnailPath));
+                await File.WriteAllBytesAsync(
+                        linkedTargetPath,
+                        [0xFF, 0xD8, 0xFF, 0xFF, 0xD9])
+                    .ConfigureAwait(false);
+
+                linkedService.RemoveCachedThumbnail(replacementClip);
+                Assert.True(
+                    File.Exists(linkedTargetPath),
+                    "Thumbnail cleanup must not traverse a reparse-point cache root.");
+            }
+            catch (Exception exception) when (
+                exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                // Windows developer mode or symbolic-link privilege may be unavailable on CI.
+            }
+        }
+        finally
+        {
+            if (linkedCacheDirectory is not null && Directory.Exists(linkedCacheDirectory))
+            {
+                Directory.Delete(linkedCacheDirectory);
+            }
+
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestThumbnailDecoderReleasesFileAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            await RunOnStaThreadAsync(() =>
+            {
+                Directory.CreateDirectory(testDirectory);
+                var thumbnailPath = Path.Combine(testDirectory, "thumbnail.jpg");
+                var source = BitmapSource.Create(
+                    2,
+                    2,
+                    96,
+                    96,
+                    PixelFormats.Bgra32,
+                    null,
+                    new byte[16],
+                    8);
+                var encoder = new JpegBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(source));
+                using (var stream = new FileStream(thumbnailPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    encoder.Save(stream);
+                }
+
+                var converter = new ThumbnailPathConverter();
+                var converted = converter.Convert(
+                    thumbnailPath,
+                    typeof(BitmapSource),
+                    null,
+                    System.Globalization.CultureInfo.InvariantCulture);
+                Assert.True(
+                    converted is BitmapSource { IsFrozen: true },
+                    "Gallery thumbnails should be fully decoded and frozen in memory.");
+
+                File.Delete(thumbnailPath);
+                Assert.True(
+                    !File.Exists(thumbnailPath),
+                    "An in-memory gallery thumbnail must not keep its cache JPEG locked.");
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static Task RunOnStaThreadAsync(Action action)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                action();
+                completion.TrySetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ClipForge thumbnail test"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
     }
 
     private static async Task TestClipLibraryProbeBudgetAsync()
@@ -1209,6 +1587,8 @@ internal static class Program
 
         public bool TimeOutAllProbes { get; init; }
 
+        public Action<IReadOnlyList<string>>? BeforeThumbnailWrite { get; init; }
+
         public async Task<ClipMediaProcessResult> RunAsync(
             string executablePath,
             IReadOnlyList<string> arguments,
@@ -1237,6 +1617,7 @@ internal static class Program
             }
 
             ThumbnailRunCount++;
+            BeforeThumbnailWrite?.Invoke(arguments);
             var outputPath = arguments[^1];
             await File.WriteAllBytesAsync(
                     outputPath,

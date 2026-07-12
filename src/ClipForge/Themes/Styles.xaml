@@ -482,6 +482,139 @@
         </Setter>
     </Style>
 
+    <!-- Dark, compact scroll bars. Keeping this implicit prevents native light-theme
+         tracks from appearing in the capture sidebar, combo popups, or text inputs. -->
+    <Style x:Key="ScrollBarPageButtonStyle" TargetType="{x:Type RepeatButton}">
+        <Setter Property="Focusable" Value="False" />
+        <Setter Property="IsTabStop" Value="False" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type RepeatButton}">
+                    <Border Background="{TemplateBinding Background}" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="VerticalScrollThumbStyle" TargetType="{x:Type Thumb}">
+        <Setter Property="MinHeight" Value="30" />
+        <Setter Property="Margin" Value="2,1" />
+        <Setter Property="Background" Value="{StaticResource TextMutedBrush}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type Thumb}">
+                    <Border x:Name="ThumbSurface"
+                            Background="{TemplateBinding Background}"
+                            CornerRadius="3"
+                            SnapsToDevicePixels="True" />
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="ThumbSurface" Property="Background" Value="{StaticResource TextSecondaryBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsDragging" Value="True">
+                            <Setter TargetName="ThumbSurface" Property="Background" Value="{StaticResource AccentBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="ThumbSurface" Property="Opacity" Value="0.35" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="HorizontalScrollThumbStyle" TargetType="{x:Type Thumb}">
+        <Setter Property="MinWidth" Value="30" />
+        <Setter Property="Margin" Value="1,2" />
+        <Setter Property="Background" Value="{StaticResource TextMutedBrush}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type Thumb}">
+                    <Border x:Name="ThumbSurface"
+                            Background="{TemplateBinding Background}"
+                            CornerRadius="3"
+                            SnapsToDevicePixels="True" />
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="ThumbSurface" Property="Background" Value="{StaticResource TextSecondaryBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsDragging" Value="True">
+                            <Setter TargetName="ThumbSurface" Property="Background" Value="{StaticResource AccentBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="ThumbSurface" Property="Opacity" Value="0.35" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <ControlTemplate x:Key="VerticalScrollBarTemplate" TargetType="{x:Type ScrollBar}">
+        <Border Background="#E60B0D12"
+                CornerRadius="5"
+                SnapsToDevicePixels="True">
+            <Track x:Name="PART_Track"
+                   Focusable="False"
+                   IsDirectionReversed="True"
+                   Orientation="Vertical">
+                <Track.DecreaseRepeatButton>
+                    <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}"
+                                  Style="{StaticResource ScrollBarPageButtonStyle}" />
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                    <Thumb Style="{StaticResource VerticalScrollThumbStyle}" />
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                    <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}"
+                                  Style="{StaticResource ScrollBarPageButtonStyle}" />
+                </Track.IncreaseRepeatButton>
+            </Track>
+        </Border>
+    </ControlTemplate>
+
+    <ControlTemplate x:Key="HorizontalScrollBarTemplate" TargetType="{x:Type ScrollBar}">
+        <Border Background="#E60B0D12"
+                CornerRadius="5"
+                SnapsToDevicePixels="True">
+            <Track x:Name="PART_Track"
+                   Focusable="False"
+                   IsDirectionReversed="False"
+                   Orientation="Horizontal">
+                <Track.DecreaseRepeatButton>
+                    <RepeatButton Command="{x:Static ScrollBar.PageLeftCommand}"
+                                  Style="{StaticResource ScrollBarPageButtonStyle}" />
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                    <Thumb Style="{StaticResource HorizontalScrollThumbStyle}" />
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                    <RepeatButton Command="{x:Static ScrollBar.PageRightCommand}"
+                                  Style="{StaticResource ScrollBarPageButtonStyle}" />
+                </Track.IncreaseRepeatButton>
+            </Track>
+        </Border>
+    </ControlTemplate>
+
+    <Style TargetType="{x:Type ScrollBar}">
+        <Setter Property="Width" Value="10" />
+        <Setter Property="MinWidth" Value="10" />
+        <Setter Property="Background" Value="#E60B0D12" />
+        <Setter Property="Focusable" Value="False" />
+        <Setter Property="Template" Value="{StaticResource VerticalScrollBarTemplate}" />
+        <Style.Triggers>
+            <Trigger Property="Orientation" Value="Horizontal">
+                <Setter Property="Width" Value="Auto" />
+                <Setter Property="MinWidth" Value="0" />
+                <Setter Property="Height" Value="10" />
+                <Setter Property="MinHeight" Value="10" />
+                <Setter Property="Template" Value="{StaticResource HorizontalScrollBarTemplate}" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
     <!-- Progress -->
     <Style TargetType="{x:Type ProgressBar}">
         <Setter Property="Height" Value="6" />

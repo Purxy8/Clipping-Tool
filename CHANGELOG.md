@@ -2,6 +2,40 @@
 
 All notable user-facing changes to ClipForge are recorded here.
 
+## [Unreleased]
+
+## [1.3.0-beta.1] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- The recent-clips gallery can show 4, 8, 10, or 15 clips. The preference is remembered, card widths adapt to the window, and larger sets use a compact horizontal scrollbar.
+- Recent clip cards now have a dark right-click menu for showing the exact clip in File Explorer or permanently deleting it after confirmation.
+
+### Changed
+
+- Scrollbars now use a compact dark track and thumb instead of the native light Windows appearance.
+- The always-on-top overlay returns `MA_NOACTIVATE` for pointer activation, so mouse clicks remain usable without taking focus or relative-mouse ownership away from a fullscreen game. Unlike the permanent no-activate window style, accessibility tools can still navigate its controls. A failed drag also releases any WPF mouse capture.
+- NVIDIA capture now uses the faster NVENC P2 preset with multipass disabled, retaining the existing zero-lookahead, no-B-frame, GPU-resident Windows Graphics Capture path.
+- Gallery refresh is latest-request-wins: changing 4/8/10/15 quickly cancels superseded probe and thumbnail work instead of queueing duplicate FFmpeg passes.
+
+### Security
+
+- Explorer reveal revalidates the selected ClipForge-owned file and launches the explicit Windows `explorer.exe` path without a command shell.
+- Permanent deletion revalidates the save root, path, stable Windows volume/file ID, timestamp, size, link count, and reparse state, then marks the already validated Windows file handle for deletion to resist same-metadata replacements and path-swap races.
+- Gallery JPEGs are decoded fully into frozen in-memory images so WPF does not keep cache files locked; permanently deleting a clip also removes its deterministic cached thumbnail.
+- Thumbnail cache keys now include the stable Windows volume/file identity, reject unusable zero IDs, and revalidate that identity around helper execution. Cache cleanup is handle-based and refuses reparse-root or parent mismatches.
+- Thumbnail decoding pins the validated clip and save-root handles for the entire FFmpeg read and cache commit, blocking same-path write/delete swaps without copying large recordings. Legacy v1.2 thumbnail keys are removed during normal loading and permanent deletion.
+
+### Verification note
+
+- The Release build completes with zero warnings and the deterministic suite passes 28/28 tests, including same-metadata replacement rejection and thumbnail-unlock tests.
+- A real Windows Graphics Capture plus NVIDIA NVENC run with desktop audio and microphone produced a valid 6.032-second MP4. The five-second sample reported 0.4% normalized FFmpeg CPU, 92.8 MB working set, and `BelowNormal` priority on the development PC.
+
 ## [1.2.0-beta.1] - 2026-07-12
 
 ### Release status

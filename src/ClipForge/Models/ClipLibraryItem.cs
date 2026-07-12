@@ -9,5 +9,19 @@ public sealed record ClipLibraryItem(
     DateTimeOffset RecordedAtUtc,
     long FileSizeBytes,
     TimeSpan? Duration,
-    string? ThumbnailPath = null);
+    string? ThumbnailPath = null)
+{
+    public DateTimeOffset RecordedAtLocal => RecordedAtUtc.ToLocalTime();
 
+    /// <summary>
+    /// Stable Windows identity captured while the item is discovered. It is kept
+    /// internal because it is security metadata, not presentation state.
+    /// </summary>
+    internal ClipFileIdentity? FileIdentity { get; init; }
+}
+
+internal readonly record struct ClipFileIdentity(
+    ulong VolumeSerialNumber,
+    ulong FileIdLow,
+    ulong FileIdHigh,
+    uint NumberOfLinks);

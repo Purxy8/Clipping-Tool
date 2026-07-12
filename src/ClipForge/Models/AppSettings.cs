@@ -6,6 +6,8 @@ public sealed class AppSettings
 {
     public const string DefaultBackgroundColor = "#0B0D12";
 
+    private static readonly int[] AllowedRecentClipCounts = [4, 8, 10, 15];
+
     public int ReplaySeconds { get; set; } = 120;
     public string ResolutionId { get; set; } = "1080p";
     public int FramesPerSecond { get; set; } = 30;
@@ -16,6 +18,7 @@ public sealed class AppSettings
     public string? MicrophoneDeviceId { get; set; }
     public bool CheckForUpdatesAutomatically { get; set; }
     public string BackgroundColor { get; set; } = DefaultBackgroundColor;
+    public int RecentClipCount { get; set; } = 4;
     public HotkeyGesture SaveClipHotkey { get; set; } = HotkeyGesture.DefaultSaveClip;
     public HotkeyGesture ToggleOverlayHotkey { get; set; } = HotkeyGesture.DefaultToggleOverlay;
     public string SaveDirectory { get; set; } = GetDefaultSaveDirectory();
@@ -57,4 +60,7 @@ public sealed class AppSettings
 
         return $"#{red:X2}{green:X2}{blue:X2}";
     }
+
+    internal static int NormalizeRecentClipCount(int requestedCount) =>
+        AllowedRecentClipCounts.Contains(requestedCount) ? requestedCount : 4;
 }

@@ -343,11 +343,14 @@ internal static class FfmpegArgumentBuilder
         {
             case VideoEncoderKind.NvidiaNvenc:
                 arguments.AddRange([
-                    "-preset", "p4",
+                    // NVIDIA recommends P2-P3 for real-time screen capture. P2
+                    // intentionally favors game headroom over P4's extra quality.
+                    "-preset", "p2",
                     "-tune", "ll",
                     "-rc", "vbr",
                     "-cq", "23",
                     "-b:v", "0",
+                    "-multipass", "disabled",
                     "-rc-lookahead", "0",
                     "-surfaces", "4",
                     "-bf", "0",

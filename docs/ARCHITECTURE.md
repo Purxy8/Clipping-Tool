@@ -14,7 +14,7 @@ ClipForge is a Windows-only WPF application targeting `.NET 10` and `win-x64`. T
 - Let the main window hide to the notification area while replay and global shortcuts remain available.
 - Keep player and appearance work out of the capture-critical path, and avoid periodic whole-buffer scans.
 
-Version 1.2 does not attempt a game-process hook, HDR pipeline, editor, or upload service.
+Version 1.3 does not attempt a game-process hook, HDR pipeline, editor, or upload service.
 
 ## Component map
 
@@ -26,7 +26,7 @@ Version 1.2 does not attempt a game-process hook, HDR pipeline, editor, or uploa
 | Replay engine | `ReplayBufferService` and capture helpers under `Capture/` | Probe capture/encoder capabilities, own the tuned FFmpeg process, WASAPI audio producers, temporary segment set, retention policy, save snapshots, cancellation, and lifecycle state. |
 | FFmpeg command construction | `FfmpegArgumentBuilder` | Build argument lists without shell interpolation for both continuous segment capture and MP4 creation. |
 | FFmpeg provisioning | `FfmpegSetupService` | Resolve an existing FFmpeg installation or download a private copy on request. |
-| Clip library | `ClipLibraryService`, `ClipMediaProcessRunner` | Discover recent top-level ClipForge-named MP4 files, validate local MOV/MP4 media, create cached thumbnails, and supply the latest clip plus four gallery items. |
+| Clip library | `ClipLibraryService`, `ClipMediaProcessRunner` | Discover recent top-level ClipForge-named MP4 files, validate local MOV/MP4 media, create cached thumbnails, and supply the latest clip plus the selected 4/8/10/15-item gallery. |
 | Application updates | `AppUpdateService`, `ReleaseInfo`, Velopack | Check the configured release feed, download an update without interrupting capture, then explicitly apply it after the window shuts down cleanly. |
 | Settings | `SettingsService` | Load JSON with safe defaults and atomically replace the settings file after changes. |
 | Shortcuts | `GlobalHotkeyService`, `HotkeyGesture` | Atomically register configurable Save Clip and Toggle Overlay combinations through the Win32 hotkey API and preserve working bindings on conflicts. |
@@ -76,7 +76,7 @@ The capture command uses:
 
 - The selected monitor index with FFmpeg `gfxcapture` when its runtime probe succeeds; otherwise the display's desktop coordinates and native dimensions with `gdigrab`.
 - A scale/pad filter for fixed output presets, preserving aspect ratio and adding black padding when necessary. Source mode only forces even dimensions.
-- H.264 through runtime-verified `h264_nvenc`, `h264_qsv`, or `h264_amf`; `libx264` remains the safe software fallback. Each encoder has low-latency/quality settings appropriate to that implementation.
+- H.264 through runtime-verified `h264_nvenc`, `h264_qsv`, or `h264_amf`; `libx264` remains the safe software fallback. Each encoder has low-impact settings appropriate to that implementation. NVENC uses the fast P2 preset, single-pass VBR, zero lookahead, and no B-frames to preserve foreground-game headroom.
 - A forced keyframe and a new Matroska segment every two seconds.
 - Optional WASAPI desktop loopback and microphone inputs, resampled to 48 kHz and mixed into one stereo track.
 - AAC audio at 192 Kbps.
@@ -97,15 +97,15 @@ Stream copy avoids a second video encode. The two-second keyframe/segment cadenc
 
 After startup, a save, or a save-folder change, `ClipLibraryService` enumerates top-level files in the selected clips directory and sorts eligible candidates newest first. Eligibility requires ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` filename format as well as existing path, file-identity, reparse-point, and traversal checks. FFprobe is forced to the MOV/MP4 demuxer with a `file`-only protocol whitelist before a candidate is surfaced as playable media. This intentionally excludes unrelated or renamed MP4 files from automatic decoding; users can still open those files outside the gallery.
 
-Thumbnail generation runs asynchronously through FFmpeg with the same local-file/MOV constraints, bounded output capture, cancellation, timeouts, one decode thread, and low-impact process priority. Cached thumbnails use a content-derived SHA-256 name and atomic replacement so a crash cannot leave a trusted partial cache entry. The library is a local view over existing files; it does not copy or upload clips.
+Thumbnail generation runs asynchronously through FFmpeg with the same local-file/MOV constraints, bounded output capture, cancellation, timeouts, one decode thread, and low-impact process priority. Cached thumbnails use a SHA-256 name bound to the clip path, metadata, Windows volume serial, and 128-bit file ID. A validated, non-writable/non-deletable clip handle and a pinned save-root handle remain open while FFmpeg reads by path and until the cache entry is committed, preventing a same-path file swap during decoding without copying the complete video. Atomic replacement prevents a crash from leaving a trusted partial entry, while cleanup pins and validates the cache-directory and thumbnail handles before deletion; loaded clips also prune their legacy v1.2 cache key. The library is a local view over existing files; it does not copy or upload clips.
 
-The large `MediaElement` surface provides play/pause, restart, clickable/draggable and keyboard seeking, elapsed/total time, 10-second backward/forward skips, mute, and volume. Playback is independent of replay capture. Short opacity/translation and button-hover animations are bounded, and the position timer runs only while media is playing in the visible, active main window.
+The large `MediaElement` surface provides play/pause, restart, clickable/draggable and keyboard seeking, elapsed/total time, 10-second backward/forward skips, mute, and volume. Playback is independent of replay capture. The recent gallery loads only the persisted 4/8/10/15-item limit, adapts one to four visible card widths to the viewport, and scrolls horizontally for the remainder. Newer refresh requests cancel superseded probe/thumbnail work. Thumbnail JPEGs use `BitmapCacheOption.OnLoad` and frozen in-memory images, allowing deterministic cache files to be removed immediately. Right-click reveal and deletion revalidate ClipForge ownership and stable Windows volume/file identity; deletion rejects multi-link files, closes the selected media source, and uses a validated Windows handle. Short opacity/translation and button-hover animations are bounded, and the position timer runs only while media is playing in the visible, active main window.
 
 ### Shortcuts, tray, and overlay
 
 `GlobalHotkeyService` owns two Win32 registrations: Save Clip and Toggle Overlay. Settings persist `HotkeyGesture` values, validation requires at least one modifier plus a non-modifier key, and both actions must be distinct. Re-registration is atomic: if Windows reports a conflict, the service restores the previous working registrations instead of leaving both actions unavailable.
 
-Closing `MainWindow` hides it to the notification area. `TrayIconService` can reopen the window, request a save, or perform a real application exit. The global hotkeys and rolling buffer require the ClipForge process to remain alive; no Windows service or injected game component is installed. `OverlayWindow` is a small topmost WPF surface for replay state and save/open controls. It can be shown or hidden from anywhere with the configured shortcut, but exclusive-fullscreen content can render above it.
+Closing `MainWindow` hides it to the notification area. `TrayIconService` can reopen the window, request a save, or perform a real application exit. The global hotkeys and rolling buffer require the ClipForge process to remain alive; no Windows service or injected game component is installed. `OverlayWindow` is a small topmost WPF surface for replay state and save/open controls. Its HWND handles `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`, delivering pointer clicks without taking focus or relative-mouse ownership from a foreground game while avoiding the accessibility limitation of permanent `WS_EX_NOACTIVATE`; failed drag operations release WPF mouse capture. It can be shown or hidden from anywhere with the configured shortcut, but exclusive-fullscreen content can render above it.
 
 `SingleInstanceService` scopes a named mutex and activation event to the current Windows user and logon session. A second launch sends only an activation signal and exits; the primary process restores its main window. This prevents two recorders from competing for the same hotkeys and devices. A legacy pre-v1.1 process is detected and must be exited once before the upgraded build starts.
 
