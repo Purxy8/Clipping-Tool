@@ -68,6 +68,7 @@ public partial class MainWindow : Window
     private string? _pendingLibraryPreferredPath;
     private string? _lastSavedPath;
     private ClipLibraryItem? _currentClip;
+    private LibraryWindow? _libraryWindow;
     private OverlayWindow? _overlayWindow;
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
@@ -295,7 +296,7 @@ public partial class MainWindow : Window
         }
         finally
         {
-            if (IsVisible)
+            if (IsVisible && IsActive)
             {
                 UpdateControlsForState(_latestState);
             }
@@ -688,6 +689,24 @@ public partial class MainWindow : Window
         SetThemeColorResource("HeroGradientStartColor", palette.HeroGradientStartColor);
         SetThemeColorResource("HeroGradientMiddleColor", palette.HeroGradientMiddleColor);
         SetThemeColorResource("HeroGradientEndColor", palette.HeroGradientEndColor);
+
+        // Most controls consume the shared brush objects through StaticResource. Updating the
+        // owning Color keys above keeps DynamicResource consumers correct; updating the brush
+        // instances in place also refreshes controls/templates that already hold a brush reference.
+        SetThemeBrushColorResource("WindowBrush", palette.BackgroundColor);
+        SetThemeBrushColorResource("SurfaceBrush", palette.SurfaceColor);
+        SetThemeBrushColorResource("SurfaceRaisedBrush", palette.SurfaceRaisedColor);
+        SetThemeBrushColorResource("SurfaceHoverBrush", palette.SurfaceHoverColor);
+        SetThemeBrushColorResource("SurfaceTranslucentBrush", palette.SurfaceTranslucentColor);
+        SetThemeBrushColorResource("SurfaceOverlayBrush", palette.SurfaceOverlayColor);
+        SetThemeBrushColorResource("BorderBrush", palette.BorderColor);
+        SetThemeBrushColorResource("BorderStrongBrush", palette.BorderStrongColor);
+        SetThemeBrushColorResource("AccentBrush", palette.AccentColor);
+        SetThemeBrushColorResource("AccentHoverBrush", palette.AccentHoverColor);
+        SetThemeBrushColorResource("AccentPressedBrush", palette.AccentPressedColor);
+        SetThemeBrushColorResource("AccentSoftBrush", palette.AccentSoftColor);
+        SetThemeBrushColorResource("AccentBorderBrush", palette.AccentBorderColor);
+        SetThemeBrushColorResource("PrimaryButtonTextBrush", palette.PrimaryButtonTextColor);
     }
 
     private void UpdateAppearanceEditor()
@@ -727,9 +746,9 @@ public partial class MainWindow : Window
             AppearanceColorTarget.Accent =>
                 "Changes primary buttons, toggles, sliders, focus rings, and highlights.",
             AppearanceColorTarget.Surface =>
-                "Changes panels, controls, borders, menus, and the lightweight overlay.",
+                "Changes the Capture settings sidebar, cards, controls, menus, and the lightweight overlay.",
             _ =>
-                "Changes the outer app canvas. Bright custom colors are darkened for readability."
+                "Changes the app canvas behind the panels. Bright custom colors are darkened for readability."
         };
     }
 
@@ -755,21 +774,91 @@ public partial class MainWindow : Window
     private static void SetThemeColorResource(string resourceKey, string colorValue)
     {
         var color = ParseThemeColor(colorValue);
-        var resources = System.Windows.Application.Current.Resources;
-        if (resources.Contains(resourceKey))
+        SetThemeResourceValue(System.Windows.Application.Current.Resources, resourceKey, color);
+    }
+
+    private static void SetThemeBrushColorResource(string resourceKey, string colorValue) =>
+        SetThemeBrushColorResource(
+            System.Windows.Application.Current.Resources,
+            resourceKey,
+            ParseThemeColor(colorValue));
+
+    internal static bool SetThemeBrushColorResource(
+        ResourceDictionary resources,
+        object resourceKey,
+        Color color)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentNullException.ThrowIfNull(resourceKey);
+
+        if (TryGetThemeResourceValue(resources, resourceKey, out var resourceValue) &&
+            resourceValue is SolidColorBrush brush)
         {
-            resources[resourceKey] = color;
-            return;
+            if (!brush.IsFrozen)
+            {
+                brush.Color = color;
+                return true;
+            }
+
+            return SetThemeResourceValue(resources, resourceKey, new SolidColorBrush(color));
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Replaces an existing resource in the dictionary that owns it. ResourceDictionary.Contains
+    /// also searches merged dictionaries, so assigning to the root after a successful Contains
+    /// check creates a shadow value that brushes declared inside the merged theme cannot see.
+    /// Updating the owner preserves DynamicResource invalidation for every open window and overlay.
+    /// </summary>
+    internal static bool SetThemeResourceValue(
+        ResourceDictionary resources,
+        object resourceKey,
+        object resourceValue)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentNullException.ThrowIfNull(resourceKey);
+        ArgumentNullException.ThrowIfNull(resourceValue);
+
+        if (resources.Keys.Cast<object>().Any(key => Equals(key, resourceKey)))
+        {
+            resources[resourceKey] = resourceValue;
+            return true;
         }
 
         foreach (var dictionary in resources.MergedDictionaries.Reverse())
         {
-            if (dictionary.Contains(resourceKey))
+            if (SetThemeResourceValue(dictionary, resourceKey, resourceValue))
             {
-                dictionary[resourceKey] = color;
-                return;
+                return true;
             }
         }
+
+        return false;
+    }
+
+    private static bool TryGetThemeResourceValue(
+        ResourceDictionary resources,
+        object resourceKey,
+        out object? resourceValue)
+    {
+        if (resources.Keys.Cast<object>().Any(key => Equals(key, resourceKey)))
+        {
+            resourceValue = resources[resourceKey];
+            return true;
+        }
+
+        foreach (var dictionary in resources.MergedDictionaries.Reverse())
+        {
+            if (TryGetThemeResourceValue(dictionary, resourceKey, out resourceValue))
+            {
+                return true;
+            }
+        }
+
+        resourceValue = null;
+        return false;
     }
 
     internal static Color ParseThemeColor(string normalizedColor)
@@ -825,7 +914,7 @@ public partial class MainWindow : Window
         }
 
         _latestState = snapshot;
-        if (IsVisible)
+        if (IsVisible && IsActive)
         {
             UpdateControlsForState(snapshot);
         }
@@ -1641,6 +1730,67 @@ public partial class MainWindow : Window
     private async void RefreshLibraryButton_Click(object sender, RoutedEventArgs e) =>
         await RefreshClipLibraryAsync();
 
+    private void OpenLibraryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        if (_libraryWindow is { } openLibrary)
+        {
+            if (!openLibrary.IsVisible)
+            {
+                openLibrary.Show();
+            }
+
+            if (openLibrary.WindowState == WindowState.Minimized)
+            {
+                openLibrary.WindowState = WindowState.Normal;
+            }
+
+            _ = openLibrary.Activate();
+            return;
+        }
+
+        // Keep exactly one in-process media decoder active. The main player is
+        // restored paused through the normal gallery refresh after Library closes.
+        ReleasePlayerForBackground();
+        _libraryRefreshPending = true;
+        var libraryWindow = new LibraryWindow(
+            _clipLibraryService,
+            _settings.SaveDirectory,
+            _currentClip)
+        {
+            Owner = this
+        };
+        _libraryWindow = libraryWindow;
+        libraryWindow.Closed += LibraryWindow_Closed;
+        libraryWindow.Show();
+    }
+
+    private void LibraryWindow_Closed(object? sender, EventArgs e)
+    {
+        if (sender is not LibraryWindow libraryWindow)
+        {
+            return;
+        }
+
+        libraryWindow.Closed -= LibraryWindow_Closed;
+        if (ReferenceEquals(_libraryWindow, libraryWindow))
+        {
+            _libraryWindow = null;
+        }
+
+        // Refresh even when no in-app delete occurred so recordings saved while
+        // Library was open appear immediately in the compact gallery.
+        _libraryRefreshPending = true;
+        if (!_isClosing && IsVisible)
+        {
+            _ = Activate();
+        }
+    }
+
     private void OpenCurrentClipButton_Click(object sender, RoutedEventArgs e)
     {
         if (_currentClip is null || !File.Exists(_currentClip.FullPath))
@@ -2323,6 +2473,8 @@ public partial class MainWindow : Window
         StatusText.Text = "Closing ClipForge…";
         _lifetimeCancellation.Cancel();
         CancelSavedToast();
+        _libraryWindow?.Close();
+        _libraryWindow = null;
 
         try
         {

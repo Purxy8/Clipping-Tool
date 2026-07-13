@@ -219,7 +219,7 @@
             </Grid.ColumnDefinitions>
 
             <!-- Settings sidebar -->
-            <Border x:Name="CaptureSidebar" Grid.Column="0" Background="{StaticResource SurfaceBrush}"
+            <Border x:Name="CaptureSidebar" Grid.Column="0" Background="{DynamicResource SurfaceBrush}"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="18">
                 <Grid>
                     <Grid.RowDefinitions>
@@ -649,6 +649,10 @@
                             </Grid.ColumnDefinitions>
                             <TextBlock FontSize="15" FontWeight="SemiBold" Text="Recent clips" />
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Button x:Name="OpenLibraryButton" Height="32" MinHeight="32" Margin="0,0,10,0"
+                                        Padding="13,5" Content="Library" Click="OpenLibraryButton_Click"
+                                        Style="{StaticResource QuietButtonStyle}"
+                                        AutomationProperties.Name="Open full clip library" />
                                 <TextBlock Margin="0,0,7,0" VerticalAlignment="Center"
                                            Style="{StaticResource MutedTextStyle}" Text="Latest" />
                                 <ComboBox x:Name="RecentClipCountComboBox" Width="68" Height="30" MinHeight="30"
