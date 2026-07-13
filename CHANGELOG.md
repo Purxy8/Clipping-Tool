@@ -4,6 +4,32 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.7.0-beta.1] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- The Library now includes a dual-handle, frame-accurate trim editor for a selected local clip. A successful export creates a separately named trimmed MP4, refreshes the Library, and keeps the normal clip by default; only then does ClipForge offer an optional original-file deletion with another identity check.
+- Library browsing can be filtered between **All**, **Normal**, and **Trimmed** clips without treating unrelated MP4 files as ClipForge recordings.
+
+### Performance
+
+- Trim export runs as a single below-normal-priority local FFmpeg job and is disabled until Instant Replay is stopped, preventing the trim encoder from intentionally competing with live capture. Frame-accurate re-encoding can still use noticeable resources and is not presented as a zero-lag or instant operation.
+
+### Security
+
+- Trimming uses the pinned private FFmpeg through local-file-only MOV/MP4 arguments and no command shell. The selected source and save root stay pinned while a unique partial is written, validated, and atomically committed without overwriting another clip; cancellation and failure clean the owned partial and leave the original unchanged.
+- Optional post-trim deletion defaults to keeping both files and revalidates the original's stable Windows identity and guarded single-link deletion policy after the trimmed output has committed.
+
+### Verification note
+
+- The Release solution builds with zero warnings and zero errors, formatting is clean, and the deterministic suite passes 37/37 tests. Real silent and audio trim smoke runs produced frame-accurate 640x360 30 FPS outputs, retained the source clips, and left no partial or orphaned files.
+- The current NuGet vulnerability audit reports no known vulnerable direct or transitive packages. These checks validate the tested development PC and cannot guarantee identical performance on every system.
+
 ## [1.6.0-beta.1] - 2026-07-13
 
 ### Release status

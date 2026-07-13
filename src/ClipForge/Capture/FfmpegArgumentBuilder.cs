@@ -248,6 +248,96 @@ internal static class FfmpegArgumentBuilder
         return arguments;
     }
 
+    /// <summary>
+    /// Builds an exact-seek transcode for an arbitrary clip range. FFmpeg's accurate-seek path is
+    /// enabled by default when input-side -ss is combined with video re-encoding: it seeks to the
+    /// preceding keyframe, decodes/discards up to the requested source frame, and starts the new
+    /// stream there. Stream copy is intentionally never used for user-selected trim boundaries.
+    /// </summary>
+    internal static IReadOnlyList<string> BuildTrimArguments(
+        string inputPath,
+        string outputPath,
+        TimeSpan start,
+        TimeSpan duration,
+        bool includeAudio,
+        int framesPerSecond,
+        VideoEncodingStrategy encodingStrategy)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        ArgumentNullException.ThrowIfNull(encodingStrategy);
+        if (start < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(start));
+        }
+
+        if (duration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(duration));
+        }
+
+        if (framesPerSecond is < 1 or > 240)
+        {
+            throw new ArgumentOutOfRangeException(nameof(framesPerSecond));
+        }
+
+        var arguments = new List<string>
+        {
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-protocol_whitelist", "file",
+            "-f", "mov",
+            "-ss", FormatPreciseTimestamp(start),
+            "-i", inputPath,
+            "-t", FormatPreciseTimestamp(duration),
+            "-map", "0:v:0"
+        };
+
+        if (includeAudio)
+        {
+            arguments.AddRange(["-map", "0:a:0?"]);
+        }
+        else
+        {
+            arguments.Add("-an");
+        }
+
+        arguments.AddRange(
+        [
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
+            "-sn",
+            "-dn"
+        ]);
+
+        AddEncoderArguments(
+            arguments,
+            encodingStrategy,
+            softwareThreadLimit: 2);
+        arguments.AddRange(
+        [
+            "-pix_fmt", "yuv420p",
+            "-g", Invariant(checked(framesPerSecond * SegmentSeconds)),
+            "-keyint_min", Invariant(checked(framesPerSecond * SegmentSeconds))
+        ]);
+
+        if (includeAudio)
+        {
+            arguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+        }
+
+        arguments.AddRange(
+        [
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            "-f", "mp4",
+            "-n",
+            outputPath
+        ]);
+        return arguments;
+    }
+
     private static string BuildVideoFilter(ResolutionOption resolution)
     {
         if (resolution.Width is null || resolution.Height is null)
@@ -339,7 +429,8 @@ internal static class FfmpegArgumentBuilder
 
     private static void AddEncoderArguments(
         List<string> arguments,
-        VideoEncodingStrategy encodingStrategy)
+        VideoEncodingStrategy encodingStrategy,
+        int? softwareThreadLimit = null)
     {
         arguments.AddRange(["-c:v", encodingStrategy.FfmpegEncoder]);
 
@@ -390,12 +481,18 @@ internal static class FfmpegArgumentBuilder
                 break;
 
             default:
+                var softwareThreadCount = softwareThreadLimit is { } requestedLimit
+                    ? Math.Clamp(
+                        GetSoftwareEncoderThreadCount(Environment.ProcessorCount),
+                        1,
+                        Math.Clamp(requestedLimit, 1, 4))
+                    : GetSoftwareEncoderThreadCount(Environment.ProcessorCount);
                 arguments.AddRange([
                     "-preset", "ultrafast",
                     "-tune", "zerolatency",
                     "-crf", "24",
                     "-pix_fmt", "yuv420p",
-                    "-threads", Invariant(GetSoftwareEncoderThreadCount(Environment.ProcessorCount)),
+                    "-threads", Invariant(softwareThreadCount),
                     "-x264-params", "rc-lookahead=0:bframes=0:scenecut=0"
                 ]);
                 break;
@@ -432,6 +529,9 @@ internal static class FfmpegArgumentBuilder
 
     private static string FormatTimestamp(TimeSpan value) =>
         value.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
+
+    private static string FormatPreciseTimestamp(TimeSpan value) =>
+        value.TotalSeconds.ToString("0.#########", CultureInfo.InvariantCulture);
 
     private static string Invariant(int value) => value.ToString(CultureInfo.InvariantCulture);
 }

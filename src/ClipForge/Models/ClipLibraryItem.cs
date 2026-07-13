@@ -11,6 +11,15 @@ public sealed record ClipLibraryItem(
     TimeSpan? Duration,
     string? ThumbnailPath = null)
 {
+    /// <summary>
+    /// Distinguishes an original replay save from a ClipForge-generated trim.
+    /// The library assigns this from the strict generated-file-name grammar;
+    /// callers should not infer ownership from arbitrary MP4 names.
+    /// </summary>
+    public ClipKind Kind { get; init; } = ClipKind.Original;
+
+    public bool IsTrimmed => Kind == ClipKind.Trimmed;
+
     public DateTimeOffset RecordedAtLocal => RecordedAtUtc.ToLocalTime();
 
     /// <summary>
@@ -39,6 +48,19 @@ public sealed record ClipLibraryItem(
     /// internal because it is security metadata, not presentation state.
     /// </summary>
     internal ClipFileIdentity? FileIdentity { get; init; }
+}
+
+public enum ClipKind
+{
+    Original,
+    Trimmed
+}
+
+public enum ClipLibraryFilter
+{
+    All,
+    Original,
+    Trimmed
 }
 
 internal readonly record struct ClipFileIdentity(

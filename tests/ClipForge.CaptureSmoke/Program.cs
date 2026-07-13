@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text.Json;
 using ClipForge.Capture;
 using ClipForge.Models;
@@ -33,6 +34,18 @@ try
     Console.WriteLine($"FFmpeg: {ffmpeg}");
     if (args.Contains("--install-only", StringComparer.OrdinalIgnoreCase))
     {
+        return 0;
+    }
+
+    if (args.Contains("--trim-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        var includeTrimAudio = args.Contains("--audio", StringComparer.OrdinalIgnoreCase);
+        await RunTrimSmokeAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            includeTrimAudio,
+            timeout.Token);
         return 0;
     }
 
@@ -244,6 +257,258 @@ static string? GetOption(string[] arguments, string name)
     var index = Array.FindIndex(arguments, argument =>
         string.Equals(argument, name, StringComparison.OrdinalIgnoreCase));
     return index >= 0 && index + 1 < arguments.Length ? arguments[index + 1] : null;
+}
+
+static async Task RunTrimSmokeAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    bool includeAudio,
+    CancellationToken cancellationToken)
+{
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException("The verified FFprobe tool is unavailable for trim smoke.");
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"trim-smoke-{(includeAudio ? "audio" : "silent")}-" +
+        $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(runDirectory);
+    var sourcePath = Path.Combine(runDirectory, "Clip_2026-07-13_16-00-00.mp4");
+    var sourceArguments = new List<string>
+    {
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "lavfi",
+        "-i", "testsrc2=duration=8:size=640x360:rate=30"
+    };
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(
+        [
+            "-f", "lavfi",
+            "-i", "sine=frequency=880:sample_rate=48000:duration=8"
+        ]);
+    }
+
+    sourceArguments.AddRange(["-map", "0:v:0"]);
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(["-map", "1:a:0"]);
+    }
+
+    sourceArguments.AddRange(
+    [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0"
+    ]);
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+    }
+    else
+    {
+        sourceArguments.Add("-an");
+    }
+
+    sourceArguments.AddRange(["-movflags", "+faststart", "-f", "mp4", "-n", sourcePath]);
+    var processRunner = new ClipMediaProcessRunner();
+    var generation = await processRunner.RunAsync(
+            ffmpeg,
+            sourceArguments,
+            TimeSpan.FromMinutes(5),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!generation.Succeeded || !File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
+    {
+        throw new InvalidDataException(
+            $"Synthetic trim source generation failed: {generation.StandardError.Trim()}");
+    }
+
+    var sourceHash = ComputeSha256(sourcePath);
+    var sourceDuration = await ReadDurationAsync(ffprobe, sourcePath, cancellationToken)
+        .ConfigureAwait(false);
+    var sourceMedia = await ReadMediaInfoAsync(ffprobe, sourcePath, cancellationToken)
+        .ConfigureAwait(false);
+    if (!ClipTrimService.TryNormalizeRange(
+            TimeSpan.FromMilliseconds(1113),
+            TimeSpan.FromMilliseconds(6287),
+            TimeSpan.FromSeconds(sourceDuration),
+            sourceMedia.AverageFrameRate,
+            out var expectedRange,
+            out var rangeError))
+    {
+        throw new InvalidDataException($"Synthetic trim range was invalid: {rangeError}");
+    }
+
+    var sourceInfo = new FileInfo(sourcePath);
+    if (!ClipLibraryService.TryGetCurrentFileIdentity(sourcePath, out var sourceIdentity))
+    {
+        throw new InvalidDataException("Synthetic trim source has no stable Windows file identity.");
+    }
+
+    var source = new ClipLibraryItem(
+        sourceInfo.Name,
+        sourceInfo.FullName,
+        new DateTimeOffset(DateTime.SpecifyKind(sourceInfo.LastWriteTimeUtc, DateTimeKind.Utc)),
+        sourceInfo.Length,
+        TimeSpan.FromSeconds(sourceDuration))
+    {
+        FileIdentity = sourceIdentity,
+        Kind = ClipKind.Original
+    };
+    if (!ClipLibraryService.TryClassifyClipFileName(source.FileName, out var sourceKind) ||
+        sourceKind != ClipKind.Original)
+    {
+        throw new InvalidDataException("Synthetic trim source was not classified as Original.");
+    }
+
+    var baselineHelpers = SnapshotMediaHelperProcessIds(ffmpeg, ffprobe);
+    var trim = await new ClipTrimService(setup).TrimAsync(
+            runDirectory,
+            source,
+            TimeSpan.FromMilliseconds(1113),
+            TimeSpan.FromMilliseconds(6287),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!trim.Succeeded || trim.OutputPath is null || !File.Exists(trim.OutputPath))
+    {
+        throw new InvalidDataException($"Real trim export failed ({trim.Status}): {trim.Message}");
+    }
+
+    var outputPath = Path.GetFullPath(trim.OutputPath);
+    if (outputPath.Equals(sourcePath, StringComparison.OrdinalIgnoreCase) ||
+        !Path.GetDirectoryName(outputPath)!.Equals(runDirectory, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidDataException("Trim export did not create a separate top-level output.");
+    }
+
+    if (!File.Exists(sourcePath) ||
+        !CryptographicOperations.FixedTimeEquals(sourceHash, ComputeSha256(sourcePath)) ||
+        !ClipLibraryService.TryGetCurrentClipPath(runDirectory, source, out _))
+    {
+        throw new InvalidDataException("Trim export changed or replaced the original source.");
+    }
+
+    if (!ClipLibraryService.TryClassifyClipFileName(
+            Path.GetFileName(outputPath),
+            out var outputKind) || outputKind != ClipKind.Trimmed)
+    {
+        throw new InvalidDataException("Trim output does not use the strict Trimmed naming grammar.");
+    }
+
+    var outputDuration = await ReadDurationAsync(ffprobe, outputPath, cancellationToken)
+        .ConfigureAwait(false);
+    var outputMedia = await ReadMediaInfoAsync(ffprobe, outputPath, cancellationToken)
+        .ConfigureAwait(false);
+    var durationTolerance = Math.Max(0.2, 2 / sourceMedia.AverageFrameRate + 0.1);
+    if (Math.Abs(outputDuration - expectedRange.Duration.TotalSeconds) > durationTolerance)
+    {
+        throw new InvalidDataException(
+            $"Trim duration was {outputDuration:0.###}s; expected {expectedRange.Duration.TotalSeconds:0.###}s.");
+    }
+
+    if (outputMedia.Width != sourceMedia.Width || outputMedia.Height != sourceMedia.Height)
+    {
+        throw new InvalidDataException(
+            $"Trim dimensions were {outputMedia.Width}x{outputMedia.Height}; " +
+            $"expected {sourceMedia.Width}x{sourceMedia.Height}.");
+    }
+
+    if (Math.Abs(outputMedia.AverageFrameRate - sourceMedia.AverageFrameRate) > 0.1)
+    {
+        throw new InvalidDataException(
+            $"Trim frame rate was {outputMedia.AverageFrameRate:0.###}; " +
+            $"expected {sourceMedia.AverageFrameRate:0.###}.");
+    }
+
+    var expectedFrames = expectedRange.EndFrame - expectedRange.StartFrame;
+    if (Math.Abs(outputMedia.FrameCount - expectedFrames) > 2)
+    {
+        throw new InvalidDataException(
+            $"Trim contained {outputMedia.FrameCount} frames; expected approximately {expectedFrames}.");
+    }
+
+    var expectedAudioStreams = includeAudio ? 1 : 0;
+    if (outputMedia.AudioStreamCount != expectedAudioStreams)
+    {
+        throw new InvalidDataException(
+            $"Trim contained {outputMedia.AudioStreamCount} audio stream(s); expected {expectedAudioStreams}.");
+    }
+
+    var partials = Directory.EnumerateFiles(
+            runDirectory,
+            ".clipforge-trim-*.partial.mp4",
+            SearchOption.TopDirectoryOnly)
+        .ToArray();
+    if (partials.Length != 0)
+    {
+        throw new InvalidDataException($"Trim left {partials.Length} partial output(s) behind.");
+    }
+
+    var orphanHelpers = SnapshotMediaHelperProcessIds(ffmpeg, ffprobe)
+        .Except(baselineHelpers)
+        .ToArray();
+    if (orphanHelpers.Length != 0)
+    {
+        throw new InvalidDataException(
+            $"Trim left media helper process ID(s) running: {string.Join(", ", orphanHelpers)}.");
+    }
+
+    Console.WriteLine($"PASS trim: {outputPath}");
+    Console.WriteLine(
+        $"Trim: {expectedRange.Start.TotalSeconds:0.###}-{expectedRange.End.TotalSeconds:0.###}s, " +
+        $"duration {outputDuration:0.###}s, frames {outputMedia.FrameCount}, " +
+        $"video {outputMedia.Width}x{outputMedia.Height} at {outputMedia.AverageFrameRate:0.###} FPS, " +
+        $"audio streams {outputMedia.AudioStreamCount}, original retained, no partial/orphan helper.");
+}
+
+static byte[] ComputeSha256(string path)
+{
+    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+    return SHA256.HashData(stream);
+}
+
+static HashSet<int> SnapshotMediaHelperProcessIds(params string[] executablePaths)
+{
+    var targets = executablePaths
+        .Select(Path.GetFullPath)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var processNames = targets
+        .Select(Path.GetFileNameWithoutExtension)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    var result = new HashSet<int>();
+    foreach (var processName in processNames)
+    {
+        foreach (var process in Process.GetProcessesByName(processName))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.MainModule?.FileName is { } processPath &&
+                        targets.Contains(Path.GetFullPath(processPath)))
+                    {
+                        result.Add(process.Id);
+                    }
+                }
+                catch (Exception exception) when (
+                    exception is InvalidOperationException or System.ComponentModel.Win32Exception or
+                        NotSupportedException)
+                {
+                    // A process can exit between enumeration and path inspection.
+                }
+            }
+        }
+    }
+
+    return result;
 }
 
 static async Task<CapturePerformanceSample?> ReadPerformanceSampleAsync(

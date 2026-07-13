@@ -35,6 +35,7 @@ public partial class MainWindow : Window
     private readonly AppUpdateService _appUpdateService = new();
     private readonly ReplayBufferService _replayBufferService;
     private readonly ClipLibraryService _clipLibraryService;
+    private readonly ClipTrimService _clipTrimService;
     private readonly GlobalHotkeyService _hotkeyService = new();
     private readonly TrayIconService _trayIconService;
     private readonly NativeWindowThemeService _nativeWindowThemeService;
@@ -79,6 +80,7 @@ public partial class MainWindow : Window
     {
         _replayBufferService = new ReplayBufferService(_ffmpegSetupService);
         _clipLibraryService = new ClipLibraryService(_ffmpegSetupService);
+        _clipTrimService = new ClipTrimService(_ffmpegSetupService);
         _replayBufferService.StateChanged += ReplayBufferService_StateChanged;
         _appUpdateService.StateChanged += AppUpdateService_StateChanged;
 
@@ -470,6 +472,12 @@ public partial class MainWindow : Window
 
     private async Task StartReplayCoreAsync()
     {
+        if (_libraryWindow?.IsTrimInProgress == true)
+        {
+            throw new InvalidOperationException(
+                "Wait for the trim export to finish or cancel it before starting Instant Replay.");
+        }
+
         if (_ffmpegSetupService.FindExecutable() is null)
         {
             InstallEnginePanel.Visibility = Visibility.Visible;
@@ -914,6 +922,7 @@ public partial class MainWindow : Window
         }
 
         _latestState = snapshot;
+        _libraryWindow?.UpdateReplayRunningState(_replayBufferService.IsRunning);
         if (IsVisible && IsActive)
         {
             UpdateControlsForState(snapshot);
@@ -1730,7 +1739,21 @@ public partial class MainWindow : Window
     private async void RefreshLibraryButton_Click(object sender, RoutedEventArgs e) =>
         await RefreshClipLibraryAsync();
 
-    private void OpenLibraryButton_Click(object sender, RoutedEventArgs e)
+    private void OpenLibraryButton_Click(object sender, RoutedEventArgs e) =>
+        OpenLibraryWindow(_currentClip, beginTrim: false);
+
+    private void TrimCurrentClipButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentClip is null)
+        {
+            ShowError("Select a saved clip before opening the trim editor.");
+            return;
+        }
+
+        OpenLibraryWindow(_currentClip, beginTrim: true);
+    }
+
+    private void OpenLibraryWindow(ClipLibraryItem? preferredClip, bool beginTrim)
     {
         if (_isClosing)
         {
@@ -1750,6 +1773,12 @@ public partial class MainWindow : Window
             }
 
             _ = openLibrary.Activate();
+            openLibrary.UpdateReplayRunningState(_replayBufferService.IsRunning);
+            if (beginTrim && preferredClip is not null)
+            {
+                openLibrary.SelectClipAndBeginTrim(preferredClip);
+            }
+
             return;
         }
 
@@ -1759,8 +1788,11 @@ public partial class MainWindow : Window
         _libraryRefreshPending = true;
         var libraryWindow = new LibraryWindow(
             _clipLibraryService,
+            _clipTrimService,
             _settings.SaveDirectory,
-            _currentClip)
+            _replayBufferService.IsRunning,
+            preferredClip,
+            beginTrim)
         {
             Owner = this
         };
@@ -2036,6 +2068,7 @@ public partial class MainWindow : Window
         LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         OpenCurrentClipButton.IsEnabled = true;
+        TrimCurrentClipButton.IsEnabled = true;
         SetPlayerControlsEnabled(true);
         PlayerSurfacePlayButton.Visibility = Visibility.Visible;
         SetSeekUi(TimeSpan.Zero, clip.Duration ?? TimeSpan.Zero);
@@ -2062,6 +2095,7 @@ public partial class MainWindow : Window
         PlayerEmptyState.Visibility = Visibility.Visible;
         PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
         OpenCurrentClipButton.IsEnabled = false;
+        TrimCurrentClipButton.IsEnabled = false;
         SetPlayerControlsEnabled(false);
         SetSeekUi(TimeSpan.Zero, TimeSpan.Zero);
         PlayerTimeText.Text = "0:00 / 0:00";
