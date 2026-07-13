@@ -19,6 +19,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private readonly FfmpegSetupService _ffmpegSetupService;
     private readonly FfmpegCapabilityProbe _capabilityProbe = new();
+    private readonly VideoEncodingStrategy? _captureStrategyOverride;
     private readonly string _bufferRoot;
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim _saveGate = new(1, 1);
@@ -60,6 +61,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // MainWindow creates this service only after primary single-instance
         // ownership is established, so pre-existing sessions are crash residue.
         CleanupStaleBuffers();
+    }
+
+    internal ReplayBufferService(
+        FfmpegSetupService ffmpegSetupService,
+        string bufferRoot,
+        VideoEncodingStrategy captureStrategyOverride)
+        : this(ffmpegSetupService, bufferRoot)
+    {
+        _captureStrategyOverride = captureStrategyOverride;
     }
 
     internal static string GetDefaultBufferRoot()
@@ -169,9 +179,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     _diagnosticLines.Clear();
                 }
 
-                var capabilitySelection = await _capabilityProbe
-                    .SelectAsync(ffmpegPath, configuration, cancellationToken)
-                    .ConfigureAwait(false);
+                var capabilitySelection = _captureStrategyOverride is null
+                    ? await _capabilityProbe
+                        .SelectAsync(ffmpegPath, configuration, cancellationToken)
+                        .ConfigureAwait(false)
+                    : new FfmpegCapabilitySelection(
+                        _captureStrategyOverride,
+                        $"Capture smoke override selected {_captureStrategyOverride.Description}.");
                 _activeEncoderDescription = capabilitySelection.Strategy.Description;
                 EnqueueDiagnostic(capabilitySelection.Diagnostics);
 

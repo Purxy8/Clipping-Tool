@@ -6,6 +6,8 @@
     <Color x:Key="SurfaceColor">#12151D</Color>
     <Color x:Key="SurfaceRaisedColor">#181C26</Color>
     <Color x:Key="SurfaceHoverColor">#202634</Color>
+    <Color x:Key="SurfaceTranslucentColor">#A112151D</Color>
+    <Color x:Key="SurfaceOverlayColor">#F212151D</Color>
     <Color x:Key="BorderColor">#293042</Color>
     <Color x:Key="BorderStrongColor">#3B455D</Color>
     <Color x:Key="TextPrimaryColor">#F5F7FC</Color>
@@ -14,46 +16,51 @@
     <Color x:Key="AccentColor">#7C6CF2</Color>
     <Color x:Key="AccentHoverColor">#9184FF</Color>
     <Color x:Key="AccentPressedColor">#6959D8</Color>
+    <Color x:Key="AccentSoftColor">#247C6CF2</Color>
+    <Color x:Key="AccentBorderColor">#597C6CF2</Color>
+    <Color x:Key="AccentGradientStartColor">#8C7BFF</Color>
+    <Color x:Key="AccentGradientEndColor">#6557DD</Color>
+    <Color x:Key="PrimaryButtonTextColor">#FFFFFF</Color>
+    <Color x:Key="HeroGradientStartColor">#1C2130</Color>
+    <Color x:Key="HeroGradientMiddleColor">#131721</Color>
+    <Color x:Key="HeroGradientEndColor">#201B39</Color>
     <Color x:Key="SuccessColor">#46D39A</Color>
     <Color x:Key="WarningColor">#F4B85B</Color>
     <Color x:Key="ErrorColor">#FF7185</Color>
 
-    <SolidColorBrush x:Key="WindowBrush" Color="{StaticResource WindowColor}" />
-    <SolidColorBrush x:Key="SurfaceBrush" Color="{StaticResource SurfaceColor}" />
-    <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{StaticResource SurfaceRaisedColor}" />
-    <SolidColorBrush x:Key="SurfaceHoverBrush" Color="{StaticResource SurfaceHoverColor}" />
-    <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
-    <SolidColorBrush x:Key="BorderStrongBrush" Color="{StaticResource BorderStrongColor}" />
+    <SolidColorBrush x:Key="WindowBrush" Color="{DynamicResource WindowColor}" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="{DynamicResource SurfaceColor}" />
+    <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{DynamicResource SurfaceRaisedColor}" />
+    <SolidColorBrush x:Key="SurfaceHoverBrush" Color="{DynamicResource SurfaceHoverColor}" />
+    <SolidColorBrush x:Key="SurfaceTranslucentBrush" Color="{DynamicResource SurfaceTranslucentColor}" />
+    <SolidColorBrush x:Key="SurfaceOverlayBrush" Color="{DynamicResource SurfaceOverlayColor}" />
+    <SolidColorBrush x:Key="BorderBrush" Color="{DynamicResource BorderColor}" />
+    <SolidColorBrush x:Key="BorderStrongBrush" Color="{DynamicResource BorderStrongColor}" />
     <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimaryColor}" />
     <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondaryColor}" />
     <SolidColorBrush x:Key="TextMutedBrush" Color="{StaticResource TextMutedColor}" />
-    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
-    <SolidColorBrush x:Key="AccentHoverBrush" Color="{StaticResource AccentHoverColor}" />
-    <SolidColorBrush x:Key="AccentPressedBrush" Color="{StaticResource AccentPressedColor}" />
+    <SolidColorBrush x:Key="AccentBrush" Color="{DynamicResource AccentColor}" />
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="{DynamicResource AccentHoverColor}" />
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="{DynamicResource AccentPressedColor}" />
+    <SolidColorBrush x:Key="PrimaryButtonTextBrush" Color="{DynamicResource PrimaryButtonTextColor}" />
     <SolidColorBrush x:Key="SuccessBrush" Color="{StaticResource SuccessColor}" />
     <SolidColorBrush x:Key="WarningBrush" Color="{StaticResource WarningColor}" />
     <SolidColorBrush x:Key="ErrorBrush" Color="{StaticResource ErrorColor}" />
-    <SolidColorBrush x:Key="AccentSoftBrush" Color="#247C6CF2" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="{DynamicResource AccentSoftColor}" />
+    <SolidColorBrush x:Key="AccentBorderBrush" Color="{DynamicResource AccentBorderColor}" />
     <SolidColorBrush x:Key="SuccessSoftBrush" Color="#1F46D39A" />
     <SolidColorBrush x:Key="WarningSoftBrush" Color="#22F4B85B" />
     <SolidColorBrush x:Key="ErrorSoftBrush" Color="#22FF7185" />
 
     <LinearGradientBrush x:Key="AccentGradientBrush" StartPoint="0,0" EndPoint="1,1">
-        <GradientStop Color="#8C7BFF" Offset="0" />
-        <GradientStop Color="#6557DD" Offset="1" />
+        <GradientStop Color="{DynamicResource AccentGradientStartColor}" Offset="0" />
+        <GradientStop Color="{DynamicResource AccentGradientEndColor}" Offset="1" />
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="HeroGradientBrush" StartPoint="0,0" EndPoint="1,1">
-        <GradientStop Color="#1C2130" Offset="0" />
-        <GradientStop Color="#131721" Offset="0.58" />
-        <GradientStop Color="#201B39" Offset="1" />
+        <GradientStop Color="{DynamicResource HeroGradientStartColor}" Offset="0" />
+        <GradientStop Color="{DynamicResource HeroGradientMiddleColor}" Offset="0.58" />
+        <GradientStop Color="{DynamicResource HeroGradientEndColor}" Offset="1" />
     </LinearGradientBrush>
-
-    <DropShadowEffect x:Key="OverlayShadowEffect"
-                      BlurRadius="28"
-                      ShadowDepth="8"
-                      Direction="270"
-                      Color="#000000"
-                      Opacity="0.48" />
 
     <!-- Typography -->
     <Style TargetType="{x:Type Window}">
@@ -124,12 +131,12 @@
 
     <Style x:Key="HeroCardStyle" TargetType="{x:Type Border}" BasedOn="{StaticResource CardStyle}">
         <Setter Property="Background" Value="{StaticResource HeroGradientBrush}" />
-        <Setter Property="BorderBrush" Value="#3A4054" />
+        <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
         <Setter Property="Padding" Value="28" />
     </Style>
 
     <Style x:Key="InsetPanelStyle" TargetType="{x:Type Border}">
-        <Setter Property="Background" Value="#8A0D1017" />
+        <Setter Property="Background" Value="{StaticResource SurfaceTranslucentBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="CornerRadius" Value="11" />
@@ -139,7 +146,7 @@
     <Style x:Key="SidebarSectionStyle" TargetType="{x:Type Border}" BasedOn="{StaticResource CardStyle}">
         <Setter Property="Padding" Value="14" />
         <Setter Property="CornerRadius" Value="12" />
-        <Setter Property="Background" Value="#A1181C26" />
+        <Setter Property="Background" Value="{StaticResource SurfaceTranslucentBrush}" />
     </Style>
 
     <!-- Buttons -->
@@ -198,8 +205,8 @@
 
     <Style x:Key="PrimaryButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
         <Setter Property="Background" Value="{StaticResource AccentGradientBrush}" />
-        <Setter Property="BorderBrush" Value="#A99EFF" />
-        <Setter Property="Foreground" Value="White" />
+        <Setter Property="BorderBrush" Value="{StaticResource AccentHoverBrush}" />
+        <Setter Property="Foreground" Value="{StaticResource PrimaryButtonTextBrush}" />
     </Style>
 
     <Style x:Key="SecondaryButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
@@ -220,7 +227,7 @@
 
     <Style x:Key="GalleryCardButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
         <Setter Property="MinHeight" Value="104" />
-        <Setter Property="Background" Value="#090B10" />
+        <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
     </Style>
 
@@ -228,7 +235,7 @@
     <Style TargetType="{x:Type TextBox}">
         <Setter Property="MinHeight" Value="42" />
         <Setter Property="Padding" Value="13,10" />
-        <Setter Property="Background" Value="#B20D1017" />
+        <Setter Property="Background" Value="{StaticResource SurfaceTranslucentBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
         <Setter Property="CaretBrush" Value="{StaticResource AccentHoverBrush}" />
         <Setter Property="SelectionBrush" Value="{StaticResource AccentBrush}" />
@@ -300,7 +307,7 @@
     <Style TargetType="{x:Type ComboBox}">
         <Setter Property="MinHeight" Value="42" />
         <Setter Property="Padding" Value="13,0,9,0" />
-        <Setter Property="Background" Value="#B20D1017" />
+        <Setter Property="Background" Value="{StaticResource SurfaceTranslucentBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
         <Setter Property="BorderThickness" Value="1" />
@@ -523,7 +530,7 @@
     </Style>
 
     <ControlTemplate x:Key="VerticalScrollBarTemplate" TargetType="{x:Type ScrollBar}">
-        <Border Background="#E60B0D12"
+        <Border Background="{StaticResource SurfaceOverlayBrush}"
                 CornerRadius="5"
                 SnapsToDevicePixels="True">
             <Track x:Name="PART_Track"
@@ -546,7 +553,7 @@
     </ControlTemplate>
 
     <ControlTemplate x:Key="HorizontalScrollBarTemplate" TargetType="{x:Type ScrollBar}">
-        <Border Background="#E60B0D12"
+        <Border Background="{StaticResource SurfaceOverlayBrush}"
                 CornerRadius="5"
                 SnapsToDevicePixels="True">
             <Track x:Name="PART_Track"
@@ -571,7 +578,7 @@
     <Style TargetType="{x:Type ScrollBar}">
         <Setter Property="Width" Value="10" />
         <Setter Property="MinWidth" Value="10" />
-        <Setter Property="Background" Value="#E60B0D12" />
+        <Setter Property="Background" Value="{StaticResource SurfaceOverlayBrush}" />
         <Setter Property="Focusable" Value="False" />
         <Setter Property="Template" Value="{StaticResource VerticalScrollBarTemplate}" />
         <Style.Triggers>

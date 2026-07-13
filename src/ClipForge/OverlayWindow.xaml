@@ -6,47 +6,19 @@
         Height="176"
         ResizeMode="NoResize"
         WindowStyle="None"
-        AllowsTransparency="True"
-        Background="Transparent"
+        Background="{StaticResource WindowBrush}"
         ShowInTaskbar="False"
         ShowActivated="False"
         Topmost="True"
         UseLayoutRounding="True"
-        Opacity="0"
         Loaded="OverlayWindow_Loaded"
         MouseLeftButtonDown="OverlayWindow_MouseLeftButtonDown">
-    <Window.Resources>
-        <Storyboard x:Key="OverlayEnterStoryboard">
-            <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                             From="0"
-                             To="1"
-                             Duration="0:0:0.18">
-                <DoubleAnimation.EasingFunction>
-                    <CubicEase EasingMode="EaseOut" />
-                </DoubleAnimation.EasingFunction>
-            </DoubleAnimation>
-            <DoubleAnimation Storyboard.TargetName="OverlayTranslate"
-                             Storyboard.TargetProperty="Y"
-                             From="-12"
-                             To="0"
-                             Duration="0:0:0.22">
-                <DoubleAnimation.EasingFunction>
-                    <CubicEase EasingMode="EaseOut" />
-                </DoubleAnimation.EasingFunction>
-            </DoubleAnimation>
-        </Storyboard>
-    </Window.Resources>
-
-    <Border Margin="8"
+    <Border x:Name="OverlayRoot"
             Padding="16"
-            Background="#F2131620"
-            BorderBrush="#597C6CF2"
+            Background="{StaticResource SurfaceOverlayBrush}"
+            BorderBrush="{StaticResource AccentBorderBrush}"
             BorderThickness="1"
-            CornerRadius="18"
-            Effect="{DynamicResource OverlayShadowEffect}">
-        <Border.RenderTransform>
-            <TranslateTransform x:Name="OverlayTranslate" />
-        </Border.RenderTransform>
+            CornerRadius="12">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -63,7 +35,7 @@
                     <Border Width="31" Height="31" Margin="0,0,10,0"
                             Background="{StaticResource AccentGradientBrush}" CornerRadius="9">
                         <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
-                                   FontWeight="Bold" Foreground="White" Text="CF" />
+                                   FontWeight="Bold" Foreground="{StaticResource PrimaryButtonTextBrush}" Text="CF" />
                     </Border>
                     <StackPanel VerticalAlignment="Center">
                         <TextBlock FontSize="14" FontWeight="SemiBold" Text="ClipForge overlay" />

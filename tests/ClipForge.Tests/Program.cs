@@ -32,6 +32,7 @@ internal static class Program
             ("Updater channel selection", TestUpdaterChannelSelectionAsync),
             ("Default save directory", TestDefaultSaveDirectoryAsync),
             ("Background color policy", TestBackgroundColorPolicyAsync),
+            ("Appearance and gallery layout", TestAppearanceAndGalleryAsync),
             ("UI feedback helpers", TestUiFeedbackHelpersAsync),
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
@@ -118,6 +119,8 @@ internal static class Program
             AppSettings.DefaultBackgroundColor,
             defaults.BackgroundColor,
             "The default background color is incorrect.");
+        Assert.Equal(AppSettings.DefaultAccentColor, defaults.AccentColor, "The default accent color is incorrect.");
+        Assert.Equal(AppSettings.DefaultSurfaceColor, defaults.SurfaceColor, "The default surface color is incorrect.");
         Assert.Equal(4, defaults.RecentClipCount, "The recent clip gallery should default to four items.");
         Assert.True(defaults.PlayClipSavedSound, "Saved-clip sound feedback should be enabled by default.");
         int[] expectedRecentClipCounts = [4, 8, 10, 15];
@@ -163,6 +166,67 @@ internal static class Program
             "#300000",
             AppSettings.NormalizeBackgroundColor("#FF0000"),
             "Tone limiting should preserve the requested hue.");
+        Assert.Equal(
+            "#303030",
+            AppSettings.NormalizeSurfaceColor("#FFFFFF"),
+            "Bright surfaces must remain inside the readable dark range.");
+        Assert.Equal(
+            AppSettings.DefaultAccentColor,
+            AppSettings.NormalizeAccentColor("invalid"),
+            "Malformed accent values must use the tested default.");
+        Assert.True(
+            !string.Equals("#000000", AppSettings.NormalizeAccentColor("#000000"), StringComparison.Ordinal),
+            "An invisible custom accent must be lifted into the visible range.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestAppearanceAndGalleryAsync()
+    {
+        var palette = AppearanceThemePalette.Create("#0D1422", "#3B82F6", "#17131F");
+        Assert.Equal("#0D1422", palette.BackgroundColor, "Background palette normalization changed a valid preset.");
+        Assert.Equal("#3B82F6", palette.AccentColor, "Accent palette normalization changed a visible preset.");
+        Assert.Equal("#17131F", palette.SurfaceColor, "Surface palette normalization changed a valid preset.");
+        Assert.True(
+            palette.SurfaceTranslucentColor.StartsWith("#A1", StringComparison.Ordinal),
+            "The translucent surface palette must preserve its intended alpha channel.");
+        Assert.True(
+            palette.AccentSoftColor.StartsWith("#24", StringComparison.Ordinal),
+            "The soft accent palette must preserve its intended alpha channel.");
+
+        var parsedArgb = MainWindow.ParseThemeColor("#A112151D");
+        Assert.Equal((byte)0xA1, parsedArgb.A, "ARGB theme parsing lost the alpha component.");
+        Assert.Equal((byte)0x12, parsedArgb.R, "ARGB theme parsing mapped the red component incorrectly.");
+        Assert.Equal((byte)0x15, parsedArgb.G, "ARGB theme parsing mapped the green component incorrectly.");
+        Assert.Equal((byte)0x1D, parsedArgb.B, "ARGB theme parsing mapped the blue component incorrectly.");
+        Assert.True(
+            palette.PrimaryButtonTextColor is "#000000" or "#FFFFFF",
+            "Primary button text must choose a deterministic contrasting color.");
+        Assert.True(
+            !string.Equals(palette.SurfaceColor, palette.SurfaceRaisedColor, StringComparison.Ordinal),
+            "Raised controls need a visible derived surface color.");
+
+        Assert.Equal("0 MB", ClipLibraryItem.FormatFileSize(0), "Zero-byte size formatting is incorrect.");
+        Assert.Equal("<1 MB", ClipLibraryItem.FormatFileSize(512 * 1024), "Sub-megabyte size formatting is incorrect.");
+        Assert.Equal("1.0 MB", ClipLibraryItem.FormatFileSize(1024 * 1024), "One-megabyte size formatting is incorrect.");
+        Assert.Equal("1.5 MB", ClipLibraryItem.FormatFileSize(1536 * 1024), "Fractional size formatting is incorrect.");
+
+        Assert.Equal(
+            594d,
+            MainWindow.CalculateRecentGalleryCardWidth(1200, requestedCount: 4, actualItemCount: 2),
+            "Two available clips should fill the selected four-clip viewport without an empty half.");
+        Assert.Equal(
+            294d,
+            MainWindow.CalculateRecentGalleryCardWidth(1200, requestedCount: 4, actualItemCount: 4),
+            "Four recent clips should divide the viewport edge to edge.");
+        Assert.Equal(
+            234d,
+            MainWindow.CalculateRecentGalleryCardWidth(1200, requestedCount: 8, actualItemCount: 8),
+            "Eight-clip mode should use five compact visible slots before scrolling.");
+        Assert.Equal(
+            168d,
+            MainWindow.CalculateRecentGalleryCardWidth(1200, requestedCount: 15, actualItemCount: 15),
+            "Fifteen-clip mode must retain a readable minimum card width and scroll.");
+
         return Task.CompletedTask;
     }
 
@@ -174,7 +238,7 @@ internal static class Program
             "Native title-bar colors must use Win32 COLORREF byte order.");
 
         var wave = ClipSavedSoundService.CreateChimeWave();
-        Assert.Equal(19_244, wave.Length, "The in-memory confirmation chime has an unexpected size.");
+        Assert.Equal(20_204, wave.Length, "The in-memory confirmation chime has an unexpected size.");
         Assert.SequenceEqual(
             new byte[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' },
             wave.Take(4),
@@ -183,13 +247,14 @@ internal static class Program
             new byte[] { (byte)'W', (byte)'A', (byte)'V', (byte)'E' },
             wave.Skip(8).Take(4),
             "The confirmation chime is not a WAVE stream.");
-        Assert.Equal(19_200, BitConverter.ToInt32(wave, 40), "The PCM data length is incorrect.");
+        Assert.Equal(20_160, BitConverter.ToInt32(wave, 40), "The PCM data length is incorrect.");
 
         var peak = Enumerable.Range(0, (wave.Length - 44) / sizeof(short))
             .Select(index => Math.Abs((int)BitConverter.ToInt16(wave, 44 + (index * sizeof(short)))))
             .Max();
-        Assert.True(peak > 0, "The confirmation chime must contain audible PCM samples.");
-        Assert.True(peak < short.MaxValue / 4, "The confirmation chime should remain deliberately quiet.");
+        Assert.True(
+            peak >= short.MaxValue * 0.26 && peak <= short.MaxValue * 0.28,
+            "The confirmation pop should be clearly audible without approaching clipping.");
 
         var constructionTimer = Stopwatch.StartNew();
         using (var soundService = new ClipSavedSoundService())
@@ -292,9 +357,26 @@ internal static class Program
         Assert.True(
             arguments.Any(argument => argument.Contains("amix=inputs=2", StringComparison.Ordinal)),
             "Two selected audio endpoints must be mixed.");
+        Assert.Equal(
+            "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear," +
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p",
+            GetArgumentAfter(arguments, "-vf"),
+            "Fixed-resolution GDI capture must use the low-impact scaling path.");
         Assert.True(
             arguments[^1].EndsWith("segment-%09d.mkv", StringComparison.Ordinal),
             "Capture output must be a numbered Matroska segment pattern.");
+
+        var sourceArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration with
+            {
+                Resolution = ResolutionOption.All.Single(option => option.Id == "source")
+            },
+            [],
+            @"C:\Buffer");
+        Assert.Equal(
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            GetArgumentAfter(sourceArguments, "-vf"),
+            "Source/native GDI capture must remain a no-resize path.");
 
         return Task.CompletedTask;
     }
@@ -461,6 +543,82 @@ internal static class Program
             expectedEncoder: VideoEncoderKind.SoftwareX264,
             expectedBackend: DesktopCaptureBackend.Gdi,
             expectedTransfer: false);
+
+        var hybridRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isTransfer = arguments.Any(argument =>
+                argument.Contains("hwdownload", StringComparison.Ordinal));
+
+            return encoderName switch
+            {
+                "h264_nvenc" when !isGraphicsCapture => true,
+                "h264_nvenc" => false,
+                "h264_qsv" when !isGraphicsCapture => true,
+                "h264_qsv" => !isTransfer,
+                _ => false
+            };
+        });
+        var hybridProbe = new FfmpegCapabilityProbe(hybridRunner);
+        var hybridResult = await hybridProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            VideoEncoderKind.IntelQuickSync,
+            hybridResult.Strategy.Encoder,
+            "A verified direct-WGC encoder must outrank an earlier hardware GDI fallback.");
+        Assert.Equal(
+            DesktopCaptureBackend.WindowsGraphicsCapture,
+            hybridResult.Strategy.CaptureBackend,
+            "Hybrid systems must keep capture on the graphics path when another encoder supports it.");
+        Assert.True(
+            !hybridResult.Strategy.RequiresSystemMemoryTransfer,
+            "The verified direct-WGC path should not add a compatibility transfer.");
+        Assert.Equal(
+            5,
+            hybridRunner.CallCount,
+            "The probe should test NVENC graphics paths before selecting verified direct QSV capture.");
+
+        var hybridTransferRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isTransfer = arguments.Any(argument =>
+                argument.Contains("hwdownload", StringComparison.Ordinal));
+
+            return encoderName switch
+            {
+                "h264_nvenc" when !isGraphicsCapture => true,
+                "h264_nvenc" => false,
+                "h264_qsv" when !isGraphicsCapture => true,
+                "h264_qsv" => isTransfer,
+                _ => false
+            };
+        });
+        var hybridTransferProbe = new FfmpegCapabilityProbe(hybridTransferRunner);
+        var hybridTransferResult = await hybridTransferProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            VideoEncoderKind.IntelQuickSync,
+            hybridTransferResult.Strategy.Encoder,
+            "A verified transfer-WGC encoder must outrank an earlier hardware GDI fallback.");
+        Assert.Equal(
+            DesktopCaptureBackend.WindowsGraphicsCapture,
+            hybridTransferResult.Strategy.CaptureBackend,
+            "Hybrid systems must keep the compatibility transfer on the graphics capture path.");
+        Assert.True(
+            hybridTransferResult.Strategy.RequiresSystemMemoryTransfer,
+            "The selected hybrid compatibility path should retain its required transfer.");
+        Assert.Equal(
+            6,
+            hybridTransferRunner.CallCount,
+            "The probe should test the later encoder's transfer path before accepting the earlier GDI fallback.");
     }
 
     private static Task TestCaptureDiagnosticPriorityAsync()
@@ -741,6 +899,8 @@ internal static class Program
                 CheckForUpdatesAutomatically = false,
                 PlayClipSavedSound = false,
                 BackgroundColor = "#161321",
+                AccentColor = "#3B82F6",
+                SurfaceColor = "#17131F",
                 RecentClipCount = 10,
                 SaveClipHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Alt, Key.F8),
                 ToggleOverlayHotkey = new HotkeyGesture(HotkeyModifiers.Control | HotkeyModifiers.Shift, Key.O),
@@ -771,6 +931,8 @@ internal static class Program
                 expected.BackgroundColor,
                 actual.BackgroundColor,
                 "Background color did not roundtrip.");
+            Assert.Equal(expected.AccentColor, actual.AccentColor, "Accent color did not roundtrip.");
+            Assert.Equal(expected.SurfaceColor, actual.SurfaceColor, "Surface color did not roundtrip.");
             Assert.Equal(
                 expected.RecentClipCount,
                 actual.RecentClipCount,

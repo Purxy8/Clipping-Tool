@@ -22,6 +22,12 @@ public partial class MainWindow : Window
 {
     private static readonly int[] FrameRateOptions = [30, 60];
     private static readonly int[] RecentClipCountOptions = [4, 8, 10, 15];
+    private static readonly AppearanceTargetOption[] AppearanceTargetOptions =
+    [
+        new(AppearanceColorTarget.Background, "App background"),
+        new(AppearanceColorTarget.Accent, "Accent & buttons"),
+        new(AppearanceColorTarget.Surface, "Panels & controls")
+    ];
 
     private readonly SettingsService _settingsService = new();
     private readonly DeviceDiscoveryService _deviceDiscoveryService = new();
@@ -48,7 +54,10 @@ public partial class MainWindow : Window
     private bool _isInitializing = true;
     private bool _isClosing;
     private bool _exitRequested;
+    private bool _engineReady;
     private bool _backgroundHintShown;
+    private bool _libraryRefreshPending;
+    private bool _playerSourceReleasedForBackground;
     private bool _isPlayerPlaying;
     private bool _playWhenOpened;
     private bool _isPlayerSeeking;
@@ -62,6 +71,8 @@ public partial class MainWindow : Window
     private OverlayWindow? _overlayWindow;
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
+    private string? _lastTrayStatus;
+    private bool? _lastTrayCanSave;
 
     public MainWindow()
     {
@@ -185,9 +196,12 @@ public partial class MainWindow : Window
         ClipSavedSoundCheckBox.IsChecked = _settings.PlayClipSavedSound;
         RecentClipCountComboBox.ItemsSource = RecentClipCountOptions;
         RecentClipCountComboBox.SelectedItem = _settings.RecentClipCount;
+        AppearanceTargetComboBox.ItemsSource = AppearanceTargetOptions;
+        AppearanceTargetComboBox.SelectedIndex = 0;
         HotkeyText.Text = _settings.SaveClipHotkey.DisplayText;
         OverlayHotkeyText.Text = _settings.ToggleOverlayHotkey.DisplayText;
-        ApplyBackgroundColor(_settings.BackgroundColor);
+        ApplyAppearanceTheme();
+        UpdateAppearanceEditor();
 
         UpdatePrimaryActionText();
     }
@@ -281,7 +295,14 @@ public partial class MainWindow : Window
         }
         finally
         {
-            UpdateControlsForState(_latestState);
+            if (IsVisible)
+            {
+                UpdateControlsForState(_latestState);
+            }
+            else
+            {
+                UpdateBackgroundIndicators(_latestState);
+            }
         }
     }
 
@@ -528,7 +549,9 @@ public partial class MainWindow : Window
         _settings.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceOption)?.Id;
         _settings.CheckForUpdatesAutomatically = AutoUpdateCheckBox.IsChecked == true;
         _settings.PlayClipSavedSound = ClipSavedSoundCheckBox.IsChecked == true;
-        _settings.BackgroundColor = NormalizeBackgroundColor(_settings.BackgroundColor);
+        _settings.BackgroundColor = AppSettings.NormalizeBackgroundColor(_settings.BackgroundColor);
+        _settings.AccentColor = AppSettings.NormalizeAccentColor(_settings.AccentColor);
+        _settings.SurfaceColor = AppSettings.NormalizeSurfaceColor(_settings.SurfaceColor);
         _settings.RecentClipCount = RecentClipCountComboBox.SelectedItem is int recentClipCount
             ? AppSettings.NormalizeRecentClipCount(recentClipCount)
             : 4;
@@ -553,25 +576,33 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void BackgroundSwatchButton_Click(object sender, RoutedEventArgs e)
+    private void AppearanceTargetComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_isInitializing && !_isClosing)
+        {
+            UpdateAppearanceEditor();
+        }
+    }
+
+    private async void AppearanceSwatchButton_Click(object sender, RoutedEventArgs e)
     {
         if (_isInitializing || _isClosing || sender is not Button { Tag: string color })
         {
             return;
         }
 
-        ApplyBackgroundColor(color);
+        ApplySelectedAppearanceColor(color);
         await PersistSettingsAsync();
     }
 
-    private async void CustomBackgroundButton_Click(object sender, RoutedEventArgs e)
+    private async void CustomAppearanceColorButton_Click(object sender, RoutedEventArgs e)
     {
         if (_isInitializing || _isClosing)
         {
             return;
         }
 
-        var current = ParseBackgroundColor(NormalizeBackgroundColor(_settings.BackgroundColor));
+        var current = ParseThemeColor(GetSelectedAppearanceColor());
         using var dialog = new Forms.ColorDialog
         {
             AllowFullOpen = true,
@@ -588,50 +619,192 @@ public partial class MainWindow : Window
             return;
         }
 
-        ApplyBackgroundColor($"#{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}");
+        ApplySelectedAppearanceColor($"#{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}");
         await PersistSettingsAsync();
     }
 
-    private async void ResetBackgroundButton_Click(object sender, RoutedEventArgs e)
+    private async void ResetAppearanceColorButton_Click(object sender, RoutedEventArgs e)
     {
         if (_isInitializing || _isClosing)
         {
             return;
         }
 
-        ApplyBackgroundColor(AppSettings.DefaultBackgroundColor);
+        var defaultColor = GetSelectedAppearanceTarget() switch
+        {
+            AppearanceColorTarget.Accent => AppSettings.DefaultAccentColor,
+            AppearanceColorTarget.Surface => AppSettings.DefaultSurfaceColor,
+            _ => AppSettings.DefaultBackgroundColor
+        };
+        ApplySelectedAppearanceColor(defaultColor);
         await PersistSettingsAsync();
     }
 
-    private void ApplyBackgroundColor(string? requestedColor)
+    private void ApplySelectedAppearanceColor(string? requestedColor)
     {
-        var normalized = NormalizeBackgroundColor(requestedColor);
-        var color = ParseBackgroundColor(normalized);
-        var backgroundBrush = new SolidColorBrush(color);
-        backgroundBrush.Freeze();
-
-        Resources["UserBackgroundBrush"] = backgroundBrush;
-        _settings.BackgroundColor = normalized;
-        BackgroundColorValueText.Text = normalized;
-
-        foreach (var button in BackgroundSwatchesPanel.Children.OfType<Button>())
+        switch (GetSelectedAppearanceTarget())
         {
-            var isSelected = string.Equals(button.Tag as string, normalized, StringComparison.OrdinalIgnoreCase);
+            case AppearanceColorTarget.Accent:
+                _settings.AccentColor = AppSettings.NormalizeAccentColor(requestedColor);
+                break;
+            case AppearanceColorTarget.Surface:
+                _settings.SurfaceColor = AppSettings.NormalizeSurfaceColor(requestedColor);
+                break;
+            default:
+                _settings.BackgroundColor = AppSettings.NormalizeBackgroundColor(requestedColor);
+                break;
+        }
+
+        ApplyAppearanceTheme();
+        UpdateAppearanceEditor();
+    }
+
+    private void ApplyAppearanceTheme()
+    {
+        var palette = AppearanceThemePalette.Create(
+            _settings.BackgroundColor,
+            _settings.AccentColor,
+            _settings.SurfaceColor);
+        _settings.BackgroundColor = palette.BackgroundColor;
+        _settings.AccentColor = palette.AccentColor;
+        _settings.SurfaceColor = palette.SurfaceColor;
+
+        SetThemeColorResource("WindowColor", palette.BackgroundColor);
+        SetThemeColorResource("SurfaceColor", palette.SurfaceColor);
+        SetThemeColorResource("SurfaceRaisedColor", palette.SurfaceRaisedColor);
+        SetThemeColorResource("SurfaceHoverColor", palette.SurfaceHoverColor);
+        SetThemeColorResource("SurfaceTranslucentColor", palette.SurfaceTranslucentColor);
+        SetThemeColorResource("SurfaceOverlayColor", palette.SurfaceOverlayColor);
+        SetThemeColorResource("BorderColor", palette.BorderColor);
+        SetThemeColorResource("BorderStrongColor", palette.BorderStrongColor);
+        SetThemeColorResource("AccentColor", palette.AccentColor);
+        SetThemeColorResource("AccentHoverColor", palette.AccentHoverColor);
+        SetThemeColorResource("AccentPressedColor", palette.AccentPressedColor);
+        SetThemeColorResource("AccentSoftColor", palette.AccentSoftColor);
+        SetThemeColorResource("AccentBorderColor", palette.AccentBorderColor);
+        SetThemeColorResource("AccentGradientStartColor", palette.AccentGradientStartColor);
+        SetThemeColorResource("AccentGradientEndColor", palette.AccentGradientEndColor);
+        SetThemeColorResource("PrimaryButtonTextColor", palette.PrimaryButtonTextColor);
+        SetThemeColorResource("HeroGradientStartColor", palette.HeroGradientStartColor);
+        SetThemeColorResource("HeroGradientMiddleColor", palette.HeroGradientMiddleColor);
+        SetThemeColorResource("HeroGradientEndColor", palette.HeroGradientEndColor);
+    }
+
+    private void UpdateAppearanceEditor()
+    {
+        if (AppearanceSwatchesPanel is null || AppearanceColorValueText is null)
+        {
+            return;
+        }
+
+        var target = GetSelectedAppearanceTarget();
+        var colors = GetAppearancePresets(target);
+        var selectedColor = GetSelectedAppearanceColor();
+        var buttons = AppearanceSwatchesPanel.Children.OfType<Button>().ToArray();
+        for (var index = 0; index < buttons.Length && index < colors.Count; index++)
+        {
+            var button = buttons[index];
+            var color = colors[index];
+            var swatchBrush = new SolidColorBrush(ParseThemeColor(color));
+            swatchBrush.Freeze();
+            button.Tag = color;
+            button.Background = swatchBrush;
+            button.ToolTip = $"Apply {color}";
+            button.SetValue(
+                System.Windows.Automation.AutomationProperties.NameProperty,
+                $"Apply {color} to {target}");
+            var isSelected = string.Equals(color, selectedColor, StringComparison.OrdinalIgnoreCase);
             button.BorderBrush = Brush(isSelected ? "AccentHoverBrush" : "BorderStrongBrush");
             button.BorderThickness = new Thickness(isSelected ? 2 : 1);
             button.SetValue(
                 System.Windows.Automation.AutomationProperties.ItemStatusProperty,
                 isSelected ? "Selected" : string.Empty);
         }
+
+        AppearanceColorValueText.Text = selectedColor;
+        AppearanceHintText.Text = target switch
+        {
+            AppearanceColorTarget.Accent =>
+                "Changes primary buttons, toggles, sliders, focus rings, and highlights.",
+            AppearanceColorTarget.Surface =>
+                "Changes panels, controls, borders, menus, and the lightweight overlay.",
+            _ =>
+                "Changes the outer app canvas. Bright custom colors are darkened for readability."
+        };
     }
 
-    private static string NormalizeBackgroundColor(string? requestedColor) =>
-        AppSettings.NormalizeBackgroundColor(requestedColor);
+    private AppearanceColorTarget GetSelectedAppearanceTarget() =>
+        AppearanceTargetComboBox.SelectedItem is AppearanceTargetOption option
+            ? option.Target
+            : AppearanceColorTarget.Background;
 
-    private static Color ParseBackgroundColor(string normalizedColor) => Color.FromRgb(
-        byte.Parse(normalizedColor.AsSpan(1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
-        byte.Parse(normalizedColor.AsSpan(3, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
-        byte.Parse(normalizedColor.AsSpan(5, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+    private string GetSelectedAppearanceColor() => GetSelectedAppearanceTarget() switch
+    {
+        AppearanceColorTarget.Accent => AppSettings.NormalizeAccentColor(_settings.AccentColor),
+        AppearanceColorTarget.Surface => AppSettings.NormalizeSurfaceColor(_settings.SurfaceColor),
+        _ => AppSettings.NormalizeBackgroundColor(_settings.BackgroundColor)
+    };
+
+    private static IReadOnlyList<string> GetAppearancePresets(AppearanceColorTarget target) => target switch
+    {
+        AppearanceColorTarget.Accent => ["#7C6CF2", "#3B82F6", "#10B981", "#F97316", "#E5486D"],
+        AppearanceColorTarget.Surface => ["#12151D", "#101927", "#17131F", "#101B19", "#181A20"],
+        _ => ["#0B0D12", "#0D1422", "#161321", "#0D1A19", "#17191F"]
+    };
+
+    private static void SetThemeColorResource(string resourceKey, string colorValue)
+    {
+        var color = ParseThemeColor(colorValue);
+        var resources = System.Windows.Application.Current.Resources;
+        if (resources.Contains(resourceKey))
+        {
+            resources[resourceKey] = color;
+            return;
+        }
+
+        foreach (var dictionary in resources.MergedDictionaries.Reverse())
+        {
+            if (dictionary.Contains(resourceKey))
+            {
+                dictionary[resourceKey] = color;
+                return;
+            }
+        }
+    }
+
+    internal static Color ParseThemeColor(string normalizedColor)
+    {
+        if (normalizedColor.Length == 9 && normalizedColor[0] == '#')
+        {
+            return Color.FromArgb(
+                byte.Parse(normalizedColor.AsSpan(1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                byte.Parse(normalizedColor.AsSpan(3, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                byte.Parse(normalizedColor.AsSpan(5, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                byte.Parse(normalizedColor.AsSpan(7, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+        }
+
+        if (normalizedColor.Length == 7 && normalizedColor[0] == '#')
+        {
+            return Color.FromRgb(
+                byte.Parse(normalizedColor.AsSpan(1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                byte.Parse(normalizedColor.AsSpan(3, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                byte.Parse(normalizedColor.AsSpan(5, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+        }
+
+        throw new FormatException("Theme colors must use #RRGGBB or #AARRGGBB format.");
+    }
+
+    private enum AppearanceColorTarget
+    {
+        Background,
+        Accent,
+        Surface
+    }
+
+    private sealed record AppearanceTargetOption(AppearanceColorTarget Target, string Label)
+    {
+        public override string ToString() => Label;
+    }
 
     private sealed class ColorDialogOwner(nint handle) : Forms.IWin32Window
     {
@@ -652,7 +825,14 @@ public partial class MainWindow : Window
         }
 
         _latestState = snapshot;
-        UpdateControlsForState(snapshot);
+        if (IsVisible)
+        {
+            UpdateControlsForState(snapshot);
+        }
+        else
+        {
+            UpdateBackgroundIndicators(snapshot);
+        }
 
         if (!string.IsNullOrWhiteSpace(snapshot.LastSavedPath))
         {
@@ -672,24 +852,23 @@ public partial class MainWindow : Window
             return;
         }
 
-        var engineReady = _ffmpegSetupService.FindExecutable() is not null;
         var isBusy = snapshot.State is ReplayState.Starting or ReplayState.Stopping;
         var isSaving = snapshot.State == ReplayState.Saving;
         var isRunning = _replayBufferService.IsRunning;
+        var canSave = CanSaveClip(snapshot, isRunning);
 
-        (StatusText.Text, StatusDot.Fill) = snapshot.State switch
+        StatusText.Text = GetReplayStatusText(snapshot.State);
+        StatusDot.Fill = snapshot.State switch
         {
-            ReplayState.Starting => ("Starting replay…", Brush("AccentBrush")),
-            ReplayState.Buffering => ("Building buffer", Brush("WarningBrush")),
-            ReplayState.Ready => ("Replay ready", Brush("SuccessBrush")),
-            ReplayState.Saving => ("Saving clip…", Brush("AccentBrush")),
-            ReplayState.Faulted => ("Replay error", Brush("ErrorBrush")),
-            ReplayState.Stopping => ("Stopping replay…", Brush("TextMutedBrush")),
-            _ => ("Replay off", Brush("TextMutedBrush"))
+            ReplayState.Starting or ReplayState.Saving => Brush("AccentBrush"),
+            ReplayState.Buffering => Brush("WarningBrush"),
+            ReplayState.Ready => Brush("SuccessBrush"),
+            ReplayState.Faulted => Brush("ErrorBrush"),
+            _ => Brush("TextMutedBrush")
         };
 
         BufferToggleButton.Content = isRunning ? "Stop replay" : "Start replay";
-        BufferToggleButton.IsEnabled = engineReady && !isBusy && !isSaving && !_isClosing;
+        BufferToggleButton.IsEnabled = _engineReady && !isBusy && !isSaving && !_isClosing;
         BufferToggleButton.SetValue(
             System.Windows.Automation.AutomationProperties.NameProperty,
             isRunning ? "Stop instant replay" : "Start instant replay");
@@ -705,11 +884,7 @@ public partial class MainWindow : Window
             AvailableText.Text = "No replay buffered";
         }
 
-        SaveClipButton.IsEnabled = isRunning &&
-                                   !isBusy &&
-                                   !isSaving &&
-                                   snapshot.AvailableDuration >= TimeSpan.FromSeconds(1) &&
-                                   !_isClosing;
+        SaveClipButton.IsEnabled = canSave;
         if (_replayBufferService.ActiveEncoderDescription is { Length: > 0 } encoderDescription)
         {
             EncoderStatusText.Text = $"Performance mode: {encoderDescription}";
@@ -719,13 +894,52 @@ public partial class MainWindow : Window
                     : "SuccessBrush");
         }
 
-        _trayIconService.UpdateStatus(StatusText.Text, SaveClipButton.IsEnabled);
-        _overlayWindow?.UpdateState(
-            snapshot,
-            isRunning,
-            _settings.SaveClipHotkey.DisplayText);
-        UpdateStorageText();
+        UpdateTrayStatus(StatusText.Text, canSave);
+        if (_overlayWindow is { IsVisible: true } overlay)
+        {
+            overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+        }
     }
+
+    private void UpdateBackgroundIndicators(ReplayStateSnapshot snapshot)
+    {
+        var isRunning = _replayBufferService.IsRunning;
+        UpdateTrayStatus(GetReplayStatusText(snapshot.State), CanSaveClip(snapshot, isRunning));
+        if (_overlayWindow is { IsVisible: true } overlay)
+        {
+            overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+        }
+    }
+
+    private void UpdateTrayStatus(string status, bool canSave)
+    {
+        if (string.Equals(_lastTrayStatus, status, StringComparison.Ordinal) &&
+            _lastTrayCanSave == canSave)
+        {
+            return;
+        }
+
+        _lastTrayStatus = status;
+        _lastTrayCanSave = canSave;
+        _trayIconService.UpdateStatus(status, canSave);
+    }
+
+    private bool CanSaveClip(ReplayStateSnapshot snapshot, bool isRunning) =>
+        isRunning &&
+        snapshot.State is not ReplayState.Starting and not ReplayState.Stopping and not ReplayState.Saving &&
+        snapshot.AvailableDuration >= TimeSpan.FromSeconds(1) &&
+        !_isClosing;
+
+    private static string GetReplayStatusText(ReplayState state) => state switch
+    {
+        ReplayState.Starting => "Starting replay…",
+        ReplayState.Buffering => "Building buffer",
+        ReplayState.Ready => "Replay ready",
+        ReplayState.Saving => "Saving clip…",
+        ReplayState.Faulted => "Replay error",
+        ReplayState.Stopping => "Stopping replay…",
+        _ => "Replay off"
+    };
 
     private Brush Brush(string resourceKey) => (Brush)FindResource(resourceKey);
 
@@ -738,9 +952,9 @@ public partial class MainWindow : Window
 
     private void RefreshEngineState()
     {
-        var engineReady = _ffmpegSetupService.FindExecutable() is not null;
-        InstallEnginePanel.Visibility = engineReady ? Visibility.Collapsed : Visibility.Visible;
-        BufferToggleButton.IsEnabled = engineReady && !_isClosing;
+        _engineReady = _ffmpegSetupService.FindExecutable() is not null;
+        InstallEnginePanel.Visibility = _engineReady ? Visibility.Collapsed : Visibility.Visible;
+        BufferToggleButton.IsEnabled = _engineReady && !_isClosing;
     }
 
     private void UpdateStorageText()
@@ -767,13 +981,16 @@ public partial class MainWindow : Window
                 ? AppSettings.GetDefaultSaveDirectory()
                 : SavePathTextBox.Text;
             var root = Path.GetPathRoot(Path.GetFullPath(savePath));
+            var freeSpace = !string.IsNullOrWhiteSpace(root)
+                ? new DriveInfo(root).AvailableFreeSpace
+                : (long?)null;
             var freeText = !string.IsNullOrWhiteSpace(root)
-                ? $" · {StorageEstimator.FormatBytes(new DriveInfo(root).AvailableFreeSpace)} free"
+                ? $" · {StorageEstimator.FormatBytes(freeSpace!.Value)} free"
                 : string.Empty;
 
             StorageText.Text = $"~{StorageEstimator.FormatBytes(estimate)} replay buffer{freeText}";
-            StorageText.Foreground = !string.IsNullOrWhiteSpace(root) &&
-                                     new DriveInfo(root).AvailableFreeSpace < estimate * 2
+            StorageText.Foreground = freeSpace is { } availableFreeSpace &&
+                                     availableFreeSpace < estimate * 2
                 ? Brush("WarningBrush")
                 : Brush("TextMutedBrush");
         }
@@ -1187,7 +1404,10 @@ public partial class MainWindow : Window
             _settings.ToggleOverlayHotkey = overlayGesture;
             HotkeyText.Text = saveGesture.DisplayText;
             OverlayHotkeyText.Text = overlayGesture.DisplayText;
-            _overlayWindow?.UpdateState(_latestState, _replayBufferService.IsRunning, saveGesture.DisplayText);
+            if (_overlayWindow is { IsVisible: true } overlay)
+            {
+                overlay.UpdateState(_latestState, _replayBufferService.IsRunning, saveGesture.DisplayText);
+            }
             EndHotkeyCapture($"Shortcut set to {gesture.DisplayText}.", isError: false);
             await PersistSettingsAsync();
         }
@@ -1279,7 +1499,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        PausePlayerForBackgroundWork();
+        ReleasePlayerForBackground();
+        CancelActiveLibraryRefreshForBackground();
         CancelSavedToast();
 
         Hide();
@@ -1360,16 +1581,44 @@ public partial class MainWindow : Window
             return;
         }
 
-        const double itemHorizontalMargin = 6;
-        const double minimumCardWidth = 210;
-        const double maximumCardWidth = 360;
         var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
-        var maximumVisibleAtMinimumWidth = Math.Max(
-            1,
-            (int)Math.Floor(availableWidth / (minimumCardWidth + itemHorizontalMargin)));
-        var visibleCards = Math.Min(Math.Min(requestedCount, 4), maximumVisibleAtMinimumWidth);
-        var width = (availableWidth / visibleCards) - itemHorizontalMargin;
-        RecentClipsItemsControl.Tag = Math.Clamp(width, minimumCardWidth, maximumCardWidth);
+        var width = CalculateRecentGalleryCardWidth(
+            availableWidth,
+            requestedCount,
+            RecentClipsItemsControl.Items.Count);
+        if (RecentClipsItemsControl.Tag is not double currentWidth ||
+            Math.Abs(currentWidth - width) >= 0.5)
+        {
+            RecentClipsItemsControl.Tag = width;
+        }
+    }
+
+    internal static double CalculateRecentGalleryCardWidth(
+        double availableWidth,
+        int requestedCount,
+        int actualItemCount)
+    {
+        if (!double.IsFinite(availableWidth) || availableWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(availableWidth));
+        }
+
+        const double itemHorizontalMargin = 6;
+        const double minimumCardWidth = 168;
+        var normalizedCount = AppSettings.NormalizeRecentClipCount(requestedCount);
+        var desiredVisibleSlots = normalizedCount switch
+        {
+            8 => 5,
+            10 => 6,
+            15 => 7,
+            _ => 4
+        };
+        var itemSlots = actualItemCount > 0
+            ? Math.Min(actualItemCount, desiredVisibleSlots)
+            : desiredVisibleSlots;
+        var visibleSlots = Math.Max(1, itemSlots);
+        var fittedWidth = (availableWidth - (itemHorizontalMargin * visibleSlots)) / visibleSlots;
+        return Math.Max(minimumCardWidth, fittedWidth);
     }
 
     private void DispatchToUi(Action action)
@@ -1499,6 +1748,22 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!string.IsNullOrWhiteSpace(preferredPath))
+        {
+            // Keep the newest requested clip until a visible refresh completes.
+            // A deactivation cancellation must not silently fall back to the
+            // previously selected player item on the next activation.
+            _pendingLibraryPreferredPath = preferredPath;
+        }
+
+        if (!IsVisible || !IsActive)
+        {
+            _libraryRefreshPending = true;
+            return;
+        }
+
+        var effectivePreferredPath = _pendingLibraryPreferredPath;
+
         var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
         var refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             _lifetimeCancellation.Token);
@@ -1519,15 +1784,23 @@ public partial class MainWindow : Window
                 includeThumbnails: true,
                 refreshCancellation.Token);
 
+            refreshCancellation.Token.ThrowIfCancellationRequested();
+            if (!IsVisible || !IsActive)
+            {
+                _libraryRefreshPending = true;
+                return;
+            }
+
             RecentClipsItemsControl.ItemsSource = snapshot.Clips;
+            UpdateRecentGalleryCardWidth();
             if (IsVisible && IsActive)
             {
                 UiMotionService.CrossFadeRefresh(RecentClipsItemsControl);
             }
 
-            var selected = preferredPath is { Length: > 0 }
+            var selected = effectivePreferredPath is { Length: > 0 }
                 ? snapshot.Clips.FirstOrDefault(clip =>
-                    clip.FullPath.Equals(preferredPath, StringComparison.OrdinalIgnoreCase))
+                    clip.FullPath.Equals(effectivePreferredPath, StringComparison.OrdinalIgnoreCase))
                 : _currentClip is not null
                     ? snapshot.Clips.FirstOrDefault(clip =>
                         clip.FullPath.Equals(_currentClip.FullPath, StringComparison.OrdinalIgnoreCase))
@@ -1540,11 +1813,22 @@ public partial class MainWindow : Window
             }
             else if (_currentClip is null ||
                      !_currentClip.FullPath.Equals(selected.FullPath, StringComparison.OrdinalIgnoreCase) ||
-                     preferredPath is not null)
+                     effectivePreferredPath is not null ||
+                     _playerSourceReleasedForBackground)
             {
                 // Automatic save refreshes select the new recording without decoding
                 // and playing it over the still-running capture session.
                 SelectClip(selected, autoplay: false);
+            }
+
+            _libraryRefreshPending = false;
+            if (effectivePreferredPath is not null &&
+                string.Equals(
+                    _pendingLibraryPreferredPath,
+                    effectivePreferredPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _pendingLibraryPreferredPath = null;
             }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
@@ -1553,6 +1837,16 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
+            if (IsVisible &&
+                IsActive &&
+                _playerSourceReleasedForBackground &&
+                _currentClip is { } releasedClip)
+            {
+                // A failed foreground refresh must not leave enabled playback
+                // controls pointing at a released MediaElement source.
+                SelectClip(releasedClip, autoplay: false);
+            }
+
             ShowError($"The clip gallery could not be refreshed. {exception.Message}");
         }
         finally
@@ -1585,6 +1879,7 @@ public partial class MainWindow : Window
 
         ClipPlayer.Stop();
         _currentClip = clip;
+        _playerSourceReleasedForBackground = false;
         _playWhenOpened = autoplay;
         SetPlayerPlaying(false);
         ClipPlayer.Source = new Uri(clip.FullPath, UriKind.Absolute);
@@ -1610,6 +1905,7 @@ public partial class MainWindow : Window
         ClipPlayer.Close();
         ClipPlayer.Source = null;
         _currentClip = null;
+        _playerSourceReleasedForBackground = false;
         _playWhenOpened = false;
         SetPlayerPlaying(false);
         LatestClipNameText.Text = "Your newest saved clip will appear here.";
@@ -1926,10 +2222,20 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_pendingLibraryPreferredPath is { } pendingPath)
+        UpdateControlsForState(_latestState);
+        UpdateStorageText();
+
+        var libraryRefreshRequired = _libraryRefreshPending || _pendingLibraryPreferredPath is not null;
+        if (!libraryRefreshRequired &&
+            _playerSourceReleasedForBackground &&
+            _currentClip is { } releasedClip)
         {
-            _pendingLibraryPreferredPath = null;
-            _ = RefreshClipLibraryAsync(pendingPath);
+            SelectClip(releasedClip, autoplay: false);
+        }
+
+        if (libraryRefreshRequired)
+        {
+            _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
         }
 
         if (!_isPlayerPlaying)
@@ -1941,8 +2247,25 @@ public partial class MainWindow : Window
         _playerTimer.Start();
     }
 
-    private void MainWindow_Deactivated(object? sender, EventArgs e) =>
-        PausePlayerForBackgroundWork();
+    private void MainWindow_Deactivated(object? sender, EventArgs e)
+    {
+        ReleasePlayerForBackground();
+        CancelActiveLibraryRefreshForBackground();
+    }
+
+    private void CancelActiveLibraryRefreshForBackground()
+    {
+        lock (_libraryRefreshCancellationGate)
+        {
+            if (_activeLibraryRefreshCancellation is null)
+            {
+                return;
+            }
+
+            _libraryRefreshPending = true;
+            _activeLibraryRefreshCancellation.Cancel();
+        }
+    }
 
     private void PausePlayerForBackgroundWork()
     {
@@ -1958,6 +2281,20 @@ public partial class MainWindow : Window
         }
 
         SetPlayerPlaying(false);
+    }
+
+    private void ReleasePlayerForBackground()
+    {
+        PausePlayerForBackgroundWork();
+        if (_currentClip is null || ClipPlayer.Source is null)
+        {
+            return;
+        }
+
+        ClipPlayer.Stop();
+        ClipPlayer.Close();
+        ClipPlayer.Source = null;
+        _playerSourceReleasedForBackground = true;
     }
 
     private static string FormatDuration(TimeSpan duration) =>

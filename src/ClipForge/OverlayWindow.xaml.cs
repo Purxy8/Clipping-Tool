@@ -2,8 +2,8 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
-using System.Windows.Media.Animation;
 using ClipForge.Models;
+using ClipForge.Services;
 using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
 using Brush = System.Windows.Media.Brush;
 using VisualTreeHelper = System.Windows.Media.VisualTreeHelper;
@@ -16,6 +16,10 @@ public partial class OverlayWindow : Window
     private const int WmMouseActivate = 0x0021;
     private const int MaNoActivate = 3;
     private const long WsExToolWindow = 0x00000080L;
+    private const int DwmwaWindowCornerPreference = 33;
+    private const int DwmwcpRound = 2;
+
+    private HwndSource? _windowSource;
 
     public OverlayWindow()
     {
@@ -63,7 +67,7 @@ public partial class OverlayWindow : Window
         var workArea = SystemParameters.WorkArea;
         Left = Math.Max(workArea.Left + 16, workArea.Right - ActualWidth - 22);
         Top = workArea.Top + 22;
-        ((Storyboard)FindResource("OverlayEnterStoryboard")).Begin(this, true);
+        UiMotionService.RevealStartup(OverlayRoot);
     }
 
     private void OverlayWindow_SourceInitialized(object? sender, EventArgs e)
@@ -77,11 +81,13 @@ public partial class OverlayWindow : Window
             return;
         }
 
-        HwndSource.FromHwnd(handle)?.AddHook(OverlayWindow_WndProc);
+        _windowSource = HwndSource.FromHwnd(handle);
+        _windowSource?.AddHook(OverlayWindow_WndProc);
         var extendedStyle = GetWindowLongPtr(handle, GwlExStyle);
         var desiredStyle = new IntPtr(
             extendedStyle.ToInt64() | WsExToolWindow);
         _ = SetWindowLongPtr(handle, GwlExStyle, desiredStyle);
+        ApplyRoundedCorners(handle);
     }
 
     private IntPtr OverlayWindow_WndProc(
@@ -115,10 +121,37 @@ public partial class OverlayWindow : Window
             catch (InvalidOperationException)
             {
                 // The pointer can be released between the routed event and DragMove.
-                // Ensure a failed drag cannot leave WPF owning mouse capture.
-                Mouse.Capture(null);
+            }
+            finally
+            {
+                // DragMove normally releases capture itself. Explicitly clear any
+                // remaining WPF capture so an interrupted drag cannot affect a game.
+                if (Mouse.Captured is not null)
+                {
+                    Mouse.Capture(null);
+                }
             }
         }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        if (_windowSource is not null)
+        {
+            try
+            {
+                _windowSource.RemoveHook(OverlayWindow_WndProc);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Destroying the HWND also releases its message hooks.
+            }
+
+            _windowSource = null;
+        }
+
+        SourceInitialized -= OverlayWindow_SourceInitialized;
+        base.OnClosed(e);
     }
 
     private void SaveButton_Click(object sender, RoutedEventArgs e) =>
@@ -147,9 +180,42 @@ public partial class OverlayWindow : Window
             ? $"{(int)duration.TotalHours}:{duration.Minutes:00}:{duration.Seconds:00}"
             : $"{(int)duration.TotalMinutes}:{duration.Seconds:00}";
 
+    private static void ApplyRoundedCorners(IntPtr windowHandle)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            return;
+        }
+
+        try
+        {
+            var preference = DwmwcpRound;
+            _ = DwmSetWindowAttribute(
+                windowHandle,
+                DwmwaWindowCornerPreference,
+                ref preference,
+                sizeof(int));
+        }
+        catch (DllNotFoundException)
+        {
+            // Retain a normal rectangular window when DWM is unavailable.
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // Retain a normal rectangular window on unsupported Windows builds.
+        }
+    }
+
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
     private static extern IntPtr GetWindowLongPtr(IntPtr windowHandle, int index);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     private static extern IntPtr SetWindowLongPtr(IntPtr windowHandle, int index, IntPtr newValue);
+
+    [DllImport("dwmapi.dll", ExactSpelling = true, PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(
+        IntPtr windowHandle,
+        int attribute,
+        ref int attributeValue,
+        int attributeSize);
 }

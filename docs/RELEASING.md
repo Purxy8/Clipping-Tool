@@ -152,6 +152,20 @@ Get-FileHash $installer -Algorithm SHA256
 Get-Content .\artifacts\Releases\SHA256SUMS.txt
 ```
 
+On the Windows capture test PC, validate the fixed-resolution and Source paths with the same engine and audio configuration intended for release:
+
+```powershell
+$smokeProject = '.\tests\ClipForge.CaptureSmoke\ClipForge.CaptureSmoke.csproj'
+$smokeRoot = '.\artifacts\capture-release-smoke'
+dotnet build $smokeProject -c Release --no-restore
+dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --artifacts $smokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --resolution 1080p --fps 60 --audio --microphone --artifacts $smokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --resolution source --fps 60 --audio --microphone --artifacts $smokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --force-gdi --artifacts $smokeRoot
+```
+
+The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A successful fallback run on one PC still does not replace validation on the affected or equivalent fallback/hybrid hardware before claiming that hardware-specific lag is resolved.
+
 For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the publisher should match the intended ClipForge publisher identity. Also verify on a clean Windows user account or VM:
 
 1. The installer starts without an unexpected publisher warning.

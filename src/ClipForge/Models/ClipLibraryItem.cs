@@ -14,6 +14,27 @@ public sealed record ClipLibraryItem(
     public DateTimeOffset RecordedAtLocal => RecordedAtUtc.ToLocalTime();
 
     /// <summary>
+    /// Compact binary-megabyte size suitable for the recent-clips gallery.
+    /// The stored byte count is used directly, so binding this property never
+    /// performs extra file-system work on the UI thread.
+    /// </summary>
+    public string FileSizeDisplay => FormatFileSize(FileSizeBytes);
+
+    internal static string FormatFileSize(long fileSizeBytes)
+    {
+        if (fileSizeBytes <= 0)
+        {
+            return "0 MB";
+        }
+
+        const double bytesPerMegabyte = 1024d * 1024d;
+        var megabytes = fileSizeBytes / bytesPerMegabyte;
+        return megabytes < 1
+            ? "<1 MB"
+            : FormattableString.Invariant($"{megabytes:0.0} MB");
+    }
+
+    /// <summary>
     /// Stable Windows identity captured while the item is discovered. It is kept
     /// internal because it is security metadata, not presentation state.
     /// </summary>

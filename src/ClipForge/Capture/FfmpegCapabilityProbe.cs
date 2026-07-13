@@ -95,6 +95,7 @@ internal sealed class FfmpegCapabilityProbe
         CancellationToken cancellationToken)
     {
         var diagnostics = new List<string>();
+        VideoEncodingStrategy? firstHardwareGdiFallback = null;
         var targetWidth = configuration.Resolution.Width ?? configuration.Display.Width;
         var targetHeight = configuration.Resolution.Height ?? configuration.Display.Height;
 
@@ -116,6 +117,12 @@ internal sealed class FfmpegCapabilityProbe
                 diagnostics.Add($"{gdiStrategy.EncoderName}: {Summarize(encoderProbe.Diagnostic)}");
                 continue;
             }
+
+            // A working encoder does not imply that its preferred graphics
+            // device can consume frames from the selected monitor. Retain the
+            // first verified GDI fallback, but try every available hardware
+            // encoder's WGC paths before accepting the CPU capture path.
+            firstHardwareGdiFallback ??= gdiStrategy;
 
             var graphicsStrategy = gdiStrategy with
             {
@@ -162,8 +169,15 @@ internal sealed class FfmpegCapabilityProbe
 
             diagnostics.Add(
                 $"Windows Graphics Capture compatibility transfer unavailable: {Summarize(transferProbe.Diagnostic)}");
-            diagnostics.Add($"Selected {gdiStrategy.Description} after runtime verification.");
-            return new FfmpegCapabilitySelection(gdiStrategy, string.Join(' ', diagnostics));
+        }
+
+        if (firstHardwareGdiFallback is not null)
+        {
+            diagnostics.Add(
+                $"Selected {firstHardwareGdiFallback.Description} after testing all hardware graphics-capture paths.");
+            return new FfmpegCapabilitySelection(
+                firstHardwareGdiFallback,
+                string.Join(' ', diagnostics));
         }
 
         var softwareGraphics = new VideoEncodingStrategy(

@@ -102,22 +102,47 @@ internal sealed class ClipSavedSoundService : IDisposable
     }
 
     /// <summary>
-    /// Produces a deterministic 200 ms, 48 kHz mono PCM16 WAV. Keeping this pure
+    /// Produces a deterministic 210 ms, 48 kHz mono PCM16 WAV. Keeping this pure
     /// makes the generated asset straightforward to validate without audio hardware.
     /// </summary>
     internal static byte[] CreateChimeWave()
     {
         const int sampleRate = 48_000;
-        const double durationSeconds = 0.2;
+        const double durationSeconds = 0.21;
         const short channelCount = 1;
         const short bitsPerSample = 16;
-        const double peakAmplitude = 0.12;
-        const double attackSeconds = 0.012;
-        const double releaseSeconds = 0.055;
+        const double targetPeakAmplitude = 0.27;
+        const double attackSeconds = 0.006;
+        const double releaseSeconds = 0.07;
 
         var sampleCount = checked((int)Math.Round(sampleRate * durationSeconds));
         var bytesPerSample = bitsPerSample / 8;
         var dataLength = checked(sampleCount * channelCount * bytesPerSample);
+
+        var samples = new double[sampleCount];
+        var unscaledPeak = 0d;
+        for (var sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+        {
+            var time = sampleIndex / (double)sampleRate;
+            var remaining = durationSeconds - time;
+            var fadeIn = Math.Min(1, time / attackSeconds);
+            var fadeOut = Math.Clamp(remaining / releaseSeconds, 0, 1);
+            var decay = Math.Exp(-3.5 * time / durationSeconds);
+            var envelope = fadeIn * fadeOut * decay;
+
+            // A single warm, lower-pitched UI pop. The octave reinforcement adds
+            // body on small speakers without the high two-note glide that made the
+            // previous confirmation resemble a bird call.
+            var fundamental = Math.Sin(2 * Math.PI * 390 * time);
+            var lowerOctave = Math.Sin((2 * Math.PI * 195 * time) + 0.32);
+            var sample = ((0.84 * fundamental) + (0.16 * lowerOctave)) * envelope;
+            samples[sampleIndex] = sample;
+            unscaledPeak = Math.Max(unscaledPeak, Math.Abs(sample));
+        }
+
+        var amplitudeScale = unscaledPeak > 0
+            ? targetPeakAmplitude / unscaledPeak
+            : 0;
 
         using var stream = new MemoryStream(capacity: 44 + dataLength);
         using var writer = new BinaryWriter(stream, Encoding.ASCII, leaveOpen: true);
@@ -136,22 +161,9 @@ internal sealed class ClipSavedSoundService : IDisposable
         writer.Write(Encoding.ASCII.GetBytes("data"));
         writer.Write(dataLength);
 
-        for (var sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+        for (var sampleIndex = 0; sampleIndex < samples.Length; sampleIndex++)
         {
-            var time = sampleIndex / (double)sampleRate;
-            var remaining = durationSeconds - time;
-            var fadeIn = Math.Min(1, time / attackSeconds);
-            var fadeOut = Math.Clamp(remaining / releaseSeconds, 0, 1);
-            var decay = Math.Exp(-2.8 * time / durationSeconds);
-            var envelope = fadeIn * fadeOut * decay;
-
-            // Two soft partials with a slight downward glide form a short,
-            // unobtrusive confirmation sound without using an external asset.
-            var glide = -110.0 / durationSeconds;
-            var primaryPhase = 2 * Math.PI * (760 * time + 0.5 * glide * time * time);
-            var harmonicPhase = 2 * Math.PI * (1_140 * time + 0.5 * glide * 1.25 * time * time);
-            var signal = 0.76 * Math.Sin(primaryPhase) + 0.24 * Math.Sin(harmonicPhase + 0.18);
-            var normalized = Math.Clamp(signal * envelope * peakAmplitude, -1, 1);
+            var normalized = Math.Clamp(samples[sampleIndex] * amplitudeScale, -1, 1);
             writer.Write((short)Math.Round(normalized * short.MaxValue));
         }
 

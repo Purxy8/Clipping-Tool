@@ -4,6 +4,35 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.5.0-beta.1] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- Appearance controls now customize the app background, accent/buttons, or panels/controls from one compact target selector, with safe dark presets, custom colors, readable derived states, and a per-target reset.
+- Recent clip cards display their file size and use the available gallery width before switching larger 8/10/15-item sets to horizontal scrolling.
+
+### Changed
+
+- The saved-clip confirmation is now a clearer, short low-pitched pop instead of the previous quiet high-pitched chime.
+- The startup reveal remains brief and respects Windows reduced-motion, High Contrast, and rendering-capability preferences.
+- The replay overlay uses an opaque no-activate window without a layered transparent surface or WPF drop shadow, reducing compositor work over fullscreen and borderless games.
+
+### Performance
+
+- Capture selection now tests direct and compatibility-transfer Windows Graphics Capture across every verified hardware encoder before accepting a hardware-plus-GDI fallback. This avoids prematurely selecting a slower scaled GDI path on some hybrid-GPU systems.
+- Fixed-resolution GDI fallback scaling, including 720p, uses FFmpeg's lower-cost `fast_bilinear` scaler; Source/native capture remains unscaled.
+- Hidden and tray operation no longer performs full main-window control, executable, storage, player, or gallery work on every engine-state tick. Gallery helper work is cancelled while inactive and the embedded player releases its media source while hidden.
+
+### Verification note
+
+- Release capture smoke runs at 720p, 1080p, and Source on the development PC all used direct Windows Graphics Capture plus NVIDIA NVENC, produced 355 frames over 6.015 seconds with the same 59.226 average FPS, and reported 0.0-0.2% normalized FFmpeg CPU. Separate forced 720p NVIDIA NVENC plus GDI fallback runs also produced 355 frames at 59.226 FPS, one mixed-audio stream, `BelowNormal` priority, 1.3% normalized CPU, and 217-226 MB working sets. These measurements validate the tested PC and do not guarantee zero game latency on every GPU, driver, or fullscreen mode.
+- The Release build completes with zero warnings and the deterministic suite passes 30/30 tests, including 720p filter selection, hybrid-GPU capture ordering, theme color safety, adaptive gallery sizing, file-size formatting, and confirmation-wave validation.
+
 ## [1.4.0-beta.1] - 2026-07-13
 
 ### Release status

@@ -13,11 +13,10 @@
         WindowStartupLocation="CenterScreen"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
-        Background="{DynamicResource UserBackgroundBrush}"
+        Background="{DynamicResource WindowBrush}"
         TextOptions.TextFormattingMode="Display">
 
     <Window.Resources>
-        <SolidColorBrush x:Key="UserBackgroundBrush" Color="#0B0D12" />
         <local:ThumbnailPathConverter x:Key="ThumbnailPathConverter" />
 
         <Style x:Key="AnimatedQuietButtonStyle" TargetType="{x:Type Button}"
@@ -26,7 +25,7 @@
         <Style x:Key="AnimatedPrimaryButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource PrimaryButtonStyle}" />
 
-        <Style x:Key="BackgroundSwatchButtonStyle" TargetType="{x:Type Button}"
+        <Style x:Key="AppearanceSwatchButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
             <Setter Property="Width" Value="34" />
             <Setter Property="Height" Value="34" />
@@ -34,7 +33,7 @@
             <Setter Property="Padding" Value="0" />
             <Setter Property="Margin" Value="0,0,7,0" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
-            <Setter Property="AutomationProperties.HelpText" Value="Apply this app background color" />
+            <Setter Property="AutomationProperties.HelpText" Value="Apply this appearance color" />
         </Style>
 
         <Style x:Key="TransportSliderStyle" TargetType="{x:Type Slider}">
@@ -143,7 +142,7 @@
         </Style>
     </Window.Resources>
 
-    <Grid x:Name="RootLayout" Background="{DynamicResource UserBackgroundBrush}">
+    <Grid x:Name="RootLayout" Background="{DynamicResource WindowBrush}">
 
         <Grid.RowDefinitions>
             <RowDefinition Height="76" />
@@ -289,7 +288,7 @@
                                     <TextBlock Margin="0,12,0,6" Style="{StaticResource FieldLabelStyle}" Text="RESOLUTION" />
                                     <ComboBox x:Name="ResolutionComboBox" SelectionChanged="ResolutionComboBox_SelectionChanged" />
 
-                                    <Border Margin="0,12,0,0" Padding="10,8" Background="#5B0B0D12" CornerRadius="8">
+                                    <Border Margin="0,12,0,0" Padding="10,8" Background="{StaticResource SurfaceTranslucentBrush}" CornerRadius="8">
                                         <StackPanel>
                                             <TextBlock x:Name="EncoderStatusText" FontSize="12" FontWeight="SemiBold"
                                                        Foreground="{StaticResource SuccessBrush}" Text="Performance mode: Auto" />
@@ -365,33 +364,29 @@
                                         <TextBlock Style="{StaticResource EyebrowStyle}" Text="APPEARANCE" />
                                         <Border Grid.Column="1" Padding="7,3" Background="{StaticResource AccentSoftBrush}"
                                                 CornerRadius="6">
-                                            <TextBlock x:Name="BackgroundColorValueText" FontFamily="Consolas" FontSize="10"
+                                            <TextBlock x:Name="AppearanceColorValueText" FontFamily="Consolas" FontSize="10"
                                                        Foreground="{StaticResource AccentHoverBrush}" Text="#0B0D12" />
                                         </Border>
                                     </Grid>
-                                    <TextBlock Margin="0,8,0,8" Style="{StaticResource MutedTextStyle}"
-                                               Text="Choose a calm app background. Custom colors are darkened when needed so text stays readable." />
-                                    <StackPanel x:Name="BackgroundSwatchesPanel" Orientation="Horizontal">
-                                        <Button Tag="#0B0D12" Background="#0B0D12" ToolTip="Midnight"
-                                                AutomationProperties.Name="Midnight background"
-                                                Click="BackgroundSwatchButton_Click"
-                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
-                                        <Button Tag="#0D1422" Background="#0D1422" ToolTip="Deep navy"
-                                                AutomationProperties.Name="Deep navy background"
-                                                Click="BackgroundSwatchButton_Click"
-                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
-                                        <Button Tag="#161321" Background="#161321" ToolTip="Soft plum"
-                                                AutomationProperties.Name="Soft plum background"
-                                                Click="BackgroundSwatchButton_Click"
-                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
-                                        <Button Tag="#0D1A19" Background="#0D1A19" ToolTip="Deep forest"
-                                                AutomationProperties.Name="Deep forest background"
-                                                Click="BackgroundSwatchButton_Click"
-                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
-                                        <Button Tag="#17191F" Background="#17191F" ToolTip="Graphite"
-                                                AutomationProperties.Name="Graphite background"
-                                                Click="BackgroundSwatchButton_Click"
-                                                Style="{StaticResource BackgroundSwatchButtonStyle}" />
+                                    <TextBlock Margin="0,8,0,5" Style="{StaticResource FieldLabelStyle}"
+                                               Text="COLOR TARGET" />
+                                    <ComboBox x:Name="AppearanceTargetComboBox"
+                                              SelectionChanged="AppearanceTargetComboBox_SelectionChanged"
+                                              AutomationProperties.Name="Appearance color target" />
+                                    <TextBlock x:Name="AppearanceHintText" Margin="0,8,0,8"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Text="Choose which part of ClipForge you want to recolor." />
+                                    <StackPanel x:Name="AppearanceSwatchesPanel" Orientation="Horizontal">
+                                        <Button Background="#0B0D12" Click="AppearanceSwatchButton_Click"
+                                                Style="{StaticResource AppearanceSwatchButtonStyle}" />
+                                        <Button Background="#0D1422" Click="AppearanceSwatchButton_Click"
+                                                Style="{StaticResource AppearanceSwatchButtonStyle}" />
+                                        <Button Background="#161321" Click="AppearanceSwatchButton_Click"
+                                                Style="{StaticResource AppearanceSwatchButtonStyle}" />
+                                        <Button Background="#0D1A19" Click="AppearanceSwatchButton_Click"
+                                                Style="{StaticResource AppearanceSwatchButtonStyle}" />
+                                        <Button Background="#17191F" Click="AppearanceSwatchButton_Click"
+                                                Style="{StaticResource AppearanceSwatchButtonStyle}" />
                                     </StackPanel>
                                     <Grid Margin="0,9,0,0">
                                         <Grid.ColumnDefinitions>
@@ -399,12 +394,12 @@
                                             <ColumnDefinition Width="8" />
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
-                                        <Button Grid.Column="0" Content="Custom color" Click="CustomBackgroundButton_Click"
+                                        <Button Grid.Column="0" Content="Custom color" Click="CustomAppearanceColorButton_Click"
                                                 Style="{StaticResource SecondaryButtonStyle}"
-                                                AutomationProperties.Name="Choose a custom background color" />
-                                        <Button Grid.Column="2" Content="Reset" Click="ResetBackgroundButton_Click"
+                                                AutomationProperties.Name="Choose a custom appearance color" />
+                                        <Button Grid.Column="2" Content="Reset" Click="ResetAppearanceColorButton_Click"
                                                 Style="{StaticResource QuietButtonStyle}"
-                                                AutomationProperties.Name="Reset app background color" />
+                                                AutomationProperties.Name="Reset selected appearance color" />
                                     </Grid>
                                 </StackPanel>
                             </Border>
@@ -418,7 +413,7 @@
                                               Click="ClipSavedSoundCheckBox_Click"
                                               Style="{StaticResource ToggleCheckBoxStyle}" />
                                     <TextBlock Margin="0,7,0,0" Style="{StaticResource MutedTextStyle}"
-                                               Text="A short, quiet confirmation plays only after the MP4 is safely saved."
+                                               Text="A clear, low-key confirmation plays only after the MP4 is safely saved."
                                                TextWrapping="Wrap" />
                                 </StackPanel>
                             </Border>
@@ -674,7 +669,7 @@
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
                                     <Button Width="{Binding RelativeSource={RelativeSource AncestorType={x:Type ItemsControl}}, Path=Tag}"
-                                            Height="112" Margin="3" Padding="0" Tag="{Binding}"
+                                            Height="118" Margin="3" Padding="0" Tag="{Binding}"
                                             Click="RecentClipButton_Click"
                                             Style="{StaticResource GalleryCardButtonStyle}" ToolTip="{Binding FullPath}">
                                         <Button.ContextMenu>
@@ -701,8 +696,17 @@
                                                 <StackPanel>
                                                     <TextBlock FontSize="12" FontWeight="SemiBold" Text="{Binding FileName}"
                                                                TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
-                                                    <TextBlock Margin="0,2,0,0" FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"
-                                                               Text="{Binding RecordedAtLocal, StringFormat={}{0:dd MMM · HH:mm}}" />
+                                                    <Grid Margin="0,2,0,0">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"
+                                                                   Text="{Binding RecordedAtLocal, StringFormat={}{0:dd MMM · HH:mm}}" />
+                                                        <TextBlock Grid.Column="1" Margin="8,0,0,0" FontSize="10"
+                                                                   FontWeight="SemiBold" Foreground="{StaticResource TextSecondaryBrush}"
+                                                                   Text="{Binding FileSizeDisplay}" />
+                                                    </Grid>
                                                 </StackPanel>
                                             </Border>
                                             <Border Width="30" Height="30" HorizontalAlignment="Center" VerticalAlignment="Center"
@@ -722,7 +726,7 @@
                 <!-- Compatibility/latest saved state used by code and accessibility -->
                 <Border x:Name="LastSavedPanel" Grid.Row="2" Panel.ZIndex="10"
                         Margin="18,72,18,64" Padding="10"
-                        VerticalAlignment="Top" HorizontalAlignment="Right" Background="#D9181C26"
+                        VerticalAlignment="Top" HorizontalAlignment="Right" Background="{StaticResource SurfaceTranslucentBrush}"
                         BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="9"
                         Visibility="Collapsed" AutomationProperties.LiveSetting="Polite">
                     <StackPanel Orientation="Horizontal">
