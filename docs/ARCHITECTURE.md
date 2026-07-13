@@ -12,21 +12,21 @@ ClipForge is a Windows-only WPF application targeting `.NET 10` and `win-x64`. T
 - Make missing FFmpeg a recoverable first-run setup step rather than a startup failure.
 - Prefer a runtime-verified hardware encoder and low-overhead capture source while retaining safe compatibility fallbacks.
 - Let the main window hide to the notification area while replay and global shortcuts remain available.
-- Keep player and appearance work out of the capture-critical path, and avoid periodic whole-buffer scans.
+- Keep player, trim-export, and appearance work out of the capture-critical path, and avoid periodic whole-buffer scans.
 
-ClipForge does not attempt a game-process hook, HDR pipeline, editor, or upload service.
+ClipForge does not attempt a game-process hook, HDR pipeline, multi-track/effects editor, or upload service. Its editing boundary is a frame-accurate start/end trim in the local Library.
 
 ## Component map
 
 | Area | Main types | Responsibility |
 | --- | --- | --- |
-| WPF shell | `MainWindow`, `LibraryWindow`, `OverlayWindow`, `App`, `Themes/Styles.xaml`, `NativeWindowThemeService`, `UiMotionService`, `ClipSavedSoundService` | Present the settings sidebar, replay controls, complete latest/full-library transport, recent gallery, virtualized Library, compact overlay, native dark captions, bounded accessible motion, optional save feedback, and non-blocking error states. |
+| WPF shell | `MainWindow`, `LibraryWindow`, `OverlayWindow`, `App`, `Themes/Styles.xaml`, `NativeWindowThemeService`, `UiMotionService`, `ClipSavedSoundService` | Present the settings sidebar, replay controls, complete latest/full-library transport, dual-handle Library trim editor, All/Normal/Trimmed filtering, recent gallery, virtualized Library, compact overlay, native dark captions, bounded accessible motion, optional save feedback, and non-blocking error states. |
 | Models | `AppSettings`, `CaptureConfiguration`, `HotkeyGesture`, `ClipLibraryItem`, option records, `ReplayStateSnapshot` | Separate serializable preferences and library views from the validated, immutable configuration used by a running capture. |
 | Device discovery | `DeviceDiscoveryService` | Enumerate Windows displays and active render/capture audio endpoints. Displays come from WinForms `Screen`; audio endpoints come from NAudio/Core Audio. |
 | Replay engine | `ReplayBufferService` and capture helpers under `Capture/` | Probe capture/encoder capabilities, own the tuned FFmpeg process, WASAPI audio producers, temporary segment set, retention policy, save snapshots, cancellation, and lifecycle state. |
 | FFmpeg command construction | `FfmpegArgumentBuilder` | Build argument lists without shell interpolation for both continuous segment capture and MP4 creation. |
 | FFmpeg provisioning | `FfmpegSetupService` | Resolve an existing FFmpeg installation or download a private copy on request. |
-| Clip library | `ClipLibraryService`, `ClipMediaProcessRunner`, `ThumbnailPathConverter` | Discover top-level ClipForge-named MP4 files, validate local MOV/MP4 media, coalesce/cache identity-bound metadata probes, create/reuse bounded thumbnail decodes, and supply the latest clip, selected 4/8/10/15-item gallery, and up-to-100-item Library. |
+| Clip library and trim export | `ClipLibraryService`, the trim-export service, `ClipMediaProcessRunner`, `ThumbnailPathConverter` | Discover and classify top-level ClipForge-generated normal/trimmed MP4 files, validate local MOV/MP4 media, coalesce/cache identity-bound metadata probes, create/reuse bounded thumbnail decodes, supply the latest clip, selected 4/8/10/15-item gallery, and up-to-100-item Library, and transactionally create a separate validated trim. |
 | Application updates | `AppUpdateService`, `ReleaseInfo`, Velopack | Check the configured release feed, download an update without interrupting capture, then explicitly apply it after the window shuts down cleanly. |
 | Settings | `SettingsService` | Load JSON with safe defaults and atomically replace the settings file after changes. |
 | Shortcuts | `GlobalHotkeyService`, `HotkeyGesture` | Atomically register configurable Save Clip and Toggle Overlay combinations through the Win32 hotkey API and preserve working bindings on conflicts. |
@@ -55,6 +55,9 @@ flowchart LR
     KEEP --> SAVE
     SAVE --> MP4["FFmpeg stream-copy/trim to MP4"]
     MP4 --> LIB["Validated latest clip + recent gallery + Library"]
+    LIB --> EDIT["Dual-handle frame-accurate trim (replay stopped)"]
+    EDIT --> TRIM["Validated separate trimmed MP4"]
+    TRIM --> LIB
 ```
 
 ### Starting replay
@@ -95,11 +98,19 @@ Stream copy avoids a second video encode. The two-second keyframe/segment cadenc
 
 ### Clip library and playback
 
-After startup, a save, or a save-folder change, `ClipLibraryService` enumerates top-level files in the selected clips directory and sorts eligible candidates newest first. Eligibility requires ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` filename format as well as existing path, file-identity, reparse-point, and traversal checks. FFprobe is forced to the MOV/MP4 demuxer with a `file`-only protocol whitelist before a candidate is surfaced as playable media. This intentionally excludes unrelated or renamed MP4 files from automatic decoding; users can still open those files outside the gallery.
+After startup, a save, a trim, or a save-folder change, `ClipLibraryService` enumerates top-level files in the selected clips directory and sorts eligible candidates newest first. Eligibility requires either ClipForge's generated normal `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` form or its distinct trimmed `Clip_YYYY-MM-DD_HH-mm-ss[_N]_trimmed[_N].mp4` form, as well as existing path, file-identity, reparse-point, and traversal checks. FFprobe is forced to the MOV/MP4 demuxer with a `file`-only protocol whitelist before a candidate is surfaced as playable media. This intentionally excludes unrelated or renamed MP4 files from automatic decoding; users can still open those files outside the gallery.
 
 Thumbnail generation runs asynchronously through FFmpeg with the same local-file/MOV constraints, bounded output capture, cancellation, timeouts, one decode thread, and low-impact process priority. Cached thumbnails use a SHA-256 name bound to the clip path, metadata, Windows volume serial, and 128-bit file ID. A validated, non-writable/non-deletable clip handle and a pinned save-root handle remain open while FFmpeg reads by path and until the cache entry is committed, preventing a same-path file swap during decoding without copying the complete video. Atomic replacement prevents a crash from leaving a trusted partial entry, while cleanup pins and validates the cache-directory and thumbnail handles before deletion; loaded clips also prune their legacy v1.2 cache key. Frozen decoded JPEGs can be reused through weak references, so a rebind avoids redundant decoding without keeping image memory or files alive. The library is a local view over existing files; it does not copy or upload clips.
 
-The large `MediaElement` surfaces provide play/pause, restart, clickable/draggable and keyboard seeking, elapsed/total time, 10-second backward/forward skips, mute, and volume. Playback is independent of replay capture. The recent gallery loads only the persisted 4/8/10/15-item limit, derives card width from both the requested limit and the number of clips actually found so a short row fills its viewport, displays the already-enumerated file size, and scrolls larger sets horizontally. **Library** loads up to the newest 100 validated clips into a recycling `VirtualizingStackPanel`; only the selected item is connected to a decoder. Because WPF manual media graphs do not always open from `Source` assignment alone, Library starts a muted prime and pauses in `MediaOpened` unless autoplay was requested. Hiding, deactivating, or closing either player clears its source and timer, and activation restores a remembered position without autoplay. Newer refresh requests cancel superseded probe/thumbnail work. Thumbnail JPEGs use `BitmapCacheOption.OnLoad` and frozen in-memory images, allowing deterministic cache files to be removed immediately. Right-click reveal and deletion revalidate ClipForge ownership and stable Windows volume/file identity; deletion rejects multi-link files, closes the selected media source, and uses a validated Windows handle. `UiMotionService` limits optional motion to short opacity/translation transitions, disables it for High Contrast, reduced-motion, or software-rendering conditions, and removes completed animation clocks.
+The large `MediaElement` surfaces provide play/pause, restart, clickable/draggable and keyboard seeking, elapsed/total time, 10-second backward/forward skips, mute, and volume. Playback is independent of replay capture. The recent gallery loads only the persisted 4/8/10/15-item limit, derives card width from both the requested limit and the number of clips actually found so a short row fills its viewport, displays the already-enumerated file size, and scrolls larger sets horizontally. **Library** loads up to the newest 100 validated clips into a recycling `VirtualizingStackPanel`; its All/Normal/Trimmed filter is applied to the classified candidates, and only the selected item is connected to a decoder. Because WPF manual media graphs do not always open from `Source` assignment alone, Library starts a muted prime and pauses in `MediaOpened` unless autoplay was requested. Hiding, deactivating, or closing either player clears its source and timer, and activation restores a remembered position without autoplay. Newer refresh requests cancel superseded probe/thumbnail work. Thumbnail JPEGs use `BitmapCacheOption.OnLoad` and frozen in-memory images, allowing deterministic cache files to be removed immediately. Right-click reveal and deletion revalidate ClipForge ownership and stable Windows volume/file identity; deletion rejects multi-link files, closes the selected media source, and uses a validated Windows handle. `UiMotionService` limits optional motion to short opacity/translation transitions, disables it for High Contrast, reduced-motion, or software-rendering conditions, and removes completed animation clocks.
+
+### Trimming a Library clip
+
+The Library exposes a two-handle range over the selected clip's timeline. Moving the start or end handle updates the local preview, and export re-encodes only that selected interval so the committed boundaries are frame-accurate rather than limited to the nearest H.264 keyframe. Trimming is available only while Instant Replay is stopped. The UI disables trim export while capture is starting, buffering, ready, saving, fault-recovering, or stopping so the trim encoder cannot compete with the capture-critical FFmpeg process.
+
+Before export, the selected clip and save root are revalidated and held through pinned Windows handles. The local FFmpeg child receives a fully resolved trusted executable path, individual argument-list entries, a forced MOV/MP4 input demuxer, and a `file`-only protocol whitelist; it runs without a command shell at below-normal priority. A uniquely named partial is written in the destination directory, remains outside Library discovery, and is removed on cancellation or failure. ClipForge probes the completed partial and revalidates the pinned source/root before atomically committing it under a non-overwriting trimmed name. The original is never modified in place.
+
+After the commit succeeds, the Library refreshes and selects the new trimmed clip. The default result is to keep both files. If the user explicitly accepts the follow-up deletion prompt, ClipForge revalidates the original's stable Windows identity and guarded deletion policy again; a changed, replaced, unsafe, or multi-link original is preserved instead of deleting a path that merely has the same name. Cancellation, FFmpeg failure, validation failure, or commit failure never triggers original deletion.
 
 `NativeWindowThemeService` colors only the native non-client caption through supported DWM attributes, retaining Windows-managed minimize/maximize/close buttons, Snap Layouts, keyboard menus, DPI behavior, and accessibility. High Contrast resets these attributes to system defaults. `AppearanceThemePalette` validates the persisted background, accent, and surface choices, derives hover/pressed/border/gradient colors, constrains dark surfaces, and chooses black or white primary-button text for contrast. `ClipSavedSoundService` generates a short low-pitched PCM confirmation in memory, preloads it asynchronously, fails silently if an output device is unavailable, and plays only after `SaveClipAsync` returns a successful MP4 path. Its setting, toast, and sound do not share audio objects or timers with the replay capture pipeline.
 
@@ -125,7 +136,7 @@ Unexpected device removal, a full disk, FFmpeg exit, or pipe failure transitions
 | --- | --- |
 | Settings | `%LOCALAPPDATA%\ClipForge\settings.json` |
 | FFmpeg tools | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
-| Saved clips | `%USERPROFILE%\Videos\ClipForge` |
+| Saved normal clips, trimmed clips, and in-progress trim partials | `%USERPROFILE%\Videos\ClipForge` |
 | Capture segments and concat manifests | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture directory managed by the replay engine |
 
 `FfmpegSetupService` resolves and checksum-verifies the pinned `ffmpeg.exe`/`ffprobe.exe` pair in this order:
@@ -156,13 +167,13 @@ The current beta remains unsigned and the installed client does not pin a ClipFo
 
 ClipForge runs as the signed-in user with `asInvoker` and does not request elevation. Startup calls the restricted Windows DLL directory policy before native capture or updater components load; assembly-level DllImport policy limits native resolution to the application directory, Windows system directory, and explicitly added user directories.
 
-FFmpeg and FFprobe are launched by fully resolved executable path with `UseShellExecute=false`, no command shell, and individual argument-list entries. Normal builds accept only the pinned private/bundled executable hashes. Media probe/thumbnail processes accept only ClipForge-named top-level candidates, revalidate file identity immediately before embedded playback, force MOV/MP4 demuxing with the local `file` protocol, cap process count and total helper time, bound diagnostic output, honor cancellation, and terminate their child process on timeout. WASAPI named pipes are restricted to the current user. Replay roots are separated by Windows logon-session ID; cleanup rejects a root when it or an existing ancestor is a reparse point, accepts only a regular direct `session-*` child, and purges abandoned sessions in the current logon scope after single-instance ownership is established on the next launch. User-facing Open actions accept only fully qualified existing local paths. The optional FFmpeg installer uses bounded download/extraction, a pinned HTTPS archive digest, and pinned hashes for both extracted executables.
+FFmpeg and FFprobe are launched by fully resolved executable path with `UseShellExecute=false`, no command shell, and individual argument-list entries. Normal builds accept only the pinned private/bundled executable hashes. Media probe, thumbnail, and trim processes accept only ClipForge-generated top-level candidates, revalidate file identity immediately before use, force MOV/MP4 demuxing with the local `file` protocol, cap helper runtime and diagnostic output, honor cancellation, and terminate their child process on timeout. Trim export additionally pins the source and destination root, writes an undiscoverable unique partial, validates it before an atomic non-overwriting commit, and revalidates the original before any optional deletion. WASAPI named pipes are restricted to the current user. Replay roots are separated by Windows logon-session ID; cleanup rejects a root when it or an existing ancestor is a reparse point, accepts only a regular direct `session-*` child, and purges abandoned sessions in the current logon scope after single-instance ownership is established on the next launch. User-facing Open actions accept only fully qualified existing local paths. The optional FFmpeg installer uses bounded download/extraction, a pinned HTTPS archive digest, and pinned hashes for both extracted executables.
 
 These controls reduce DLL preloading, command injection, path traversal, resource-exhaustion, and update-feed mistakes. They do not protect recordings from malware already running as the same user, an administrator, a kernel driver, or a compromised Windows installation. Authenticode establishes publisher identity and file integrity; it is not a substitute for secure implementation and operating-system hygiene.
 
 ## Privacy boundary
 
-No media path leads to a ClipForge server: the application has no account, analytics, telemetry, cloud, or upload component. Screen and audio data stay within the WPF process, its NAudio capture instances, local named pipes, the local FFmpeg child process, temporary disk segments, and the user-selected output folder.
+No media path leads to a ClipForge server: the application has no account, analytics, telemetry, cloud, or upload component. Screen and audio data, normal clips, trim selections, trim partials, and trimmed outputs stay within the WPF process, its NAudio capture instances, local named pipes, local FFmpeg child processes, temporary disk storage, and the user-selected output folder.
 
 App-initiated network requests are limited to the user-triggered FFmpeg install and, in a release build with an update source, release-feed checks and update-package downloads. These requests do not contain captured media. A save folder controlled by another synchronization product is outside this boundary and may be uploaded by that product.
 
@@ -176,7 +187,7 @@ audio_bps = 192,000 when any audio is enabled, otherwise 0
 bytes     = (video_bps + audio_bps) * seconds / 8
 ```
 
-This is capacity guidance, not a quota. CRF encoding varies with content, and the user needs extra space while a saved MP4 coexists with the rolling segments. Segment pruning must be based on completed media only; deleting the segment FFmpeg is still writing can corrupt the session.
+This is capacity guidance, not a quota. CRF encoding varies with content, and the user needs extra space while a saved MP4 coexists with the rolling segments. Trim export likewise needs room for the normal source, an in-progress partial, and the separately committed trimmed MP4 until the user optionally confirms original deletion. Segment pruning must be based on completed media only; deleting the segment FFmpeg is still writing can corrupt the session.
 
 ## Concurrency and ownership rules
 
@@ -184,7 +195,9 @@ This is capacity guidance, not a quota. CRF encoding varies with content, and th
 - Capture configuration is immutable for the life of a session. The UI automatically performs stop/start when display, resolution, frame-rate, or audio choices change; retention changes apply in place.
 - Start and stop are serialized and cancellation-aware.
 - Saving uses a snapshot of completed segments and does not mutate the active segment set.
-- Temporary files have one clear owner and are removed on normal completion; cleanup after abnormal termination is best-effort.
+- Trim export is single-flight and is disabled until replay has stopped; capture and trim encoders never intentionally run together.
+- Trim output is committed as a separate file. The selected source and destination root stay pinned through validation and commit, and optional original deletion is a later identity-revalidated action.
+- Temporary files have one clear owner and are removed on normal completion or cancellation; cleanup after abnormal process or machine termination is best-effort.
 - UI changes and progress events are marshalled back to the WPF dispatcher.
 
 These rules prevent overlapping capture processes, use-after-delete races during save, and cross-thread WPF access.
@@ -197,7 +210,8 @@ These rules prevent overlapping capture processes, use-after-delete races during
 - Hardware encoders depend on current drivers and runtime support. If every hardware probe fails, `libx264` is CPU-based and 1440p/2160p or 60 FPS may be too expensive on some systems.
 - There is one selected display and one mixed stereo audio track. Region/window capture, per-app audio, separate tracks, and independent gain controls are not part of the current release.
 - Audio device removal or format changes during a session may require replay to be restarted.
-- The overlay is a desktop WPF window, not a game-injected overlay. There is no startup task, clip editor, or automatic upload.
+- The overlay is a desktop WPF window, not a game-injected overlay. There is no startup task, multi-track/effects editor, or automatic upload; editing is limited to a start/end Library trim.
+- Trim export requires replay to be stopped and re-encodes the selected interval. Below-normal process priority and single-flight scheduling reduce foreground contention but cannot make a long or high-resolution trim instantaneous or resource-free.
 - The performance smoke test validates real segment rollover, a saved MP4, duration, encoder/process priority, and sampled resource use on the test machine. It cannot certify zero input delay for every game/GPU/driver combination; target-game testing remains a release check.
 - The current beta is unsigned, and the installed updater does not yet enforce a pinned publisher identity. Signing and a client-side update trust policy remain release/security work rather than completed protection.
 

@@ -166,13 +166,40 @@ dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --
 
 The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A successful fallback run on one PC still does not replace validation on the affected or equivalent fallback/hybrid hardware before claiming that hardware-specific lag is resolved.
 
+### Library trim smoke checklist
+
+Complete this checklist with a real ClipForge-generated MP4 before publishing a build that changes trimming, Library discovery, FFmpeg media helpers, or guarded deletion:
+
+```powershell
+$smokeProject = '.\tests\ClipForge.CaptureSmoke\ClipForge.CaptureSmoke.csproj'
+$trimSmokeRoot = '.\artifacts\trim-release-smoke'
+dotnet build $smokeProject -c Release --no-restore
+dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --artifacts $trimSmokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --audio --artifacts $trimSmokeRoot
+```
+
+The two automated trim runs create a synthetic ClipForge source with non-keyframe-aligned boundaries and validate duration, frame count, resolution, frame rate, audio-stream count, strict trimmed naming, original-file retention, partial cleanup, and helper-process termination. They complement rather than replace the following interactive player, filter, prompt, cancellation, and target-hardware checks.
+
+1. Save a normal clip containing motion and audio, open it in Library, and confirm the **All**, **Normal**, and **Trimmed** filters classify it correctly.
+2. While replay is running, verify the trim export action is disabled. Stop replay before continuing; capture FFmpeg and trim FFmpeg must not intentionally run together.
+3. Move both trim handles to a non-keyframe-aligned interval, including a short selection of approximately five seconds. Confirm the preview labels and selected range match the requested start/end frames.
+4. Export the range and use FFprobe to verify the trimmed MP4 is playable, has the expected video dimensions and audio-stream count, starts/ends within the accepted frame-duration tolerance, and appears under **Trimmed** without hiding the normal clip.
+5. At the post-export prompt, choose the default keep-both path and confirm both files remain. Repeat with another source, explicitly choose deletion, and confirm only the identity-revalidated original is removed after the trimmed output is safely present.
+6. Repeat a trim that would produce the same friendly base name and confirm a unique suffix is used instead of overwriting either earlier file.
+7. Start a longer trim and cancel it, then test an induced helper failure if practical. Confirm the original remains, no completed trimmed entry appears, no owned trim partial remains in the clips folder, and no FFmpeg/FFprobe child process is orphaned.
+8. Confirm the trim helper runs at below-normal priority and that the app remains responsive. Record duration and resource observations for 720p, 1080p, and Source/high-resolution inputs; these measurements describe only the test hardware and are not proof of zero latency everywhere.
+9. Start replay again after trimming and rerun the applicable capture smoke. Confirm save, playback, gallery refresh, and trim-filter state do not leave a decoder or export helper running in the background.
+
+Do not publish a frame-accuracy claim from UI observation alone. Record the input, selected timestamps, output duration/stream details, and FFprobe result in the release verification notes. Do not claim zero lag: trimming performs a separate re-encode and can use noticeable CPU, GPU, disk bandwidth, and temporary space even though capture must be stopped and helper priority is reduced.
+
 For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the publisher should match the intended ClipForge publisher identity. Also verify on a clean Windows user account or VM:
 
 1. The installer starts without an unexpected publisher warning.
 2. ClipForge launches from the Start menu and Desktop shortcut.
-3. FFmpeg setup, replay capture, and clip saving work.
-4. The displayed application version matches the release.
-5. After publishing a newer version, **Check for updates**, download, and **Restart to update** complete successfully. Verify that a staged package is not applied merely by launching the app without that explicit action.
+3. FFmpeg setup, replay capture, clip saving, Library filtering, local playback, and frame-accurate trimming work.
+4. Trim export remains disabled while replay is active, keeps both files by default, and deletes only an explicitly confirmed, identity-revalidated original.
+5. The displayed application version matches the release.
+6. After publishing a newer version, **Check for updates**, download, and **Restart to update** complete successfully. Verify that a staged package is not applied merely by launching the app without that explicit action.
 
 Raw `dotnet run`, IDE, and portable publish builds are intentionally excluded from updater installation tests. Velopack updates only apply to a Velopack-installed copy.
 

@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Threading;
+using ClipForge.Controls;
 using ClipForge.Models;
 using ClipForge.Services;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
@@ -19,8 +20,17 @@ namespace ClipForge;
 public partial class LibraryWindow : Window
 {
     private const int InitialClipLimit = 100;
+    private static readonly TimeSpan NormalPlayerTimerInterval = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan TrimPreviewTimerInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly LibraryFilterOption[] LibraryFilterOptions =
+    [
+        new(ClipLibraryFilter.All, "All clips"),
+        new(ClipLibraryFilter.Original, "Normal clips"),
+        new(ClipLibraryFilter.Trimmed, "Trimmed clips")
+    ];
 
     private readonly ClipLibraryService _clipLibraryService;
+    private readonly ClipTrimService _clipTrimService;
     private readonly string _saveDirectory;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _playerTimer;
@@ -29,6 +39,7 @@ public partial class LibraryWindow : Window
     private readonly object _refreshCancellationGate = new();
 
     private CancellationTokenSource? _activeRefreshCancellation;
+    private CancellationTokenSource? _activeTrimCancellation;
     private ClipLibraryItem? _currentClip;
     private TimeSpan? _positionToRestore;
     private bool _isLoaded;
@@ -42,27 +53,47 @@ public partial class LibraryWindow : Window
     private bool _resumeAfterSeek;
     private bool _isUpdatingControls;
     private bool _isMuted;
+    private bool _isReplayRunning;
+    private bool _isTrimMode;
+    private bool _isTrimInProgress;
+    private bool _isPreviewingTrim;
+    private bool _isUpdatingTrimRange;
+    private bool _trimRangeInitialized;
+    private bool _beginTrimWhenReady;
+    private bool _suppressFilterChange;
     private double _volumeBeforeMute = 0.8;
     private long _refreshGeneration;
     private LibraryMediaOpenPlan? _pendingOpenPlan;
+    private ClipLibraryFilter _activeFilter = ClipLibraryFilter.All;
+    private string? _requestedPreferredPath;
 
     public LibraryWindow(
         ClipLibraryService clipLibraryService,
+        ClipTrimService clipTrimService,
         string saveDirectory,
-        ClipLibraryItem? initiallySelectedClip = null)
+        bool replayRunning,
+        ClipLibraryItem? initiallySelectedClip = null,
+        bool beginTrim = false)
     {
         ArgumentNullException.ThrowIfNull(clipLibraryService);
+        ArgumentNullException.ThrowIfNull(clipTrimService);
         ArgumentException.ThrowIfNullOrWhiteSpace(saveDirectory);
 
         _clipLibraryService = clipLibraryService;
+        _clipTrimService = clipTrimService;
         _saveDirectory = Path.GetFullPath(saveDirectory);
         _initialPreferredPath = initiallySelectedClip?.FullPath;
+        _requestedPreferredPath = beginTrim ? _initialPreferredPath : null;
+        _beginTrimWhenReady = beginTrim;
+        _isReplayRunning = replayRunning;
 
         InitializeComponent();
+        LibraryFilterComboBox.ItemsSource = LibraryFilterOptions;
+        LibraryFilterComboBox.SelectedItem = LibraryFilterOptions[0];
         _nativeWindowThemeService = new NativeWindowThemeService(this);
         _playerTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
-            Interval = TimeSpan.FromMilliseconds(400)
+            Interval = NormalPlayerTimerInterval
         };
         _playerTimer.Tick += PlayerTimer_Tick;
 
@@ -79,6 +110,51 @@ public partial class LibraryWindow : Window
     /// </summary>
     public bool LibraryChanged { get; private set; }
 
+    /// <summary>
+    /// Prevents Instant Replay from starting while a trim encoder owns the
+    /// local media engine and is intentionally running at below-normal priority.
+    /// </summary>
+    public bool IsTrimInProgress => _isTrimInProgress;
+
+    public void UpdateReplayRunningState(bool isRunning)
+    {
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() => UpdateReplayRunningState(isRunning));
+            return;
+        }
+
+        _isReplayRunning = isRunning;
+        UpdateTrimAvailability();
+    }
+
+    public void SelectClipAndBeginTrim(ClipLibraryItem clip)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        if (_isClosing || _isTrimInProgress)
+        {
+            return;
+        }
+
+        if (_activeFilter != ClipLibraryFilter.All)
+        {
+            SetLibraryFilter(ClipLibraryFilter.All);
+        }
+
+        _requestedPreferredPath = clip.FullPath;
+        _beginTrimWhenReady = true;
+        _refreshPending = true;
+        if (_isLoaded && IsVisible && IsActive)
+        {
+            _ = RefreshLibraryAsync(clip.FullPath);
+        }
+    }
+
     private async void LibraryWindow_Loaded(object sender, RoutedEventArgs e)
     {
         Loaded -= LibraryWindow_Loaded;
@@ -90,6 +166,25 @@ public partial class LibraryWindow : Window
         await RefreshLibraryAsync(_currentClip?.FullPath);
 
     private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();
+
+    private async void LibraryFilterComboBox_SelectionChanged(
+        object sender,
+        SelectionChangedEventArgs e)
+    {
+        if (_suppressFilterChange ||
+            !_isLoaded ||
+            _isClosing ||
+            _isTrimInProgress ||
+            LibraryFilterComboBox.SelectedItem is not LibraryFilterOption option ||
+            option.Filter == _activeFilter)
+        {
+            return;
+        }
+
+        _activeFilter = option.Filter;
+        CancelTrimMode();
+        await RefreshLibraryAsync();
+    }
 
     private async Task RefreshLibraryAsync(string? preferredPath = null)
     {
@@ -124,7 +219,8 @@ public partial class LibraryWindow : Window
                 _saveDirectory,
                 count: InitialClipLimit,
                 includeThumbnails: true,
-                refreshCancellation.Token);
+                filter: _activeFilter,
+                cancellationToken: refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
             if (generation != Volatile.Read(ref _refreshGeneration) || !IsVisible || !IsActive)
@@ -138,11 +234,16 @@ public partial class LibraryWindow : Window
             ClipCountText.Text = clips.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
             LibraryStatusText.Text = clips.Count switch
             {
-                0 => "No saved clips found in the current folder.",
-                1 => "1 local clip · newest first",
+                0 => _activeFilter switch
+                {
+                    ClipLibraryFilter.Original => "No normal clips found in the current folder.",
+                    ClipLibraryFilter.Trimmed => "No trimmed clips yet.",
+                    _ => "No saved clips found in the current folder."
+                },
+                1 => $"1 {GetFilterDescription(_activeFilter)} · newest first",
                 _ when clips.Count == InitialClipLimit =>
-                    $"Showing the newest {clips.Count} local clips",
-                _ => $"{clips.Count} local clips · newest first"
+                    $"Showing the newest {clips.Count} {GetFilterDescription(_activeFilter)}",
+                _ => $"{clips.Count} {GetFilterDescription(_activeFilter)} · newest first"
             };
             LoadingState.Visibility = Visibility.Collapsed;
             EmptyLibraryState.Visibility = clips.Count == 0
@@ -188,6 +289,24 @@ public partial class LibraryWindow : Window
                     preserveRestorePosition: restorePreviousPosition);
             }
 
+            var requestedTrimPath = _requestedPreferredPath;
+            if (_beginTrimWhenReady &&
+                selected is not null &&
+                (requestedTrimPath is null || selected.FullPath.Equals(
+                    requestedTrimPath,
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                _beginTrimWhenReady = false;
+                _requestedPreferredPath = null;
+                BeginTrimMode();
+            }
+            else if (_beginTrimWhenReady && requestedTrimPath is not null)
+            {
+                _beginTrimWhenReady = false;
+                _requestedPreferredPath = null;
+                LibraryStatusText.Text = "The requested clip is no longer available to trim.";
+            }
+
             _refreshPending = false;
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
@@ -215,7 +334,7 @@ public partial class LibraryWindow : Window
 
             if (wasActiveRefresh)
             {
-                RefreshButton.IsEnabled = !_isClosing && IsVisible && IsActive;
+                RefreshButton.IsEnabled = !_isClosing && !_isTrimInProgress && IsVisible && IsActive;
             }
 
             refreshCancellation.Dispose();
@@ -226,11 +345,13 @@ public partial class LibraryWindow : Window
     {
         if (_isClosing ||
             _suppressSelectionAutoplay ||
+            _isTrimInProgress ||
             ClipList.SelectedItem is not ClipLibraryItem clip)
         {
             return;
         }
 
+        CancelTrimMode();
         OpenClip(clip, autoplay: true);
     }
 
@@ -256,7 +377,7 @@ public partial class LibraryWindow : Window
         _playWhenOpened = autoplay;
         SelectedClipNameText.Text = clip.FileName;
         SelectedClipDetailsText.Text =
-            $"{clip.RecordedAtLocal:dd MMM yyyy · HH:mm} · {clip.FileSizeDisplay}";
+            $"{(clip.IsTrimmed ? "Trimmed copy · " : string.Empty)}{clip.RecordedAtLocal:dd MMM yyyy · HH:mm} · {clip.FileSizeDisplay}";
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         SurfacePlayButton.Visibility = Visibility.Visible;
         SetControlsEnabled(false);
@@ -285,6 +406,11 @@ public partial class LibraryWindow : Window
 
     private void ClearPlayer()
     {
+        if (!_isTrimInProgress)
+        {
+            CancelTrimMode();
+        }
+
         ReleasePlayerSource(rememberPosition: false);
         _currentClip = null;
         _positionToRestore = null;
@@ -441,11 +567,17 @@ public partial class LibraryWindow : Window
             SetPlaying(false);
         }
 
+        if (_isTrimMode)
+        {
+            InitializeTrimRange(GetPlayerDuration(), preserveSelection: _trimRangeInitialized);
+        }
+
         UpdatePlayerTime();
     }
 
     private void LibraryPlayer_MediaEnded(object sender, RoutedEventArgs e)
     {
+        _isPreviewingTrim = false;
         LibraryPlayer.Pause();
         LibraryPlayer.Position = TimeSpan.Zero;
         SetPlaying(false);
@@ -480,6 +612,12 @@ public partial class LibraryWindow : Window
     private void SetPlaying(bool isPlaying)
     {
         _isPlaying = isPlaying;
+        if (!isPlaying)
+        {
+            _isPreviewingTrim = false;
+            _playerTimer.Interval = NormalPlayerTimerInterval;
+        }
+
         PlayPauseButton.Content = isPlaying ? "⏸" : "▶";
         PlayPauseButton.ToolTip = isPlaying ? "Pause clip" : "Play clip";
         SurfacePlayButton.Visibility = !isPlaying &&
@@ -510,6 +648,23 @@ public partial class LibraryWindow : Window
         var position = total > TimeSpan.Zero && LibraryPlayer.Position > total
             ? total
             : LibraryPlayer.Position;
+        if (_isPreviewingTrim &&
+            _isTrimMode &&
+            position.TotalSeconds >= TrimRangeSelector.UpperValue - 0.03)
+        {
+            var trimEnd = TimeSpan.FromSeconds(TrimRangeSelector.UpperValue);
+            var previewEnd = total > TimeSpan.FromMilliseconds(50) && trimEnd >= total
+                ? total - TimeSpan.FromMilliseconds(50)
+                : trimEnd;
+            LibraryPlayer.Pause();
+            LibraryPlayer.Position = previewEnd;
+            _isPreviewingTrim = false;
+            SetPlaying(false);
+            TimeText.Text = $"{FormatDuration(trimEnd)} / {(total > TimeSpan.Zero ? FormatDuration(total) : "--:--")}";
+            SetSeekUi(trimEnd, total);
+            return;
+        }
+
         TimeText.Text =
             $"{FormatDuration(position)} / {(total > TimeSpan.Zero ? FormatDuration(total) : "--:--")}";
         if (!_isSeeking)
@@ -528,6 +683,7 @@ public partial class LibraryWindow : Window
         VolumeSlider.IsEnabled = isEnabled;
         SurfacePlayButton.IsEnabled = isEnabled;
         SeekSlider.IsEnabled = isEnabled && GetPlayerDuration() > TimeSpan.Zero;
+        BeginTrimButton.IsEnabled = isEnabled && !_isTrimInProgress;
     }
 
     private TimeSpan GetPlayerDuration() => LibraryPlayer.NaturalDuration.HasTimeSpan
@@ -664,6 +820,403 @@ public partial class LibraryWindow : Window
         e.Handled = true;
     }
 
+    private void BeginTrimButton_Click(object sender, RoutedEventArgs e) => BeginTrimMode();
+
+    private void BeginTrimMode()
+    {
+        if (_isClosing || _isTrimInProgress || _currentClip is null)
+        {
+            return;
+        }
+
+        var duration = SeekSlider.IsEnabled
+            ? GetPlayerDuration()
+            : _currentClip.Duration ?? GetPlayerDuration();
+
+        if (duration < TimeSpan.FromSeconds(0.25))
+        {
+            ShowError("This clip is too short to trim, or its duration is unavailable.");
+            return;
+        }
+
+        _isTrimMode = true;
+        _trimRangeInitialized = false;
+        _isPreviewingTrim = false;
+        TrimEditorPanel.Visibility = Visibility.Visible;
+        InitializeTrimRange(duration, preserveSelection: false);
+        UpdateTrimAvailability();
+        _ = TrimRangeSelector.FocusStartHandle();
+    }
+
+    private void CancelTrimModeButton_Click(object sender, RoutedEventArgs e) => CancelTrimMode();
+
+    private void CancelTrimMode()
+    {
+        if (_isTrimInProgress)
+        {
+            return;
+        }
+
+        _isTrimMode = false;
+        _isPreviewingTrim = false;
+        _trimRangeInitialized = false;
+        TrimEditorPanel.Visibility = Visibility.Collapsed;
+        BeginTrimButton.Content = "Trim clip";
+        BeginTrimButton.IsEnabled = _currentClip is not null && LibraryPlayer.Source is not null;
+    }
+
+    private void InitializeTrimRange(TimeSpan duration, bool preserveSelection)
+    {
+        if (!_isTrimMode || duration <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        var maximum = Math.Max(0.25, duration.TotalSeconds);
+        var previousMaximum = TrimRangeSelector.Maximum;
+        var previousLower = TrimRangeSelector.LowerValue;
+        var previousUpper = TrimRangeSelector.UpperValue;
+        var keptFullRange = !_trimRangeInitialized ||
+                            previousUpper >= previousMaximum - 0.03;
+
+        _isUpdatingTrimRange = true;
+        try
+        {
+            TrimRangeSelector.Minimum = 0;
+            TrimRangeSelector.Maximum = maximum;
+            TrimRangeSelector.MinimumSpan = Math.Min(0.25, maximum);
+            TrimRangeSelector.LowerValue = preserveSelection
+                ? Math.Clamp(previousLower, 0, maximum - TrimRangeSelector.MinimumSpan)
+                : 0;
+            TrimRangeSelector.UpperValue = preserveSelection && !keptFullRange
+                ? Math.Clamp(previousUpper, TrimRangeSelector.LowerValue + TrimRangeSelector.MinimumSpan, maximum)
+                : maximum;
+        }
+        finally
+        {
+            _isUpdatingTrimRange = false;
+        }
+
+        _trimRangeInitialized = true;
+        UpdateTrimLabels();
+        UpdateTrimAvailability();
+    }
+
+    private void TrimRangeSelector_RangeChanged(object? sender, TrimRangeChangedEventArgs e)
+    {
+        UpdateTrimLabels();
+        UpdateTrimAvailability();
+        if (_isUpdatingTrimRange ||
+            e.Handle == TrimRangeHandle.None ||
+            LibraryPlayer.Source is null)
+        {
+            return;
+        }
+
+        LibraryPlayer.Pause();
+        SetPlaying(false);
+        SeekPlayerTo(GetTrimBoundaryPreviewPosition(e.Handle, e.LowerValue, e.UpperValue));
+    }
+
+    private void TrimRangeSelector_RangeChangeCompleted(object? sender, TrimRangeChangedEventArgs e)
+    {
+        UpdateTrimLabels();
+        if (_isUpdatingTrimRange || LibraryPlayer.Source is null)
+        {
+            return;
+        }
+
+        SeekPlayerTo(GetTrimBoundaryPreviewPosition(e.Handle, e.LowerValue, e.UpperValue));
+    }
+
+    private TimeSpan GetTrimBoundaryPreviewPosition(
+        TrimRangeHandle handle,
+        double lowerValue,
+        double upperValue)
+    {
+        var requested = handle == TrimRangeHandle.End ? upperValue : lowerValue;
+        var total = GetPlayerDuration();
+        if (handle == TrimRangeHandle.End &&
+            total > TimeSpan.FromMilliseconds(50) &&
+            requested >= total.TotalSeconds - 0.001)
+        {
+            requested = total.TotalSeconds - 0.05;
+        }
+
+        return TimeSpan.FromSeconds(Math.Max(0, requested));
+    }
+
+    private void PreviewTrimButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_isTrimMode ||
+            _isTrimInProgress ||
+            _currentClip is null ||
+            LibraryPlayer.Source is null)
+        {
+            return;
+        }
+
+        LibraryPlayer.Position = TimeSpan.FromSeconds(TrimRangeSelector.LowerValue);
+        _playerTimer.Interval = TrimPreviewTimerInterval;
+        _isPreviewingTrim = true;
+        LibraryPlayer.Play();
+        SetPlaying(true);
+        UpdatePlayerTime();
+    }
+
+    private async void SaveTrimButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_isTrimMode || _isTrimInProgress || _currentClip is null)
+        {
+            return;
+        }
+
+        if (_isReplayRunning)
+        {
+            UpdateTrimAvailability();
+            ShowError("Stop instant replay before creating a trimmed copy. This prevents the export from competing with your game capture.");
+            return;
+        }
+
+        var source = _currentClip;
+        var start = TimeSpan.FromSeconds(TrimRangeSelector.LowerValue);
+        var end = TimeSpan.FromSeconds(TrimRangeSelector.UpperValue);
+        if (end - start < TimeSpan.FromSeconds(0.25))
+        {
+            ShowError("Choose at least 0.25 seconds to keep.");
+            return;
+        }
+
+        LibraryPlayer.Pause();
+        _isPreviewingTrim = false;
+        ReleasePlayerSource(rememberPosition: false);
+
+        var trimCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _activeTrimCancellation = trimCancellation;
+        SetTrimBusy(true);
+
+        try
+        {
+            var result = await _clipTrimService.TrimAsync(
+                _saveDirectory,
+                source,
+                start,
+                end,
+                trimCancellation.Token);
+            if (_isClosing)
+            {
+                return;
+            }
+
+            if (!result.Succeeded || string.IsNullOrWhiteSpace(result.OutputPath))
+            {
+                SetTrimBusy(false);
+                if (!IsVisible || !IsActive)
+                {
+                    _requestedPreferredPath = source.FullPath;
+                    _refreshPending = true;
+                    return;
+                }
+
+                if (!trimCancellation.IsCancellationRequested)
+                {
+                    ShowError(result.Message);
+                }
+
+                OpenClip(source, autoplay: false);
+
+                return;
+            }
+
+            if (!await WaitForForegroundAsync(trimCancellation.Token))
+            {
+                return;
+            }
+
+            LibraryChanged = true;
+            var outputPath = result.OutputPath;
+            var deleteOriginal = MessageBox.Show(
+                this,
+                $"The trimmed clip was saved successfully.\n\nDelete the source clip {source.FileName}?\n\nChoose No to keep both clips.",
+                "Trimmed clip saved",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question,
+                MessageBoxResult.No) == MessageBoxResult.Yes;
+
+            if (deleteOriginal)
+            {
+                var deletion = ClipLibraryService.DeleteCurrentClip(_saveDirectory, source);
+                if (deletion == ClipDeletionResult.Deleted)
+                {
+                    _clipLibraryService.RemoveCachedThumbnail(source);
+                }
+                else
+                {
+                    ShowError(deletion == ClipDeletionResult.ChangedOrUnsafe
+                        ? "The source clip changed, so ClipForge kept it. Your trimmed copy is safe."
+                        : "The source clip could not be deleted. Your trimmed copy is safe, and both clips were kept.");
+                }
+            }
+
+            SetTrimBusy(false);
+            CancelTrimMode();
+            SetLibraryFilter(ClipLibraryFilter.Trimmed);
+            await RefreshLibraryAsync(outputPath);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException or
+                ArgumentException or NotSupportedException)
+        {
+            if (!_isClosing)
+            {
+                SetTrimBusy(false);
+                if (IsVisible && IsActive)
+                {
+                    ShowError($"The trimmed clip could not be created. {exception.Message}");
+                    OpenClip(source, autoplay: false);
+                }
+                else
+                {
+                    _requestedPreferredPath = source.FullPath;
+                    _refreshPending = true;
+                }
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_activeTrimCancellation, trimCancellation))
+            {
+                _activeTrimCancellation = null;
+            }
+
+            trimCancellation.Dispose();
+            if (!_isClosing && _isTrimInProgress)
+            {
+                SetTrimBusy(false);
+            }
+        }
+    }
+
+    private async Task<bool> WaitForForegroundAsync(CancellationToken cancellationToken)
+    {
+        while (!_isClosing)
+        {
+            if (IsVisible && IsActive)
+            {
+                return true;
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private void CancelTrimOperationButton_Click(object sender, RoutedEventArgs e)
+    {
+        CancelTrimOperationButton.IsEnabled = false;
+        CancelTrimOperationButton.Content = "Cancelling…";
+        _activeTrimCancellation?.Cancel();
+    }
+
+    private void SetTrimBusy(bool isBusy)
+    {
+        _isTrimInProgress = isBusy;
+        ClipList.IsEnabled = !isBusy;
+        LibraryFilterComboBox.IsEnabled = !isBusy;
+        RefreshButton.IsEnabled = !isBusy && IsVisible && IsActive;
+        TrimRangeSelector.IsEnabled = !isBusy;
+        CancelTrimModeButton.IsEnabled = !isBusy;
+        TrimActionsPanel.Visibility = isBusy ? Visibility.Collapsed : Visibility.Visible;
+        TrimProgressPanel.Visibility = isBusy ? Visibility.Visible : Visibility.Collapsed;
+        CancelTrimOperationButton.IsEnabled = isBusy;
+        CancelTrimOperationButton.Content = "Cancel";
+        BeginTrimButton.IsEnabled = !isBusy && _currentClip is not null && LibraryPlayer.Source is not null;
+        UpdateTrimAvailability();
+    }
+
+    private void UpdateTrimLabels()
+    {
+        if (TrimStartText is null)
+        {
+            return;
+        }
+
+        var start = TimeSpan.FromSeconds(Math.Max(0, TrimRangeSelector.LowerValue));
+        var end = TimeSpan.FromSeconds(Math.Max(start.TotalSeconds, TrimRangeSelector.UpperValue));
+        TrimStartText.Text = FormatTrimDuration(start);
+        TrimEndText.Text = FormatTrimDuration(end);
+        TrimLengthText.Text = FormatTrimDuration(end - start);
+    }
+
+    private void UpdateTrimAvailability()
+    {
+        if (SaveTrimButton is null)
+        {
+            return;
+        }
+
+        var validRange = _isTrimMode &&
+                         TrimRangeSelector.UpperValue - TrimRangeSelector.LowerValue >= 0.25 &&
+                         (TrimRangeSelector.LowerValue > 0.01 ||
+                          TrimRangeSelector.UpperValue < TrimRangeSelector.Maximum - 0.01);
+        TrimContentionText.Visibility = _isTrimMode && _isReplayRunning
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        SaveTrimButton.IsEnabled = validRange && !_isTrimInProgress && !_isReplayRunning;
+        PreviewTrimButton.IsEnabled = _isTrimMode &&
+                                      !_isTrimInProgress &&
+                                      _currentClip is not null &&
+                                      LibraryPlayer.Source is not null &&
+                                      SeekSlider.IsEnabled;
+        BeginTrimButton.Content = _isTrimMode ? "Editing trim" : "Trim clip";
+        if (_isTrimMode)
+        {
+            BeginTrimButton.IsEnabled = false;
+        }
+    }
+
+    private void SetLibraryFilter(ClipLibraryFilter filter)
+    {
+        _activeFilter = filter;
+        _suppressFilterChange = true;
+        try
+        {
+            LibraryFilterComboBox.SelectedItem = LibraryFilterOptions.First(option => option.Filter == filter);
+        }
+        finally
+        {
+            _suppressFilterChange = false;
+        }
+    }
+
+    private static string GetFilterDescription(ClipLibraryFilter filter) => filter switch
+    {
+        ClipLibraryFilter.Original => "normal clips",
+        ClipLibraryFilter.Trimmed => "trimmed clips",
+        _ => "local clips"
+    };
+
+    private static string FormatTrimDuration(TimeSpan duration)
+    {
+        var totalTenths = Math.Max(0, (long)Math.Round(duration.TotalSeconds * 10));
+        var tenths = totalTenths % 10;
+        var totalSeconds = totalTenths / 10;
+        var seconds = totalSeconds % 60;
+        var totalMinutes = totalSeconds / 60;
+        return totalMinutes >= 60
+            ? $"{totalMinutes / 60}:{totalMinutes % 60:00}:{seconds:00}.{tenths}"
+            : $"{totalMinutes}:{seconds:00}.{tenths}";
+    }
+
     private async void DeleteClipMenuItem_Click(object sender, RoutedEventArgs e)
     {
         if (_isClosing || sender is not MenuItem { Tag: ClipLibraryItem clip })
@@ -779,7 +1332,8 @@ public partial class LibraryWindow : Window
         }
         if (_refreshPending)
         {
-            _ = RefreshLibraryAsync(_currentClip?.FullPath ?? _initialPreferredPath);
+            _ = RefreshLibraryAsync(
+                _requestedPreferredPath ?? _currentClip?.FullPath ?? _initialPreferredPath);
             return;
         }
 
@@ -862,6 +1416,7 @@ public partial class LibraryWindow : Window
     {
         _isClosing = true;
         _lifetimeCancellation.Cancel();
+        _activeTrimCancellation?.Cancel();
         lock (_refreshCancellationGate)
         {
             _activeRefreshCancellation?.Cancel();
@@ -921,4 +1476,9 @@ internal readonly record struct LibraryMediaOpenPlan(
             PlaybackVolume: Math.Clamp(playbackVolume, 0, 1),
             MustPrimeWithPlay: true,
             ContinueAfterOpened: autoplay);
+}
+
+internal sealed record LibraryFilterOption(ClipLibraryFilter Filter, string Label)
+{
+    public override string ToString() => Label;
 }

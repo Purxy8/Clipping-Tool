@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Pipes;
+using ClipForge.Controls;
 using ClipForge.Models;
 using ClipForge.Services;
 using ClipForge.Capture;
@@ -24,6 +26,8 @@ internal static class Program
             ("FFmpeg capability priority", TestEncoderCapabilityPriorityAsync),
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
             ("FFmpeg concat arguments", TestConcatArgumentsAsync),
+            ("FFmpeg trim arguments", TestTrimArgumentsAsync),
+            ("Trim range and output naming", TestTrimRangeAndNamingAsync),
             ("Configured FFmpeg discovery", TestConfiguredFfmpegDiscoveryAsync),
             ("Pinned FFmpeg trust policy", TestPinnedFfmpegTrustPolicyAsync),
             ("FFmpeg download byte limits", TestFfmpegDownloadLimitsAsync),
@@ -33,12 +37,15 @@ internal static class Program
             ("Default save directory", TestDefaultSaveDirectoryAsync),
             ("Background color policy", TestBackgroundColorPolicyAsync),
             ("Appearance and gallery layout", TestAppearanceAndGalleryAsync),
+            ("Trim range selector policy", TestTrimRangeSelectorAsync),
             ("Library player open policy", TestLibraryPlayerOpenPolicyAsync),
             ("UI feedback helpers", TestUiFeedbackHelpersAsync),
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
             ("Secure clip discovery and thumbnail cache", TestClipLibraryAsync),
+            ("Clip classification and filtered discovery", TestClipClassificationAndFilteringAsync),
+            ("Transactional clip trimming", TestClipTrimServiceAsync),
             ("Clip path and media process hardening", TestClipLibrarySecurityPolicyAsync),
             ("Race-resistant clip deletion", TestClipDeletionAsync),
             ("Thumbnail decoding releases cache files", TestThumbnailDecoderReleasesFileAsync),
@@ -265,6 +272,52 @@ internal static class Program
 
         return Task.CompletedTask;
     }
+
+    private static Task TestTrimRangeSelectorAsync() => RunOnStaThreadAsync(() =>
+    {
+        var selector = new TrimRangeSelector
+        {
+            Minimum = 0,
+            Maximum = 10,
+            MinimumSpan = 0.5,
+            LowerValue = 2,
+            UpperValue = 8
+        };
+        Assert.Equal(2d, selector.LowerValue, "A valid trim start should remain unchanged.");
+        Assert.Equal(8d, selector.UpperValue, "A valid trim end should remain unchanged.");
+
+        selector.LowerValue = 9.9;
+        Assert.Equal(9.5d, selector.LowerValue,
+            "The start handle must remain inside the duration and preserve the minimum span.");
+        Assert.Equal(10d, selector.UpperValue,
+            "Crossing the end handle should normalize to the clip boundary.");
+
+        selector.UpperValue = -10;
+        Assert.Equal(10d, selector.UpperValue,
+            "The end handle must not cross an already clamped start handle.");
+        Assert.True(selector.UpperValue - selector.LowerValue >= selector.MinimumSpan,
+            "Range normalization violated the minimum trim span.");
+
+        selector.Minimum = double.NaN;
+        selector.Maximum = double.PositiveInfinity;
+        selector.MinimumSpan = double.NegativeInfinity;
+        selector.LowerValue = double.NaN;
+        selector.UpperValue = double.PositiveInfinity;
+        Assert.True(
+            double.IsFinite(selector.Minimum) &&
+            double.IsFinite(selector.Maximum) &&
+            double.IsFinite(selector.MinimumSpan) &&
+            double.IsFinite(selector.LowerValue) &&
+            double.IsFinite(selector.UpperValue),
+            "Non-finite trim selector input must normalize to finite values.");
+        Assert.True(selector.Maximum > selector.Minimum,
+            "A normalized trim selector must retain a positive total range.");
+        Assert.True(
+            selector.LowerValue >= selector.Minimum &&
+            selector.UpperValue <= selector.Maximum &&
+            selector.UpperValue >= selector.LowerValue + selector.MinimumSpan,
+            "Normalized trim handles escaped their legal range.");
+    });
 
     private static Task TestLibraryPlayerOpenPolicyAsync()
     {
@@ -794,6 +847,222 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestTrimArgumentsAsync()
+    {
+        var inputPath = @"C:\Clips\Clip with spaces & quote's.mp4";
+        var outputPath = @"C:\Clips\Clip with spaces & quote's_trimmed.mp4";
+        var previousCulture = CultureInfo.CurrentCulture;
+        var previousUiCulture = CultureInfo.CurrentUICulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("bg-BG");
+            CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("bg-BG");
+            var arguments = FfmpegArgumentBuilder.BuildTrimArguments(
+                inputPath,
+                outputPath,
+                TimeSpan.FromMilliseconds(1250),
+                TimeSpan.FromMilliseconds(5375),
+                includeAudio: true,
+                framesPerSecond: 60,
+                VideoEncodingStrategy.SoftwareGdi);
+
+            Assert.ContainsSequence(arguments, "-nostdin", "-protocol_whitelist", "file", "-f", "mov");
+            Assert.ContainsSequence(arguments, "-ss", "1.25", "-i", inputPath, "-t", "5.375");
+            Assert.ContainsSequence(arguments, "-map", "0:v:0", "-map", "0:a:0?");
+            Assert.ContainsSequence(arguments, "-c:v", "libx264");
+            Assert.ContainsSequence(arguments, "-threads", "2");
+            Assert.ContainsSequence(arguments, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2");
+            Assert.ContainsSequence(arguments, "-f", "mp4", "-n", outputPath);
+            Assert.Equal(1, arguments.Count(argument => argument == inputPath),
+                "A trim input path must remain one exact ArgumentList entry.");
+            Assert.Equal(1, arguments.Count(argument => argument == outputPath),
+                "A trim output path must remain one exact ArgumentList entry.");
+            Assert.True(
+                !arguments.Contains("copy", StringComparer.Ordinal),
+                "Frame-accurate trim must re-encode rather than copy keyframe-bounded packets.");
+
+            var silentArguments = FfmpegArgumentBuilder.BuildTrimArguments(
+                inputPath,
+                outputPath,
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(1),
+                includeAudio: false,
+                framesPerSecond: 30,
+                new VideoEncodingStrategy(VideoEncoderKind.NvidiaNvenc, DesktopCaptureBackend.Gdi));
+            Assert.True(silentArguments.Contains("-an", StringComparer.Ordinal),
+                "A silent source must explicitly disable audio output.");
+            Assert.True(!silentArguments.Contains("0:a:0?", StringComparer.Ordinal),
+                "A silent trim must not add an optional audio mapping.");
+            Assert.ContainsSequence(silentArguments, "-c:v", "h264_nvenc");
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => FfmpegArgumentBuilder.BuildTrimArguments(
+                    inputPath,
+                    outputPath,
+                    TimeSpan.FromMilliseconds(-1),
+                    TimeSpan.FromSeconds(1),
+                    true,
+                    60,
+                    VideoEncodingStrategy.SoftwareGdi),
+                "A negative trim start must be rejected.");
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => FfmpegArgumentBuilder.BuildTrimArguments(
+                    inputPath,
+                    outputPath,
+                    TimeSpan.Zero,
+                    TimeSpan.Zero,
+                    true,
+                    60,
+                    VideoEncodingStrategy.SoftwareGdi),
+                "A zero trim duration must be rejected.");
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => FfmpegArgumentBuilder.BuildTrimArguments(
+                    inputPath,
+                    outputPath,
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(1),
+                    true,
+                    0,
+                    VideoEncodingStrategy.SoftwareGdi),
+                "An invalid trim frame rate must be rejected.");
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = previousCulture;
+            CultureInfo.CurrentUICulture = previousUiCulture;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestTrimRangeAndNamingAsync()
+    {
+        Assert.True(
+            ClipTrimService.TryNormalizeRange(
+                TimeSpan.FromMilliseconds(1011),
+                TimeSpan.FromMilliseconds(6234),
+                TimeSpan.FromSeconds(10),
+                60,
+                out var range,
+                out var rangeError),
+            $"A valid non-keyframe-aligned trim range was rejected: {rangeError}");
+        Assert.Equal(61L, range.StartFrame, "The trim start was not snapped to the nearest source frame.");
+        Assert.Equal(374L, range.EndFrame, "The trim end was not snapped to the nearest source frame.");
+        Assert.Equal(313L, range.EndFrame - range.StartFrame, "The normalized frame interval is incorrect.");
+        Assert.True(
+            Math.Abs(range.Start.TotalSeconds - 61d / 60) < 0.000001 &&
+            Math.Abs(range.End.TotalSeconds - 374d / 60) < 0.000001,
+            "Normalized timestamps do not match their source-frame indices.");
+
+        Assert.True(
+            ClipTrimService.TryNormalizeRange(
+                TimeSpan.FromSeconds(-5),
+                TimeSpan.FromSeconds(15),
+                TimeSpan.FromSeconds(10),
+                60,
+                out var clamped,
+                out _),
+            "A range overlapping the complete source should clamp safely.");
+        Assert.Equal(0L, clamped.StartFrame, "A negative requested start did not clamp to frame zero.");
+        Assert.Equal(600L, clamped.EndFrame, "An oversized requested end did not clamp to the source end.");
+
+        Assert.True(
+            ClipTrimService.TryNormalizeRange(
+                TimeSpan.FromSeconds(9.999),
+                TimeSpan.FromSeconds(10),
+                TimeSpan.FromSeconds(10),
+                60,
+                out var lastFrame,
+                out _),
+            "The final source frame should remain trimmable.");
+        Assert.Equal(599L, lastFrame.StartFrame, "The last-frame selection began at the wrong frame.");
+        Assert.Equal(600L, lastFrame.EndFrame, "The last-frame selection ended at the wrong frame.");
+
+        Assert.True(
+            !ClipTrimService.TryNormalizeRange(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(10),
+                60,
+                out _,
+                out _),
+            "An empty trim range must be rejected.");
+        Assert.True(
+            !ClipTrimService.TryNormalizeRange(
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.Zero,
+                60,
+                out _,
+                out _),
+            "A source with no duration must be rejected.");
+        foreach (var invalidFrameRate in new[] { double.NaN, double.PositiveInfinity, 0, -1, 241 })
+        {
+            Assert.True(
+                !ClipTrimService.TryNormalizeRange(
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(10),
+                    invalidFrameRate,
+                    out _,
+                    out _),
+                $"An invalid source frame rate was accepted: {invalidFrameRate}");
+        }
+
+        var timestamp = new DateTime(2026, 7, 13, 14, 30, 45, DateTimeKind.Local);
+        Assert.Equal(
+            "Clip_2026-07-13_14-30-45_trimmed.mp4",
+            ClipTrimService.BuildTrimmedFileName(timestamp, 1),
+            "The first trimmed output name is not stable.");
+        Assert.Equal(
+            "Clip_2026-07-13_14-30-45_trimmed_2.mp4",
+            ClipTrimService.BuildTrimmedFileName(timestamp, 2),
+            "Trimmed collision suffixes are not stable.");
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => ClipTrimService.BuildTrimmedFileName(timestamp, 0),
+            "A non-positive trimmed suffix must be rejected.");
+
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            var firstName = ClipTrimService.BuildTrimmedFileName(timestamp, 1);
+            var existingPath = Path.Combine(testDirectory, firstName);
+            File.WriteAllBytes(existingPath, [9, 9, 9]);
+            var stagingPath = Path.Combine(
+                testDirectory,
+                $".clipforge-trim-{Guid.NewGuid():N}.partial.mp4");
+            File.WriteAllBytes(stagingPath, [1, 2, 3, 4]);
+
+            var committedPath = ClipTrimService.CommitStagingFile(
+                testDirectory,
+                stagingPath,
+                timestamp);
+            Assert.Equal(
+                Path.Combine(testDirectory, ClipTrimService.BuildTrimmedFileName(timestamp, 2)),
+                committedPath,
+                "A collision did not reserve the next non-overwriting trimmed name.");
+            Assert.SequenceEqual(new byte[] { 9, 9, 9 }, File.ReadAllBytes(existingPath),
+                "Committing a trim overwrote an existing output.");
+            Assert.True(committedPath is not null && File.Exists(committedPath),
+                "The unique trimmed output was not committed.");
+            Assert.SequenceEqual(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(committedPath!),
+                "The committed output does not contain the staged media.");
+            Assert.True(!File.Exists(stagingPath), "Atomic trim commit left the staging path behind.");
+            Assert.True(
+                ClipLibraryService.TryClassifyClipFileName(
+                    Path.GetFileName(committedPath),
+                    out var committedKind) && committedKind == ClipKind.Trimmed,
+                "A committed trim name is not discoverable as Trimmed.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+
+        return Task.CompletedTask;
+    }
+
     private static Task TestConfiguredFfmpegDiscoveryAsync()
     {
         var testDirectory = CreateTestDirectory();
@@ -1151,6 +1420,299 @@ internal static class Program
             DeleteTestDirectory(testDirectory);
         }
     }
+
+    private static async Task TestClipClassificationAndFilteringAsync()
+    {
+        (string FileName, ClipKind Kind)[] validNames =
+        [
+            ("Clip_2026-07-13_12-34-56.mp4", ClipKind.Original),
+            ("Clip_2026-07-13_12-34-56_2.mp4", ClipKind.Original),
+            ("Clip_2026-07-13_12-34-56_trimmed.mp4", ClipKind.Trimmed),
+            ("Clip_2026-07-13_12-34-56_trimmed_2.mp4", ClipKind.Trimmed),
+            ("Clip_2026-07-13_12-34-56_2_trimmed.mp4", ClipKind.Trimmed),
+            ("Clip_2026-07-13_12-34-56_2_trimmed_3.MP4", ClipKind.Trimmed)
+        ];
+        foreach (var (fileName, expectedKind) in validNames)
+        {
+            Assert.True(
+                ClipLibraryService.TryClassifyClipFileName(fileName, out var actualKind),
+                $"A generated clip name was rejected: {fileName}");
+            Assert.Equal(expectedKind, actualKind, $"Clip kind was misclassified for {fileName}");
+        }
+
+        string?[] invalidNames =
+        [
+            null,
+            string.Empty,
+            " Clip_2026-07-13_12-34-56.mp4",
+            "Nested\\Clip_2026-07-13_12-34-56.mp4",
+            "Clip_2026-02-30_12-34-56.mp4",
+            "Clip_0000-07-13_12-34-56.mp4",
+            "Clip_٢٠٢٦-07-13_12-34-56.mp4",
+            "Clip_2026-07-13_12-34-56_0.mp4",
+            "Clip_2026-07-13_12-34-56_01.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed_.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed_0.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed_01.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed_2_3.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed.partial.mp4",
+            "Clip_2026-07-13_12-34-56_trimmed.mp4.exe",
+            "Clip_2026-07-13_12-34-56_edited.mp4",
+            ".Clip_2026-07-13_12-34-56_trimmed.partial.mp4"
+        ];
+        foreach (var fileName in invalidNames)
+        {
+            Assert.True(
+                !ClipLibraryService.TryClassifyClipFileName(fileName, out _),
+                $"An unowned or partial file name was accepted: {fileName ?? "<null>"}");
+        }
+
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffmpegPath = Path.Combine(toolsDirectory, "ffmpeg.exe");
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+
+            var trimmedPath = Path.Combine(clipsDirectory, "Clip_2026-07-12_12-00-00_trimmed.mp4");
+            await File.WriteAllBytesAsync(trimmedPath, [1, 2, 3]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(trimmedPath, new DateTime(2026, 7, 12, 12, 0, 0, DateTimeKind.Utc));
+            for (var index = 0; index < 25; index++)
+            {
+                var originalPath = Path.Combine(
+                    clipsDirectory,
+                    $"Clip_2026-07-13_12-00-{index:00}.mp4");
+                await File.WriteAllBytesAsync(originalPath, [(byte)(index + 1)]).ConfigureAwait(false);
+                File.SetLastWriteTimeUtc(
+                    originalPath,
+                    new DateTime(2026, 7, 13, 12, index, 0, DateTimeKind.Utc));
+            }
+
+            var runner = new FakeClipMediaProcessRunner();
+            var service = new ClipLibraryService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                runner,
+                Path.Combine(testDirectory, "Cache"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+
+            var trimmed = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 1,
+                    includeThumbnails: false,
+                    filter: ClipLibraryFilter.Trimmed)
+                .ConfigureAwait(false);
+            Assert.Equal(1, trimmed.Count,
+                "A trimmed clip older than more than the probe budget of originals was starved.");
+            Assert.Equal(ClipKind.Trimmed, trimmed[0].Kind,
+                "The Trimmed filter returned a normal clip.");
+            Assert.Equal(Path.GetFileName(trimmedPath), trimmed[0].FileName,
+                "The filtered Library returned the wrong trimmed clip.");
+            Assert.Equal(1, runner.Invocations.Count,
+                "Filtering must happen before probes, not after probing newer originals.");
+            Assert.Equal(trimmedPath, runner.Invocations[0].Arguments[^1],
+                "The Trimmed filter probed an item from another category.");
+
+            var originals = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 2,
+                    includeThumbnails: false,
+                    filter: ClipLibraryFilter.Original)
+                .ConfigureAwait(false);
+            Assert.Equal(2, originals.Count, "The Original filter returned the wrong count.");
+            Assert.True(originals.All(clip => clip.Kind == ClipKind.Original),
+                "The Original filter included a trimmed clip.");
+            Assert.True(originals[0].RecordedAtUtc >= originals[1].RecordedAtUtc,
+                "Filtered results are not ordered newest first.");
+
+            var all = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 30,
+                    includeThumbnails: false,
+                    filter: ClipLibraryFilter.All)
+                .ConfigureAwait(false);
+            Assert.Equal(26, all.Count, "The All filter did not return both clip kinds.");
+            Assert.True(all.Any(clip => clip.Kind == ClipKind.Trimmed),
+                "The All filter omitted trimmed clips.");
+            Assert.True(all.Any(clip => clip.Kind == ClipKind.Original),
+                "The All filter omitted normal clips.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestClipTrimServiceAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffmpegPath = Path.Combine(toolsDirectory, "ffmpeg.exe");
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+
+            var sourcePath = Path.Combine(clipsDirectory, "Clip_2026-07-13_15-00-00.mp4");
+            await File.WriteAllBytesAsync(sourcePath, [1, 2, 3, 4, 5, 6, 7, 8]).ConfigureAwait(false);
+            var sourceInfo = new FileInfo(sourcePath);
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(sourcePath, out var sourceIdentity),
+                "The trim source did not receive a stable Windows identity.");
+            var source = new ClipLibraryItem(
+                sourceInfo.Name,
+                sourceInfo.FullName,
+                new DateTimeOffset(DateTime.SpecifyKind(sourceInfo.LastWriteTimeUtc, DateTimeKind.Utc)),
+                sourceInfo.Length,
+                TimeSpan.FromSeconds(10))
+            {
+                FileIdentity = sourceIdentity,
+                Kind = ClipKind.Original
+            };
+
+            var successRunner = new FakeTrimMediaProcessRunner();
+            var successService = new ClipTrimService(() => ffmpegPath, () => ffprobePath, successRunner);
+            var success = await successService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromMilliseconds(1011),
+                    TimeSpan.FromMilliseconds(6234))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.Succeeded, success.Status,
+                $"A valid transactional trim failed: {success.Message}");
+            Assert.True(success.Succeeded && success.OutputPath is not null && File.Exists(success.OutputPath),
+                "A successful trim did not return an existing output.");
+            Assert.True(File.Exists(sourcePath), "A successful trim modified or deleted its source.");
+            Assert.SequenceEqual(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }, File.ReadAllBytes(sourcePath),
+                "A successful trim changed the source bytes.");
+            Assert.True(
+                ClipLibraryService.TryClassifyClipFileName(
+                    Path.GetFileName(success.OutputPath),
+                    out var successfulKind) && successfulKind == ClipKind.Trimmed,
+                "The successful trim did not use a strict Trimmed filename.");
+            Assert.Equal(1, successRunner.TrimRunCount,
+                "A software trim should launch exactly one export after hardware probes fail.");
+            Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
+                "A successful trim left a partial output behind.");
+
+            var trimRunsBeforeInvalidRange = successRunner.TrimRunCount;
+            var invalidRange = await successService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(5),
+                    TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.InvalidRange, invalidRange.Status,
+                "An empty selection did not return InvalidRange.");
+            Assert.True(!invalidRange.Succeeded && invalidRange.OutputPath is null,
+                "An invalid range returned a successful output.");
+            Assert.Equal(trimRunsBeforeInvalidRange, successRunner.TrimRunCount,
+                "An invalid range launched the trim encoder.");
+
+            var failedRunner = new FakeTrimMediaProcessRunner { FailTrim = true };
+            var failedService = new ClipTrimService(() => ffmpegPath, () => ffprobePath, failedRunner);
+            var failed = await failedService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(3))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.EncodingFailed, failed.Status,
+                "A non-zero FFmpeg result did not return EncodingFailed.");
+            Assert.True(File.Exists(sourcePath), "An encoding failure removed the original.");
+            Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
+                "An encoding failure left its owned partial behind.");
+
+            var invalidOutputRunner = new FakeTrimMediaProcessRunner { ReturnInvalidOutputMetadata = true };
+            var invalidOutputService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                invalidOutputRunner);
+            var invalidOutput = await invalidOutputService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(4))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.OutputValidationFailed, invalidOutput.Status,
+                "A wrong-duration output passed post-encode validation.");
+            Assert.True(File.Exists(sourcePath), "Output validation failure removed the original.");
+            Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
+                "Output validation failure left its owned partial behind.");
+
+            var cancellationRunner = new FakeTrimMediaProcessRunner { WaitForTrimCancellation = true };
+            var cancellationService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                cancellationRunner);
+            using (var cancellation = new CancellationTokenSource())
+            {
+                var trimTask = cancellationService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(4),
+                    cancellation.Token);
+                await cancellationRunner.TrimStarted.Task
+                    .WaitAsync(TimeSpan.FromSeconds(10))
+                    .ConfigureAwait(false);
+                cancellation.Cancel();
+                var cancelled = await trimTask.ConfigureAwait(false);
+                Assert.Equal(ClipTrimStatus.Cancelled, cancelled.Status,
+                    "A cancelled export did not return Cancelled.");
+                Assert.True(!cancelled.Succeeded && cancelled.OutputPath is null,
+                    "A cancelled export returned an output path.");
+            }
+
+            Assert.True(File.Exists(sourcePath), "Cancellation removed the original.");
+            Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
+                "Cancellation left its owned partial behind.");
+
+            var preservedTimestamp = sourceInfo.LastWriteTimeUtc;
+            File.Delete(sourcePath);
+            await File.WriteAllBytesAsync(sourcePath, [8, 7, 6, 5, 4, 3, 2, 1]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(sourcePath, preservedTimestamp);
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(sourcePath, out var replacementIdentity) &&
+                replacementIdentity != sourceIdentity,
+                "The same-size replacement did not receive a new file identity.");
+            var staleRunner = new FakeTrimMediaProcessRunner();
+            var staleService = new ClipTrimService(() => ffmpegPath, () => ffprobePath, staleRunner);
+            var stale = await staleService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.SourceChangedOrUnsafe, stale.Status,
+                "A same-size, same-time source replacement was not rejected.");
+            Assert.Equal(0, staleRunner.Invocations.Count,
+                "A stale source launched a media helper before identity rejection.");
+            Assert.True(File.Exists(sourcePath), "The replacement source was deleted after rejection.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static IEnumerable<string> EnumerateTrimPartials(string clipsDirectory) =>
+        Directory.Exists(clipsDirectory)
+            ? Directory.EnumerateFiles(
+                clipsDirectory,
+                ".clipforge-trim-*.partial.mp4",
+                SearchOption.TopDirectoryOnly)
+            : [];
 
     private static Task TestClipLibrarySecurityPolicyAsync()
     {
@@ -1937,6 +2499,86 @@ internal static class Program
         }
     }
 
+    private sealed class FakeTrimMediaProcessRunner : IClipMediaProcessRunner
+    {
+        private double _lastTrimDurationSeconds = 1;
+
+        public List<Invocation> Invocations { get; } = [];
+
+        public TaskCompletionSource TrimStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool FailTrim { get; init; }
+
+        public bool ReturnInvalidOutputMetadata { get; init; }
+
+        public bool WaitForTrimCancellation { get; init; }
+
+        public int TrimRunCount { get; private set; }
+
+        public async Task<ClipMediaProcessResult> RunAsync(
+            string executablePath,
+            IReadOnlyList<string> arguments,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Invocations.Add(new Invocation(executablePath, arguments.ToArray(), timeout));
+            if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                var mediaPath = arguments[^1];
+                var isTrimPartial = Path.GetFileName(mediaPath).StartsWith(
+                    ".clipforge-trim-",
+                    StringComparison.OrdinalIgnoreCase);
+                var duration = isTrimPartial
+                    ? ReturnInvalidOutputMetadata ? 99 : _lastTrimDurationSeconds
+                    : 10;
+                var durationText = duration.ToString("0.######", CultureInfo.InvariantCulture);
+                var output =
+                    $"{{\"streams\":[{{\"codec_type\":\"video\",\"width\":1280,\"height\":720," +
+                    $"\"avg_frame_rate\":\"60/1\",\"r_frame_rate\":\"60/1\",\"duration\":\"{durationText}\"}}," +
+                    $"{{\"codec_type\":\"audio\",\"duration\":\"{durationText}\"}}]," +
+                    $"\"format\":{{\"duration\":\"{durationText}\"}}}}";
+                return new ClipMediaProcessResult(0, output, string.Empty, false);
+            }
+
+            var outputPath = arguments[^1];
+            if (!Path.GetFileName(outputPath).StartsWith(
+                    ".clipforge-trim-",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                // Hardware encoder probes deliberately fail so the deterministic
+                // service test exercises the bounded software fallback.
+                return new ClipMediaProcessResult(1, string.Empty, "probe unavailable", false);
+            }
+
+            TrimRunCount++;
+            var durationArgument = GetArgumentAfter(arguments, "-t")
+                ?? throw new InvalidOperationException("The trim invocation omitted its duration.");
+            _lastTrimDurationSeconds = double.Parse(durationArgument, CultureInfo.InvariantCulture);
+            await File.WriteAllBytesAsync(
+                    outputPath,
+                    [0, 0, 0, 24, (byte)'f', (byte)'t', (byte)'y', (byte)'p'],
+                    cancellationToken)
+                .ConfigureAwait(false);
+            TrimStarted.TrySetResult();
+
+            if (WaitForTrimCancellation)
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            }
+
+            return FailTrim
+                ? new ClipMediaProcessResult(1, string.Empty, "scripted encoding failure", false)
+                : new ClipMediaProcessResult(0, string.Empty, string.Empty, false);
+        }
+
+        public sealed record Invocation(
+            string ExecutablePath,
+            IReadOnlyList<string> Arguments,
+            TimeSpan Timeout);
+    }
+
     private sealed class FakeClipMediaProcessRunner : IClipMediaProcessRunner
     {
         public List<Invocation> Invocations { get; } = [];
@@ -2048,6 +2690,21 @@ internal static class Program
 
             throw new InvalidOperationException(
                 $"Expected contiguous sequence was not found: {string.Join(", ", expected)}.");
+        }
+
+        public static void Throws<TException>(Action action, string message)
+            where TException : Exception
+        {
+            try
+            {
+                action();
+            }
+            catch (TException)
+            {
+                return;
+            }
+
+            throw new InvalidOperationException(message);
         }
     }
 }

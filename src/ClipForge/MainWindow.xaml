@@ -533,6 +533,11 @@
                                 <Button x:Name="RefreshLibraryButton" Width="40" Height="40" Margin="0,0,6,0" Padding="0"
                                         Content="↻" Click="RefreshLibraryButton_Click" Style="{StaticResource QuietButtonStyle}"
                                         ToolTip="Refresh clips" />
+                                <Button x:Name="TrimCurrentClipButton" Height="40" Margin="0,0,6,0" Padding="13,7"
+                                        Content="Trim" Click="TrimCurrentClipButton_Click" IsEnabled="False"
+                                        Style="{StaticResource QuietButtonStyle}"
+                                        ToolTip="Trim this clip in the library"
+                                        AutomationProperties.Name="Trim latest clip" />
                                 <Button x:Name="OpenCurrentClipButton" Height="40" Content="Open file"
                                         Click="OpenCurrentClipButton_Click" IsEnabled="False" Style="{StaticResource QuietButtonStyle}" />
                             </StackPanel>
@@ -717,6 +722,21 @@
                                                     Background="#B20B0D12" BorderBrush="#55FFFFFF" BorderThickness="1" CornerRadius="15">
                                                 <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" Margin="2,0,0,0"
                                                            FontSize="12" Foreground="White" Text="▶" />
+                                            </Border>
+                                            <Border Margin="8" Padding="7,3" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                    Background="{DynamicResource AccentSoftBrush}" CornerRadius="6">
+                                                <Border.Style>
+                                                    <Style TargetType="{x:Type Border}">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsTrimmed}" Value="True">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <TextBlock FontSize="9" FontWeight="SemiBold"
+                                                           Foreground="{DynamicResource AccentHoverBrush}" Text="TRIMMED" />
                                             </Border>
                                         </Grid>
                                     </Button>

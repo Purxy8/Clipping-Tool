@@ -34,7 +34,7 @@ public sealed class ClipLibraryService
     private const uint FileNameNormalized = 0;
     private const int MaximumFinalPathCharacters = 32_768;
     private static readonly Regex ClipForgeFileNamePattern = new(
-        @"\AClip_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.mp4\z",
+        @"\AClip_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}(?:_[1-9][0-9]*)?(?<trimmed>_trimmed(?:_[1-9][0-9]*)?)?\.mp4\z",
         RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
     private static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan DefaultThumbnailTimeout = TimeSpan.FromSeconds(15);
@@ -131,14 +131,40 @@ public sealed class ClipLibraryService
         bool includeThumbnails = true,
         CancellationToken cancellationToken = default)
     {
+        return await GetRecentClipsAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                ClipLibraryFilter.All,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Returns safely discovered clips matching <paramref name="filter"/>. Filtering is applied
+    /// before the discovery/probe budget and requested count, so one category cannot starve the
+    /// other when the folder contains more than the bounded library view.
+    /// </summary>
+    public async Task<IReadOnlyList<ClipLibraryItem>> GetRecentClipsAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipLibraryFilter filter,
+        CancellationToken cancellationToken = default)
+    {
         if (count is < 1 or > MaximumClipCount)
         {
             throw new ArgumentOutOfRangeException(nameof(count), $"Clip count must be between 1 and {MaximumClipCount}.");
         }
 
+        if (!Enum.IsDefined(filter))
+        {
+            throw new ArgumentOutOfRangeException(nameof(filter));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         var discovery = await Task.Run(
-                () => DiscoverSafeCandidates(saveDirectory, cancellationToken),
+                () => DiscoverSafeCandidates(saveDirectory, filter, cancellationToken),
                 cancellationToken)
             .ConfigureAwait(false);
         if (discovery is null || discovery.Candidates.Count == 0)
@@ -214,7 +240,8 @@ public sealed class ClipLibraryService
                 candidate.Length,
                 probe.Duration)
             {
-                FileIdentity = identity
+                FileIdentity = identity,
+                Kind = candidate.Kind
             });
 
             if (clips.Count == count)
@@ -356,6 +383,23 @@ public sealed class ClipLibraryService
                 saveDirectory,
                 count,
                 includeThumbnails,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return clips.Count == 0 ? ClipLibrarySnapshot.Empty : new ClipLibrarySnapshot(clips);
+    }
+
+    public async Task<ClipLibrarySnapshot> LoadAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipLibraryFilter filter,
+        CancellationToken cancellationToken = default)
+    {
+        var clips = await GetRecentClipsAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                filter,
                 cancellationToken)
             .ConfigureAwait(false);
         return clips.Count == 0 ? ClipLibrarySnapshot.Empty : new ClipLibrarySnapshot(clips);
@@ -661,7 +705,7 @@ public sealed class ClipLibraryService
         if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
             !Path.IsPathFullyQualified(rootDirectory) ||
             !Path.IsPathFullyQualified(candidatePath) ||
-            !ClipForgeFileNamePattern.IsMatch(Path.GetFileName(candidatePath)))
+            !TryClassifyClipFileName(Path.GetFileName(candidatePath), out _))
         {
             return false;
         }
@@ -688,6 +732,35 @@ public sealed class ClipLibraryService
         {
             return false;
         }
+    }
+
+    internal static bool TryClassifyClipFileName(string? fileName, out ClipKind kind)
+    {
+        kind = ClipKind.Original;
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        var match = ClipForgeFileNamePattern.Match(fileName);
+        const int timestampStart = 5;
+        const int timestampLength = 19;
+        if (!match.Success ||
+            fileName.Length < timestampStart + timestampLength ||
+            !DateTime.TryParseExact(
+                fileName.AsSpan(timestampStart, timestampLength),
+                "yyyy-MM-dd_HH-mm-ss",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out _))
+        {
+            return false;
+        }
+
+        kind = match.Groups["trimmed"].Success
+            ? ClipKind.Trimmed
+            : ClipKind.Original;
+        return true;
     }
 
     internal static IReadOnlyList<string> BuildProbeArguments(string clipPath) =>
@@ -835,6 +908,7 @@ public sealed class ClipLibraryService
 
     private static DiscoveryResult? DiscoverSafeCandidates(
         string saveDirectory,
+        ClipLibraryFilter filter,
         CancellationToken cancellationToken)
     {
         var rootDirectory = TryGetSafeRootDirectory(saveDirectory);
@@ -849,7 +923,8 @@ public sealed class ClipLibraryService
             foreach (var path in Directory.EnumerateFiles(rootDirectory, "*", SearchOption.TopDirectoryOnly))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!TryGetCurrentCandidate(rootDirectory, path, out var candidate))
+                if (!TryGetCurrentCandidate(rootDirectory, path, out var candidate) ||
+                    !MatchesFilter(candidate.Kind, filter))
                 {
                     continue;
                 }
@@ -888,7 +963,8 @@ public sealed class ClipLibraryService
             var info = new FileInfo(fullPath);
             if (!info.Exists ||
                 info.Length <= 0 ||
-                !IsSafeTopLevelClipPath(rootDirectory, fullPath, info.Attributes))
+                !IsSafeTopLevelClipPath(rootDirectory, fullPath, info.Attributes) ||
+                !TryClassifyClipFileName(info.Name, out var kind))
             {
                 return false;
             }
@@ -897,7 +973,8 @@ public sealed class ClipLibraryService
                 info.Name,
                 fullPath,
                 info.Length,
-                DateTime.SpecifyKind(info.LastWriteTimeUtc, DateTimeKind.Utc));
+                DateTime.SpecifyKind(info.LastWriteTimeUtc, DateTimeKind.Utc),
+                kind);
             return true;
         }
         catch (Exception exception) when (IsExpectedFileException(exception))
@@ -906,10 +983,19 @@ public sealed class ClipLibraryService
         }
     }
 
+    private static bool MatchesFilter(ClipKind kind, ClipLibraryFilter filter) => filter switch
+    {
+        ClipLibraryFilter.All => true,
+        ClipLibraryFilter.Original => kind == ClipKind.Original,
+        ClipLibraryFilter.Trimmed => kind == ClipKind.Trimmed,
+        _ => false
+    };
+
     private static bool CandidateMatchesClip(ClipCandidate candidate, ClipLibraryItem clip) =>
         candidate.FileName.Equals(clip.FileName, StringComparison.Ordinal) &&
         candidate.Length == clip.FileSizeBytes &&
-        candidate.LastWriteTimeUtc == clip.RecordedAtUtc.UtcDateTime;
+        candidate.LastWriteTimeUtc == clip.RecordedAtUtc.UtcDateTime &&
+        candidate.Kind == clip.Kind;
 
     private static bool TryGetMatchingCurrentCandidate(
         string rootDirectory,
@@ -929,48 +1015,12 @@ public sealed class ClipLibraryService
         string rootDirectory,
         ClipLibraryItem clip)
     {
-        if (!OperatingSystem.IsWindows() ||
-            clip.FileIdentity is not { } identity ||
-            !HasUsableFileId(identity))
-        {
-            return null;
-        }
-
-        SafeFileHandle? rootHandle = null;
-        SafeFileHandle? clipHandle = null;
+        PinnedClipReadContext? clipContext = null;
         SafeFileHandle? cacheDirectoryHandle = null;
         try
         {
-            var fullPath = Path.GetFullPath(clip.FullPath);
-            if (!Path.GetFileName(fullPath).Equals(clip.FileName, StringComparison.Ordinal) ||
-                !IsSafeTopLevelClipPath(rootDirectory, fullPath, FileAttributes.Normal))
-            {
-                return null;
-            }
-
-            rootHandle = CreateFileW(
-                rootDirectory,
-                GenericRead,
-                FileShare.Read | FileShare.Write,
-                IntPtr.Zero,
-                OpenExisting,
-                FileFlagOpenReparsePoint | FileFlagBackupSemantics,
-                IntPtr.Zero);
-            if (!TryValidateDirectoryHandle(rootHandle))
-            {
-                return null;
-            }
-
-            clipHandle = CreateFileW(
-                fullPath,
-                GenericRead,
-                FileShare.Read,
-                IntPtr.Zero,
-                OpenExisting,
-                FileFlagOpenReparsePoint,
-                IntPtr.Zero);
-            if (!TryValidateOpenClipHandle(clipHandle, clip, requireSingleLink: false) ||
-                !TryValidateDirectChildHandle(rootHandle, clipHandle, out var mediaPath))
+            clipContext = TryOpenPinnedClipReadContextCore(rootDirectory, clip);
+            if (clipContext is null)
             {
                 return null;
             }
@@ -990,13 +1040,10 @@ public sealed class ClipLibraryService
             }
 
             var pinnedContext = new PinnedThumbnailContext(
-                rootHandle,
-                clipHandle,
+                clipContext,
                 cacheDirectoryHandle,
-                mediaPath,
                 cacheDirectoryPath);
-            rootHandle = null;
-            clipHandle = null;
+            clipContext = null;
             cacheDirectoryHandle = null;
             return pinnedContext;
         }
@@ -1007,9 +1054,147 @@ public sealed class ClipLibraryService
         finally
         {
             cacheDirectoryHandle?.Dispose();
+            clipContext?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Pins the exact discovered source and its direct, non-reparse save root. Keeping this context
+    /// alive denies source writes/renames/deletion and root replacement while an external decoder
+    /// reads the resolved path.
+    /// </summary>
+    internal static PinnedClipReadContext? TryOpenPinnedClipReadContext(
+        string saveDirectory,
+        ClipLibraryItem clip)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        var rootDirectory = TryGetSafeRootDirectory(saveDirectory);
+        return rootDirectory is null
+            ? null
+            : TryOpenPinnedClipReadContextCore(rootDirectory, clip);
+    }
+
+    private static PinnedClipReadContext? TryOpenPinnedClipReadContextCore(
+        string rootDirectory,
+        ClipLibraryItem clip)
+    {
+        if (!OperatingSystem.IsWindows() ||
+            clip.FileIdentity is not { } identity ||
+            !HasUsableFileId(identity))
+        {
+            return null;
+        }
+
+        SafeFileHandle? rootHandle = null;
+        SafeFileHandle? clipHandle = null;
+        try
+        {
+            var fullPath = Path.GetFullPath(clip.FullPath);
+            if (!Path.GetFileName(fullPath).Equals(clip.FileName, StringComparison.Ordinal) ||
+                !IsSafeTopLevelClipPath(rootDirectory, fullPath, FileAttributes.Normal) ||
+                !TryClassifyClipFileName(Path.GetFileName(fullPath), out var currentKind) ||
+                currentKind != clip.Kind)
+            {
+                return null;
+            }
+
+            rootHandle = CreateFileW(
+                rootDirectory,
+                GenericRead,
+                FileShare.Read | FileShare.Write,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagOpenReparsePoint | FileFlagBackupSemantics,
+                IntPtr.Zero);
+            if (!TryValidateDirectoryHandle(rootHandle) ||
+                TryGetFinalDosPath(rootHandle) is not { } resolvedRoot)
+            {
+                return null;
+            }
+
+            clipHandle = CreateFileW(
+                fullPath,
+                GenericRead,
+                FileShare.Read,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagOpenReparsePoint,
+                IntPtr.Zero);
+            if (!TryValidateOpenClipHandle(clipHandle, clip, requireSingleLink: false) ||
+                !TryValidateDirectChildHandle(rootHandle, clipHandle, out var mediaPath))
+            {
+                return null;
+            }
+
+            var context = new PinnedClipReadContext(
+                rootHandle,
+                clipHandle,
+                resolvedRoot,
+                mediaPath);
+            rootHandle = null;
+            clipHandle = null;
+            return context;
+        }
+        catch (Exception exception) when (IsExpectedFileException(exception))
+        {
+            return null;
+        }
+        finally
+        {
             clipHandle?.Dispose();
             rootHandle?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Validates a completed helper output as a regular, non-empty direct child of a root that is
+    /// still pinned by <paramref name="context"/>.
+    /// </summary>
+    internal static bool TryValidatePinnedDirectChildFile(
+        PinnedClipReadContext context,
+        string candidatePath,
+        out string resolvedPath,
+        out long length)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        resolvedPath = string.Empty;
+        length = 0;
+        if (string.IsNullOrWhiteSpace(candidatePath) || !Path.IsPathFullyQualified(candidatePath))
+        {
+            return false;
+        }
+
+        using var handle = CreateFileW(
+            candidatePath,
+            GenericRead,
+            FileShare.Read,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid ||
+            !GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileAttributeTagInfo,
+                out FileAttributeTagInformation attributes,
+                Marshal.SizeOf<FileAttributeTagInformation>()) ||
+            (attributes.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+            !GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileStandardInfo,
+                out FileStandardInformation standard,
+                Marshal.SizeOf<FileStandardInformation>()) ||
+            standard.Directory ||
+            standard.DeletePending ||
+            standard.EndOfFile <= 0 ||
+            !TryValidateDirectChildHandle(context.RootDirectoryHandle, handle, out resolvedPath))
+        {
+            resolvedPath = string.Empty;
+            return false;
+        }
+
+        length = standard.EndOfFile;
+        return true;
     }
 
     internal static bool HasUsableFileId(ClipFileIdentity identity) =>
@@ -1295,7 +1480,7 @@ public sealed class ClipLibraryService
         }
     }
 
-    private static string? GetSafeToolPath(string? path)
+    internal static string? GetSafeToolPath(string? path)
     {
         if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
         {
@@ -1471,7 +1656,8 @@ public sealed class ClipLibraryService
         string FileName,
         string FullPath,
         long Length,
-        DateTime LastWriteTimeUtc);
+        DateTime LastWriteTimeUtc,
+        ClipKind Kind = ClipKind.Original);
 
     private readonly record struct ProbeCacheKey(
         ClipFileIdentity FileIdentity,
@@ -1482,18 +1668,37 @@ public sealed class ClipLibraryService
         ProbeOutcome Outcome,
         long LastAccessOrder);
 
-    private sealed class PinnedThumbnailContext(
+    internal sealed class PinnedClipReadContext(
         SafeFileHandle rootDirectoryHandle,
         SafeFileHandle clipHandle,
-        SafeFileHandle cacheDirectoryHandle,
-        string mediaPath,
-        string cacheDirectoryPath) : IDisposable
+        string rootDirectoryPath,
+        string mediaPath) : IDisposable
     {
         private readonly SafeFileHandle _rootDirectoryHandle = rootDirectoryHandle;
         private readonly SafeFileHandle _clipHandle = clipHandle;
-        private readonly SafeFileHandle _cacheDirectoryHandle = cacheDirectoryHandle;
+
+        internal SafeFileHandle RootDirectoryHandle => _rootDirectoryHandle;
+
+        public string RootDirectoryPath { get; } = rootDirectoryPath;
 
         public string MediaPath { get; } = mediaPath;
+
+        public void Dispose()
+        {
+            _clipHandle.Dispose();
+            _rootDirectoryHandle.Dispose();
+        }
+    }
+
+    private sealed class PinnedThumbnailContext(
+        PinnedClipReadContext clipContext,
+        SafeFileHandle cacheDirectoryHandle,
+        string cacheDirectoryPath) : IDisposable
+    {
+        private readonly PinnedClipReadContext _clipContext = clipContext;
+        private readonly SafeFileHandle _cacheDirectoryHandle = cacheDirectoryHandle;
+
+        public string MediaPath => _clipContext.MediaPath;
 
         public string CacheDirectoryPath { get; } = cacheDirectoryPath;
 
@@ -1504,9 +1709,8 @@ public sealed class ClipLibraryService
 
         public void Dispose()
         {
-            _clipHandle.Dispose();
-            _rootDirectoryHandle.Dispose();
             _cacheDirectoryHandle.Dispose();
+            _clipContext.Dispose();
         }
     }
 

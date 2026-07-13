@@ -18,7 +18,8 @@ Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed u
 - A second launch reopens the existing ClipForge instance instead of competing for capture devices or global shortcuts.
 - Play, pause, restart, seek, skip backward/forward 10 seconds, mute, and adjust the volume of the latest saved clip without opening another application.
 - Browse 4, 8, 10, or 15 recent ClipForge-generated clips in an adaptive gallery that fills the available width, shows each file size, and scrolls larger sets horizontally.
-- Open the full in-app **Library** for up to the newest 100 validated recordings, scroll a virtualized list, select any clip, and use the same complete embedded playback controls without opening another player.
+- Open the full in-app **Library** for up to the newest 100 validated recordings, switch between **All**, **Normal**, and **Trimmed** views, scroll a virtualized list, select any clip, and use the same complete embedded playback controls without opening another player.
+- Trim a selected Library clip to an exact range with two timeline handles. ClipForge writes a separate local MP4, keeps the normal clip by default, and asks before deleting the identity-revalidated original.
 - Right-click a recent clip to reveal it in File Explorer or permanently delete it after confirmation.
 - Customize the app background, accent/buttons, or panels/controls from one compact Appearance selector. Unsafe custom colors are adjusted to preserve dark surfaces and readable button contrast.
 - Use a native black Windows title bar and restrained startup/save transitions that honor High Contrast, reduced-motion, and rendering-capability preferences.
@@ -81,7 +82,9 @@ For a managed or offline installation, place the exact pinned `ffmpeg.exe` and `
 
 The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. After the save succeeds, ClipForge can play a short confirmation sound and show a compact in-app confirmation; disable the sound at any time from **Feedback**. The player includes a timeline, elapsed/total time, play/pause, restart, 10-second skip controls, mute, and volume. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
 
-The gallery automatically loads only top-level files using ClipForge's generated `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` naming format. Other MP4 files in the save folder are left untouched and are not automatically decoded by the embedded player. Use the selector above the gallery to show 4, 8, 10, or 15 recent clips; the available clips fill the row, every card shows its size, and larger sets scroll horizontally. Select **Library** to browse up to the newest 100 validated recordings in a recycling list. Clicking any Library entry loads it into a large local player with play/pause, restart, timeline seeking, 10-second skips, mute, and volume. Right-clicking a Recent or Library item can reveal the revalidated file in Explorer or permanently delete that exact ClipForge recording after confirmation.
+The gallery automatically loads only top-level files using ClipForge's generated normal `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` and trimmed `Clip_YYYY-MM-DD_HH-mm-ss[_N]_trimmed[_N].mp4` forms. Other MP4 files in the save folder are left untouched and are not automatically decoded by the embedded player. Use the selector above the gallery to show 4, 8, 10, or 15 recent clips; the available clips fill the row, every card shows its size, and larger sets scroll horizontally. Select **Library** to browse up to the newest 100 validated recordings in a recycling list and filter the view to All, Normal, or Trimmed clips. Clicking any Library entry loads it into a large local player with play/pause, restart, timeline seeking, 10-second skips, mute, and volume. Right-clicking a Recent or Library item can reveal the revalidated file in Explorer or permanently delete that exact ClipForge recording after confirmation.
+
+To trim, stop Instant Replay, open a Library clip, enable the trim editor, and move its two handles to the first and last frame you want to keep. Trim export is disabled while replay is running so a second encoder cannot compete with the active capture process. ClipForge re-encodes the chosen range locally for frame-accurate boundaries, validates the completed MP4, and then adds it to the Library as a separate trimmed clip. The normal clip is kept by default. Only after a successful export does ClipForge ask whether to delete it; accepting that prompt still revalidates the exact original file identity before deletion.
 
 Select either shortcut in the left settings panel and press a new combination to change it. Each shortcut must contain at least one modifier and a non-modifier key, and Save Clip and Toggle Overlay must be different. If another application owns a chosen combination, ClipForge keeps the previous working registration and reports the conflict.
 
@@ -94,6 +97,8 @@ At replay startup, ClipForge runs short, real encoding probes instead of assumin
 The FFmpeg capture process runs at below-normal priority, and desktop/microphone PCM transfer is bounded and reuses pooled buffers so capture cannot grow an unlimited in-memory queue. Replay retention follows FFmpeg's sequential segment names incrementally instead of repeatedly enumerating and sorting the entire buffer, while media probes and thumbnail decoding also run below the foreground game's priority. Valid unchanged clip metadata is reused from a bounded file-identity cache, simultaneous Recent/Library requests coalesce to one probe per clip, and frozen thumbnail decodes use a bounded weak cache. Fixed-resolution GDI fallback scaling uses a lower-cost scaler, while Source/native remains unscaled. Hidden, inactive, and tray states cancel gallery/Library helpers, release embedded-player sources, keep at most one decoder active, and avoid rebuilding the full UI on background state ticks. Player position timers run only while their visible, active window is playing a clip. NVIDIA capture favors game headroom with the fast P2 preset, single-pass encoding, no lookahead, and no B-frames.
 
 These are conservative reductions in disk scans, allocation pressure, and background CPU contention; they do not change the captured format or promise zero lag. Hardware encoding generally reduces CPU pressure, but performance still depends on the GPU driver, resolution, frame rate, game, and other software. Windows Graphics Capture is most reliable with Borderless Fullscreen (Fullscreen Windowed); true Exclusive Fullscreen can bypass desktop composition and is not guaranteed to capture consistently. The release smoke test samples normalized FFmpeg CPU use, working set, and process priority while producing and validating a real six-second clip; that diagnostic is evidence for the test machine, not a guarantee of zero input latency on every PC. Test the intended games, especially at 1440p/2160p or 60 FPS, before relying on a configuration.
+
+Frame-accurate trimming is an explicit offline export and performs a second video encode in a below-normal-priority local FFmpeg process. Replay must be stopped before it can start. This prevents trim export from contending with live capture, but trimming can still use noticeable CPU, GPU, disk bandwidth, and temporary disk space and may take longer for high-resolution or long selections. It does not provide a zero-resource or instant export guarantee.
 
 ## Privacy and local data
 
@@ -111,7 +116,7 @@ Local data is kept in these locations:
 
 | Data | Location |
 | --- | --- |
-| Saved clips | The folder selected in the app; `%USERPROFILE%\Videos\ClipForge` by default |
+| Saved normal and trimmed clips | The folder selected in the app; `%USERPROFILE%\Videos\ClipForge` by default |
 | Settings | `%LOCALAPPDATA%\ClipForge\settings.json` |
 | Private FFmpeg install | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
 | Rolling replay segments | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture folder removed when replay stops normally |
@@ -141,8 +146,8 @@ Leave additional room for segment overhead and the MP4 being saved. Higher frame
 
 1. Choose **Exit ClipForge** from the notification-area menu so ClipForge and its FFmpeg process have stopped.
 2. Open **Windows Settings > Apps > Installed apps**, find **ClipForge**, open its menu, and select **Uninstall**. A portable development build has no registered uninstaller; delete the folder into which it was extracted instead.
-3. Uninstalling the application does not intentionally delete personal clips or the separate ClipForge data folder. To remove settings, the optional FFmpeg install, thumbnails, and any leftover replay buffer, delete `%LOCALAPPDATA%\ClipForge` after ClipForge has exited.
-4. To remove saved recordings, delete the clips folder selected in ClipForge. Its default is `%USERPROFILE%\Videos\ClipForge`. Check that folder before deleting it because it contains the user's recordings, not disposable application files.
+3. Uninstalling the application does not intentionally delete personal normal or trimmed clips or the separate ClipForge data folder. To remove settings, the optional FFmpeg install, thumbnails, and any leftover replay buffer, delete `%LOCALAPPDATA%\ClipForge` after ClipForge has exited.
+4. To remove saved recordings, trimmed exports, or a partial left by an abnormal machine shutdown, inspect and then delete the clips folder selected in ClipForge. Its default is `%USERPROFILE%\Videos\ClipForge`. Check that folder before deleting it because it contains the user's recordings, not disposable application files.
 
 Removing `%LOCALAPPDATA%\ClipForge` resets ClipForge, including the selected background color, if it is installed again. A cloud-sync provider may retain its own copies or deleted-file history when the selected clips folder is synchronized; consult that provider for complete removal.
 
@@ -198,7 +203,8 @@ ClipForge is preparing an application to the SignPath Foundation open-source pro
 - Capture uses direct or compatibility-transfer Windows Graphics Capture when runtime verification succeeds, otherwise GDI desktop capture. None is a game-specific hook; windowed and borderless games are the intended target, and exclusive-fullscreen games may not be captured reliably.
 - HDR/10-bit capture and tone mapping are not implemented. Output is SDR H.264 (`yuv420p`) with AAC audio.
 - Hardware H.264 is used only after a successful runtime probe. Unsupported encoders or drivers fall back automatically; software encoding can be expensive at high resolution or frame rate.
-- One display is captured at a time. There is no window/region picker, clip editor, or automatic upload.
+- One display is captured at a time. There is no window/region picker, multi-track editor, transitions/effects editor, or automatic upload; the Library editor is intentionally limited to frame-accurate start/end trimming.
+- Trimming requires Instant Replay to be stopped, creates a separately encoded MP4, and can take noticeable time and resources for long or high-resolution selections.
 - Desktop and microphone audio are mixed into one stereo track. Per-application audio and separate editable tracks are not available.
 - Protected/DRM video and some overlays may appear blank.
 
