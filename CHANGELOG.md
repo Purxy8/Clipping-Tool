@@ -4,6 +4,35 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.6.0-beta.1] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- A new **Library** window opens from Recent clips and shows up to the newest 100 validated local ClipForge recordings in a recycling, scrollable list. Selecting a clip keeps playback inside ClipForge with play/pause, restart, seeking, 10-second skips, mute, volume, file reveal, and guarded permanent deletion.
+
+### Fixed
+
+- Appearance colors now update the resource dictionary that actually owns the theme values instead of creating an ineffective root shadow. Existing shared brushes repaint in place, so **App background** changes the full canvas and **Panels & controls** changes the Capture settings sidebar, cards, controls, menus, Library, and overlay immediately without a restart.
+- The Library explicitly primes WPF's manual media graph while muted, then pauses or continues according to the requested playback state. This prevents a selected clip from remaining on a blank disabled player while waiting indefinitely for `MediaOpened`.
+
+### Performance
+
+- Valid clip metadata is cached in a bounded 512-entry cache keyed by stable Windows file identity, size, and last-write time. Concurrent Recent clips and Library loads share one low-priority probe, unchanged refreshes launch no additional `ffprobe` process, and a changed file is revalidated before a new result is cached.
+- Decoded, frozen thumbnail bitmaps use a bounded 128-key weak cache, avoiding repeated JPEG decoding and file locks without retaining image memory under pressure.
+- Library and main-window players keep at most one decoder active. Hiding, deactivating, or closing either surface cancels helper work, stops its timer, closes the media graph, and restores the selected position paused only when the window becomes active again.
+- Replay state ticks rebuild the full main UI only while the window is both visible and active; a background/full-screen game receives only deduplicated tray and visible-overlay state updates.
+
+### Verification note
+
+- The Release app and capture-smoke projects build with zero warnings and zero errors, formatting is clean, and the deterministic suite passes 32/32 tests. A real local MP4 was selected and played inside the Library with working pause, seeking, skip, mute, volume, and timeline controls.
+- Hardware Windows Graphics Capture plus NVIDIA NVENC smoke runs at 720p and Source both produced 355 frames over 6.015 seconds at 59.226 average FPS with desktop audio and microphone. A forced 720p GDI fallback produced the same frame count and average FPS; measured normalized FFmpeg CPU was 0.1% on the hardware path and 1.7% on the fallback path on the development PC.
+- With the app inactive after Library playback, the five-second sample measured 0.000% normalized ClipForge CPU and no lingering FFmpeg/FFprobe helper process. The current NuGet vulnerability audit reports no known vulnerable direct or transitive packages. These measurements validate the tested PC and cannot guarantee zero latency on every game, GPU, driver, or fullscreen mode.
+
 ## [1.5.0-beta.1] - 2026-07-13
 
 ### Release status

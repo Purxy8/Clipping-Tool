@@ -23,6 +23,7 @@ public sealed class ClipLibraryService
     private const int MaximumDiscoveryCandidates = 4096;
     private const int MinimumProbeCandidates = 20;
     private const int ProbeCandidatesPerRequestedClip = 4;
+    private const int MaximumProbeCacheEntries = 512;
     private const long MaximumThumbnailBytes = 16 * 1024 * 1024;
     private const uint GenericRead = 0x80000000;
     private const uint DeleteAccess = 0x00010000;
@@ -43,10 +44,14 @@ public sealed class ClipLibraryService
     private readonly Func<string?> _findFfmpeg;
     private readonly Func<string?> _findFfprobe;
     private readonly IClipMediaProcessRunner _processRunner;
+    private readonly SemaphoreSlim _probeExecutionGate = new(1, 1);
     private readonly SemaphoreSlim _thumbnailGate = new(1, 1);
+    private readonly object _probeCacheGate = new();
+    private readonly Dictionary<ProbeCacheKey, CachedProbe> _probeCache = [];
     private readonly string _thumbnailCacheDirectory;
     private readonly TimeSpan _probeTimeout;
     private readonly TimeSpan _thumbnailTimeout;
+    private long _probeCacheAccessOrder;
 
     public ClipLibraryService(
         FfmpegSetupService ffmpegSetupService,
@@ -153,39 +158,51 @@ public sealed class ClipLibraryService
         var maximumProbes = Math.Min(
             discovery.Candidates.Count,
             Math.Max(MinimumProbeCandidates, checked(count * ProbeCandidatesPerRequestedClip)));
-        var probesStarted = 0;
+        var probeAttempts = 0;
 
         foreach (var candidate in discovery.Candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (probesStarted >= maximumProbes)
-            {
-                break;
-            }
-
-            probesStarted++;
-            ProbeOutcome probe;
-            try
-            {
-                probe = await ProbeAsync(
-                        ffprobePath,
-                        candidate.FullPath,
-                        probeBudget.Token)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (
-                probeBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-
-            if (probe.State != ProbeState.Valid)
+            // Capture a stable Windows identity before consulting the cache.
+            // Path, size and timestamp alone are not sufficient because a file
+            // can be replaced between gallery refreshes.
+            if (!TryGetCurrentFileIdentity(candidate, out var identity))
             {
                 continue;
             }
 
-            if (!TryGetCurrentFileIdentity(candidate, out var identity))
+            var cacheKey = new ProbeCacheKey(
+                identity,
+                candidate.Length,
+                candidate.LastWriteTimeUtc.Ticks);
+            var cacheHit = TryGetCachedValidProbe(cacheKey, out var probe);
+            if (!cacheHit && probeAttempts >= maximumProbes)
+            {
+                break;
+            }
+
+            if (!cacheHit)
+            {
+                probeAttempts++;
+                try
+                {
+                    probe = await GetValidatedProbeAsync(
+                            ffprobePath,
+                            candidate,
+                            identity,
+                            cacheKey,
+                            probeBudget.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (
+                    probeBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+
+            if (probe.State != ProbeState.Valid)
             {
                 continue;
             }
@@ -233,6 +250,100 @@ public sealed class ClipLibraryService
         }
 
         return new ReadOnlyCollection<ClipLibraryItem>(clips);
+    }
+
+    private async Task<ProbeOutcome> GetValidatedProbeAsync(
+        string ffprobePath,
+        ClipCandidate candidate,
+        ClipFileIdentity expectedIdentity,
+        ProbeCacheKey cacheKey,
+        CancellationToken cancellationToken)
+    {
+        // Only one low-priority ffprobe process may run per library service.
+        // A second foreground/library request waits, then consumes the first
+        // request's cached result instead of competing with the game and capture.
+        await _probeExecutionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (TryGetCachedValidProbe(cacheKey, out var cached))
+            {
+                return cached;
+            }
+
+            var probe = await ProbeAsync(
+                    ffprobePath,
+                    candidate.FullPath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (probe.State != ProbeState.Valid)
+            {
+                return probe;
+            }
+
+            // Re-open the candidate after ffprobe exits. Cache the result only
+            // when the exact file identity and metadata are still unchanged.
+            if (!TryGetCurrentFileIdentity(candidate, out var currentIdentity) ||
+                currentIdentity != expectedIdentity)
+            {
+                return ProbeOutcome.Invalid;
+            }
+
+            CacheValidProbe(cacheKey, probe);
+            return probe;
+        }
+        finally
+        {
+            _probeExecutionGate.Release();
+        }
+    }
+
+    private bool TryGetCachedValidProbe(ProbeCacheKey key, out ProbeOutcome probe)
+    {
+        lock (_probeCacheGate)
+        {
+            if (!_probeCache.TryGetValue(key, out var cached))
+            {
+                probe = ProbeOutcome.Invalid;
+                return false;
+            }
+
+            probe = cached.Outcome;
+            _probeCache[key] = cached with { LastAccessOrder = NextProbeCacheAccessOrderLocked() };
+            return true;
+        }
+    }
+
+    private void CacheValidProbe(ProbeCacheKey key, ProbeOutcome probe)
+    {
+        if (probe.State != ProbeState.Valid)
+        {
+            return;
+        }
+
+        lock (_probeCacheGate)
+        {
+            if (!_probeCache.ContainsKey(key) && _probeCache.Count >= MaximumProbeCacheEntries)
+            {
+                var oldestKey = _probeCache.MinBy(entry => entry.Value.LastAccessOrder).Key;
+                _probeCache.Remove(oldestKey);
+            }
+
+            _probeCache[key] = new CachedProbe(probe, NextProbeCacheAccessOrderLocked());
+        }
+    }
+
+    private long NextProbeCacheAccessOrderLocked()
+    {
+        if (_probeCacheAccessOrder == long.MaxValue)
+        {
+            _probeCacheAccessOrder = 0;
+            foreach (var key in _probeCache.Keys.ToArray())
+            {
+                _probeCache[key] = _probeCache[key] with { LastAccessOrder = 0 };
+            }
+        }
+
+        return ++_probeCacheAccessOrder;
     }
 
     public async Task<ClipLibrarySnapshot> LoadAsync(
@@ -1361,6 +1472,15 @@ public sealed class ClipLibraryService
         string FullPath,
         long Length,
         DateTime LastWriteTimeUtc);
+
+    private readonly record struct ProbeCacheKey(
+        ClipFileIdentity FileIdentity,
+        long Length,
+        long LastWriteTimeUtcTicks);
+
+    private readonly record struct CachedProbe(
+        ProbeOutcome Outcome,
+        long LastAccessOrder);
 
     private sealed class PinnedThumbnailContext(
         SafeFileHandle rootDirectoryHandle,

@@ -33,6 +33,7 @@ internal static class Program
             ("Default save directory", TestDefaultSaveDirectoryAsync),
             ("Background color policy", TestBackgroundColorPolicyAsync),
             ("Appearance and gallery layout", TestAppearanceAndGalleryAsync),
+            ("Library player open policy", TestLibraryPlayerOpenPolicyAsync),
             ("UI feedback helpers", TestUiFeedbackHelpersAsync),
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
@@ -43,6 +44,7 @@ internal static class Program
             ("Thumbnail decoding releases cache files", TestThumbnailDecoderReleasesFileAsync),
             ("Clip library fail-closed probing", TestClipLibraryFailClosedAsync),
             ("Clip library probe budget", TestClipLibraryProbeBudgetAsync),
+            ("Clip library probe result cache", TestClipLibraryProbeCacheAsync),
             ("Runtime local-data boundaries", TestRuntimeLocalDataBoundariesAsync),
             ("Clip library cancellation", TestClipLibraryCancellationAsync)
         ];
@@ -205,6 +207,40 @@ internal static class Program
             !string.Equals(palette.SurfaceColor, palette.SurfaceRaisedColor, StringComparison.Ordinal),
             "Raised controls need a visible derived surface color.");
 
+        var rootResources = new System.Windows.ResourceDictionary();
+        var originalSurfaceBrush = new SolidColorBrush(Colors.Black);
+        var themeResources = new System.Windows.ResourceDictionary
+        {
+            ["WindowColor"] = Colors.Black,
+            ["SurfaceBrush"] = originalSurfaceBrush
+        };
+        rootResources.MergedDictionaries.Add(themeResources);
+        var replacementWindowColor = Color.FromRgb(0x18, 0x30, 0x30);
+        Assert.True(
+            MainWindow.SetThemeResourceValue(rootResources, "WindowColor", replacementWindowColor),
+            "The appearance updater must find colors declared in a merged theme dictionary.");
+        Assert.Equal(
+            replacementWindowColor,
+            (Color)themeResources["WindowColor"],
+            "The appearance updater changed the wrong resource dictionary.");
+        Assert.True(
+            !rootResources.Keys.Cast<object>().Any(key => Equals(key, "WindowColor")),
+            "The appearance updater must not create a root shadow that leaves theme brushes unchanged.");
+        Assert.True(
+            !MainWindow.SetThemeResourceValue(rootResources, "MissingColor", Colors.Red),
+            "The appearance updater should fail closed when a theme key is missing.");
+        var replacementSurfaceColor = Color.FromRgb(0x18, 0x18, 0x30);
+        Assert.True(
+            MainWindow.SetThemeBrushColorResource(rootResources, "SurfaceBrush", replacementSurfaceColor),
+            "The appearance updater must refresh existing shared brush instances.");
+        Assert.True(
+            ReferenceEquals(originalSurfaceBrush, themeResources["SurfaceBrush"]),
+            "The appearance updater should preserve live brush references whenever possible.");
+        Assert.Equal(
+            replacementSurfaceColor,
+            originalSurfaceBrush.Color,
+            "The appearance updater did not repaint controls holding a shared brush reference.");
+
         Assert.Equal("0 MB", ClipLibraryItem.FormatFileSize(0), "Zero-byte size formatting is incorrect.");
         Assert.Equal("<1 MB", ClipLibraryItem.FormatFileSize(512 * 1024), "Sub-megabyte size formatting is incorrect.");
         Assert.Equal("1.0 MB", ClipLibraryItem.FormatFileSize(1024 * 1024), "One-megabyte size formatting is incorrect.");
@@ -227,6 +263,30 @@ internal static class Program
             MainWindow.CalculateRecentGalleryCardWidth(1200, requestedCount: 15, actualItemCount: 15),
             "Fifteen-clip mode must retain a readable minimum card width and scroll.");
 
+        return Task.CompletedTask;
+    }
+
+    private static Task TestLibraryPlayerOpenPolicyAsync()
+    {
+        var backgroundLoad = LibraryMediaOpenPlan.Create(
+            autoplay: false,
+            playbackVolume: 0.73);
+        Assert.Equal(0d, backgroundLoad.PrimeVolume, "Media priming must remain silent.");
+        Assert.Equal(0.73, backgroundLoad.PlaybackVolume, "Requested player volume was not preserved.");
+        Assert.True(
+            backgroundLoad.MustPrimeWithPlay,
+            "A manually controlled MediaElement must explicitly Play to build its media graph.");
+        Assert.True(
+            !backgroundLoad.ContinueAfterOpened,
+            "A restored or programmatically selected clip must pause after the media graph opens.");
+
+        var userSelection = LibraryMediaOpenPlan.Create(
+            autoplay: true,
+            playbackVolume: 2);
+        Assert.Equal(1d, userSelection.PlaybackVolume, "Playback volume must be clamped to MediaElement limits.");
+        Assert.True(
+            userSelection.ContinueAfterOpened,
+            "A foreground user selection should continue after muted media priming completes.");
         return Task.CompletedTask;
     }
 
@@ -1462,11 +1522,26 @@ internal static class Program
                 Assert.True(
                     converted is BitmapSource { IsFrozen: true },
                     "Gallery thumbnails should be fully decoded and frozen in memory.");
+                var convertedAgain = converter.Convert(
+                    thumbnailPath,
+                    typeof(BitmapSource),
+                    null,
+                    System.Globalization.CultureInfo.InvariantCulture);
+                Assert.True(
+                    ReferenceEquals(converted, convertedAgain),
+                    "An unchanged visible thumbnail should reuse its frozen decode across gallery refreshes.");
 
                 File.Delete(thumbnailPath);
                 Assert.True(
                     !File.Exists(thumbnailPath),
                     "An in-memory gallery thumbnail must not keep its cache JPEG locked.");
+                Assert.True(
+                    converter.Convert(
+                        thumbnailPath,
+                        typeof(BitmapSource),
+                        null,
+                        System.Globalization.CultureInfo.InvariantCulture) is null,
+                    "A deleted cache JPEG must not be resurrected by the in-memory decode cache.");
             }).ConfigureAwait(false);
         }
         finally
@@ -1537,6 +1612,84 @@ internal static class Program
                 20,
                 runner.Invocations.Count,
                 "A folder full of invalid recordings must not launch an unbounded number of probe processes.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestClipLibraryProbeCacheAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+            var newestClip = Path.Combine(clipsDirectory, "Clip_2026-07-13_12-00-01.mp4");
+            var olderClip = Path.Combine(clipsDirectory, "Clip_2026-07-13_12-00-00.mp4");
+            await File.WriteAllBytesAsync(newestClip, [1, 2, 3]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(olderClip, [4, 5, 6]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(newestClip, new DateTime(2026, 7, 13, 12, 0, 1, DateTimeKind.Utc));
+            File.SetLastWriteTimeUtc(olderClip, new DateTime(2026, 7, 13, 12, 0, 0, DateTimeKind.Utc));
+
+            var runner = new FakeClipMediaProcessRunner
+            {
+                ProbeDelay = TimeSpan.FromMilliseconds(50)
+            };
+            var service = new ClipLibraryService(
+                () => null,
+                () => ffprobePath,
+                runner,
+                Path.Combine(testDirectory, "Cache"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+
+            var simultaneousLoads = await Task.WhenAll(
+                    service.GetRecentClipsAsync(
+                        clipsDirectory,
+                        count: 2,
+                        includeThumbnails: false),
+                    service.GetRecentClipsAsync(
+                        clipsDirectory,
+                        count: 2,
+                        includeThumbnails: false))
+                .ConfigureAwait(false);
+            Assert.True(
+                simultaneousLoads.All(clips => clips.Count == 2),
+                "Simultaneous library loads should both retain the validated clips.");
+            Assert.Equal(
+                2,
+                runner.Invocations.Count,
+                "Simultaneous loads must coalesce validation to one probe per unchanged clip.");
+
+            var second = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 2,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(2, second.Count, "The cached library load should retain both clips.");
+            Assert.Equal(
+                2,
+                runner.Invocations.Count,
+                "Unchanged clips must reuse identity-bound probe results instead of starting ffprobe again.");
+
+            await File.WriteAllBytesAsync(newestClip, [1, 2, 3, 4]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(newestClip, new DateTime(2026, 7, 13, 12, 0, 2, DateTimeKind.Utc));
+            var afterChange = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 2,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(2, afterChange.Count, "A changed clip should remain discoverable after revalidation.");
+            Assert.Equal(
+                3,
+                runner.Invocations.Count,
+                "Changing a clip's metadata must invalidate only that clip's cached probe result.");
         }
         finally
         {
@@ -1794,6 +1947,8 @@ internal static class Program
 
         public bool TimeOutAllProbes { get; init; }
 
+        public TimeSpan ProbeDelay { get; init; }
+
         public Action<IReadOnlyList<string>>? BeforeThumbnailWrite { get; init; }
 
         public async Task<ClipMediaProcessResult> RunAsync(
@@ -1807,6 +1962,11 @@ internal static class Program
 
             if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
             {
+                if (ProbeDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(ProbeDelay, cancellationToken).ConfigureAwait(false);
+                }
+
                 if (TimeOutAllProbes)
                 {
                     return new ClipMediaProcessResult(-1, string.Empty, string.Empty, true);
