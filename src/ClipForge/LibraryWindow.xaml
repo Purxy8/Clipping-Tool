@@ -267,6 +267,13 @@
                                         </Grid.ColumnDefinitions>
                                         <Border Background="{DynamicResource WindowBrush}" CornerRadius="8" ClipToBounds="True">
                                             <Grid>
+                                                <Border x:Name="ThumbnailPlaceholder"
+                                                        Background="{DynamicResource SurfaceRaisedBrush}">
+                                                    <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                               FontSize="9" FontWeight="SemiBold"
+                                                               Foreground="{DynamicResource TextMutedBrush}"
+                                                               Text="PREVIEW" />
+                                                </Border>
                                                 <Image Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailPathConverter}}"
                                                        Stretch="UniformToFill" />
                                                 <Border Width="26" Height="26" HorizontalAlignment="Center" VerticalAlignment="Center"
@@ -369,6 +376,9 @@
 
                     <Border Grid.Row="1" Background="{DynamicResource WindowBrush}" CornerRadius="12" ClipToBounds="True">
                         <Grid x:Name="LibraryPlayerHost">
+                            <Image x:Name="PlayerPosterImage"
+                                   Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailPathConverter}}"
+                                   Stretch="Uniform" IsHitTestVisible="False" />
                             <MediaElement x:Name="LibraryPlayer"
                                           LoadedBehavior="Manual"
                                           UnloadedBehavior="Manual"

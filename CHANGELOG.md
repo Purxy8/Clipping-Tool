@@ -4,6 +4,30 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.2] - 2026-07-14
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Fixed
+
+- Recent and Library cards now keep their full thumbnail area when an image is still missing or cannot be decoded, with a stable preview placeholder instead of collapsing around the filename and play icon.
+- Clips saved while replay remains active no longer stay thumbnail-less forever. ClipForge paints cached metadata immediately, then hydrates a bounded set of missing thumbnails while the app is visible and foreground.
+- The large Main and Library players show the selected cached poster before an explicitly deferred replay-time media decoder is opened.
+
+### Performance
+
+- Replay-safe thumbnail hydration reuses the already validated clip snapshot, avoids repeat media probes, generates only one image at a time with one FFmpeg thread at Idle priority, and stops on focus loss, capture transitions, trimming, close, or a newer refresh.
+- Recent hydration is capped by the selected 4/8/10/15 gallery size. Library hydration prioritizes the selected clip and is capped at 12 items rather than decoding the complete 100-item view.
+
+### Verification note
+
+- The Release solution builds with zero warnings and errors, formatting is clean, `git diff --check` is clean, and the deterministic suite passes 43/43 tests.
+- Regression coverage verifies cached-first rendering, bounded and cancellable hydration, cache reuse, no repeated media probe, deferred replay-time decoders, and Idle-priority helper execution. The production thumbnail command also generated a valid 640-pixel JPEG from an affected local trimmed clip.
+- Thumbnail work is deliberately bounded and low priority, but foreground-game validation remains hardware dependent; this release does not claim universally zero capture impact.
+
 ## [1.9.0-beta.1] - 2026-07-14
 
 ### Release status

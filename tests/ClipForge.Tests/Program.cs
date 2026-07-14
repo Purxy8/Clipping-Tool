@@ -49,6 +49,7 @@ internal static class Program
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
             ("Secure clip discovery and thumbnail cache", TestClipLibraryAsync),
+            ("Replay-safe thumbnail hydration", TestReplayThumbnailHydrationAsync),
             ("Clip classification and filtered discovery", TestClipClassificationAndFilteringAsync),
             ("Transactional clip trimming", TestClipTrimServiceAsync),
             ("Clip path and media process hardening", TestClipLibrarySecurityPolicyAsync),
@@ -2006,6 +2007,213 @@ internal static class Program
         }
     }
 
+    private static async Task TestReplayThumbnailHydrationAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var cacheDirectory = Path.Combine(testDirectory, "Cache");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffmpegPath = Path.Combine(toolsDirectory, "ffmpeg.exe");
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+
+            var olderClipPath = Path.Combine(clipsDirectory, "Clip_2026-07-14_16-00-00.mp4");
+            var newerClipPath = Path.Combine(clipsDirectory, "Clip_2026-07-14_16-01-00.mp4");
+            await File.WriteAllBytesAsync(olderClipPath, [1, 2, 3, 4]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(newerClipPath, [5, 6, 7, 8]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(
+                olderClipPath,
+                new DateTime(2026, 7, 14, 16, 0, 0, DateTimeKind.Utc));
+            File.SetLastWriteTimeUtc(
+                newerClipPath,
+                new DateTime(2026, 7, 14, 16, 1, 0, DateTimeKind.Utc));
+
+            var runner = new FakeClipMediaProcessRunner
+            {
+                PauseThumbnailGeneration = true
+            };
+            var service = new ClipLibraryService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                runner,
+                cacheDirectory,
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(3));
+
+            var firstReplayRefresh = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 4,
+                    includeThumbnails: true,
+                    filter: ClipLibraryFilter.All,
+                    thumbnailPolicy: ClipThumbnailPolicy.CachedOnly)
+                .ConfigureAwait(false);
+            Assert.Equal(2, firstReplayRefresh.Count,
+                "Replay discovery must expose valid clips before their thumbnails are hydrated.");
+            Assert.True(firstReplayRefresh.All(clip => clip.ThumbnailPath is null),
+                "Uncached replay thumbnails should initially use the visual fallback.");
+            Assert.Equal(0, runner.ThumbnailRunCount,
+                "The initial cached-only replay pass must not start a thumbnail helper.");
+            var probeRunsBeforeHydration = runner.Invocations.Count(invocation =>
+                Path.GetFileName(invocation.ExecutablePath).Equals(
+                    "ffprobe.exe",
+                    StringComparison.OrdinalIgnoreCase));
+            Assert.True(
+                LibraryWindow.ShouldDeferAutomaticMediaOpen(
+                    replayRunning: true,
+                    beginTrimWhenReady: false),
+                "Thumbnail hydration must not regress the replay policy that defers the UI media decoder.");
+
+            var zeroLimit = await service.HydrateThumbnailsAsync(
+                    clipsDirectory,
+                    firstReplayRefresh,
+                    maximumMissingThumbnails: 0)
+                .ConfigureAwait(false);
+            Assert.True(zeroLimit.All(clip => clip.ThumbnailPath is null),
+                "A zero hydration limit must preserve the cached-first placeholder snapshot.");
+            Assert.Equal(0, runner.ThumbnailRunCount,
+                "A zero hydration limit must not launch a media helper.");
+
+            using (var alreadyCancelled = new CancellationTokenSource())
+            {
+                alreadyCancelled.Cancel();
+                var cancellationObserved = false;
+                try
+                {
+                    await service.HydrateThumbnailsAsync(
+                            clipsDirectory,
+                            firstReplayRefresh,
+                            maximumMissingThumbnails: 1,
+                            alreadyCancelled.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    cancellationObserved = true;
+                }
+
+                Assert.True(cancellationObserved,
+                    "A cancelled foreground refresh must cancel replay thumbnail hydration.");
+                Assert.Equal(0, runner.ThumbnailRunCount,
+                    "Cancelled hydration must not launch a media helper.");
+            }
+
+            var invalidLimitRejected = false;
+            try
+            {
+                await service.HydrateThumbnailsAsync(
+                        clipsDirectory,
+                        firstReplayRefresh,
+                        maximumMissingThumbnails: 101)
+                    .ConfigureAwait(false);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                invalidLimitRejected = true;
+            }
+
+            Assert.True(invalidLimitRejected,
+                "Thumbnail hydration must reject work beyond the bounded library limit.");
+
+            var hydration = service.HydrateThumbnailsAsync(
+                clipsDirectory,
+                firstReplayRefresh,
+                maximumMissingThumbnails: 1);
+
+            try
+            {
+                await runner.ThumbnailStarted.Task
+                    .WaitAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(false);
+                Assert.True(!hydration.IsCompleted,
+                    "Thumbnail generation should yield asynchronously while the low-priority helper is running.");
+                Assert.Equal(ProcessPriorityClass.Idle, ProcessTuning.AuxiliaryMediaPriority,
+                    "Replay thumbnail helpers must remain below the live capture process priority.");
+
+                // A blocked thumbnail helper must not monopolize the caller or the
+                // thread pool used by independent replay/capture coordination work.
+                var captureCoordinationPulse = await Task.Run(static () => 42)
+                    .WaitAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(false);
+                Assert.Equal(42, captureCoordinationPulse,
+                    "Independent capture coordination stalled behind thumbnail hydration.");
+            }
+            finally
+            {
+                runner.ReleaseThumbnailGeneration();
+                try
+                {
+                    await hydration.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Preserve the original assertion failure; the outer cleanup
+                    // remains best-effort if the scripted helper itself failed.
+                }
+            }
+
+            var partiallyHydrated = await hydration
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            Assert.True(
+                partiallyHydrated[0].ThumbnailPath is { } thumbnailPath && File.Exists(thumbnailPath),
+                "A steady replay refresh should eventually publish its generated thumbnail.");
+            Assert.True(partiallyHydrated[1].ThumbnailPath is null,
+                "Thumbnail hydration must honor its missing-item limit.");
+            Assert.True(firstReplayRefresh.All(clip => clip.ThumbnailPath is null),
+                "Background hydration must not mutate the already-rendered cached-first snapshot.");
+            Assert.Equal(1, runner.ThumbnailRunCount,
+                "One missing replay thumbnail should launch exactly one serialized helper.");
+
+            var fullyHydrated = await service.HydrateThumbnailsAsync(
+                    clipsDirectory,
+                    partiallyHydrated,
+                    maximumMissingThumbnails: 4)
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            Assert.True(fullyHydrated.All(clip =>
+                    clip.ThumbnailPath is { } path && File.Exists(path)),
+                "A later bounded hydration pass should fill the remaining replay thumbnail.");
+            Assert.Equal(2, runner.ThumbnailRunCount,
+                "Hydration must reuse the populated item and decode only the remaining thumbnail.");
+            Assert.Equal(
+                probeRunsBeforeHydration,
+                runner.Invocations.Count(invocation =>
+                    Path.GetFileName(invocation.ExecutablePath).Equals(
+                        "ffprobe.exe",
+                        StringComparison.OrdinalIgnoreCase)),
+                "Hydrating an already validated snapshot must not repeat media probes.");
+
+            var thumbnailRuns = runner.ThumbnailRunCount;
+            var laterReplayRefresh = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 4,
+                    includeThumbnails: true,
+                    filter: ClipLibraryFilter.All,
+                    thumbnailPolicy: ClipThumbnailPolicy.CachedOnly)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                fullyHydrated[0].ThumbnailPath,
+                laterReplayRefresh[0].ThumbnailPath,
+                "Later replay refreshes should surface the newest hydrated cache entry.");
+            Assert.Equal(
+                fullyHydrated[1].ThumbnailPath,
+                laterReplayRefresh[1].ThumbnailPath,
+                "Later replay refreshes should surface every hydrated deterministic cache entry.");
+            Assert.Equal(thumbnailRuns, runner.ThumbnailRunCount,
+                "A hydrated replay thumbnail must not launch another helper on cached-only refresh.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
     private static async Task TestClipClassificationAndFilteringAsync()
     {
         (string FileName, ClipKind Kind)[] validNames =
@@ -3330,9 +3538,17 @@ internal static class Program
 
     private sealed class FakeClipMediaProcessRunner : IClipMediaProcessRunner
     {
+        private readonly TaskCompletionSource _releaseThumbnailGeneration =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public List<Invocation> Invocations { get; } = [];
 
         public int ThumbnailRunCount { get; private set; }
+
+        public TaskCompletionSource ThumbnailStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool PauseThumbnailGeneration { get; init; }
 
         public bool RejectAllProbes { get; init; }
 
@@ -3341,6 +3557,9 @@ internal static class Program
         public TimeSpan ProbeDelay { get; init; }
 
         public Action<IReadOnlyList<string>>? BeforeThumbnailWrite { get; init; }
+
+        public void ReleaseThumbnailGeneration() =>
+            _releaseThumbnailGeneration.TrySetResult();
 
         public async Task<ClipMediaProcessResult> RunAsync(
             string executablePath,
@@ -3375,6 +3594,14 @@ internal static class Program
             }
 
             ThumbnailRunCount++;
+            ThumbnailStarted.TrySetResult();
+            if (PauseThumbnailGeneration)
+            {
+                await _releaseThumbnailGeneration.Task
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
             BeforeThumbnailWrite?.Invoke(arguments);
             var outputPath = arguments[^1];
             await File.WriteAllBytesAsync(

@@ -573,6 +573,9 @@
 
                         <Border Grid.Row="1" Margin="14,0" Background="#05060A" CornerRadius="12" ClipToBounds="True">
                             <Grid x:Name="ClipPlayerHost">
+                                <Image x:Name="ClipPlayerPosterImage"
+                                       Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailPathConverter}}"
+                                       Stretch="Uniform" IsHitTestVisible="False" />
                                 <MediaElement x:Name="ClipPlayer" LoadedBehavior="Manual" UnloadedBehavior="Manual"
                                               Stretch="Uniform" ScrubbingEnabled="True" Volume="0.8"
                                               Cursor="Hand" MouseLeftButtonUp="ClipPlayer_MouseLeftButtonUp"
@@ -723,6 +726,15 @@
                                             </ContextMenu>
                                         </Button.ContextMenu>
                                         <Grid>
+                                            <Border x:Name="ThumbnailPlaceholder"
+                                                    Background="{StaticResource SurfaceRaisedBrush}">
+                                                <TextBlock Margin="0,20,0,0"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Top"
+                                                           FontSize="10" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           Text="PREVIEW" />
+                                            </Border>
                                             <Image Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailPathConverter}}"
                                                    Stretch="UniformToFill" />
                                             <Border VerticalAlignment="Bottom" Padding="9,18,9,8">

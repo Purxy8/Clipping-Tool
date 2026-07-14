@@ -20,6 +20,7 @@ namespace ClipForge;
 public partial class LibraryWindow : Window
 {
     private const int InitialClipLimit = 100;
+    private const int ReplayThumbnailHydrationLimit = 12;
     private static readonly TimeSpan NormalPlayerTimerInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan TrimPreviewTimerInterval = TimeSpan.FromMilliseconds(50);
     private static readonly LibraryFilterOption[] LibraryFilterOptions =
@@ -467,6 +468,61 @@ public partial class LibraryWindow : Window
             }
 
             _refreshPending = false;
+
+            if (_isReplayRunning &&
+                !_beginTrimWhenReady &&
+                !_isTrimInProgress &&
+                clips.Any(clip => clip.ThumbnailPath is null))
+            {
+                // The cached list is already visible. Hydrate only the newest
+                // cards likely to be on screen, without repeating discovery or
+                // probes. Focus loss, trimming, a newer refresh, or a critical
+                // capture transition cancels the Idle-priority helper.
+                var hydratedClips = await _clipLibraryService.HydrateThumbnailsAsync(
+                    _saveDirectory,
+                    clips,
+                    ReplayThumbnailHydrationLimit,
+                    cancellationToken: refreshCancellation.Token,
+                    preferredClipPath: _currentClip?.FullPath);
+
+                refreshCancellation.Token.ThrowIfCancellationRequested();
+                if (generation != Volatile.Read(ref _refreshGeneration) ||
+                    !IsVisible ||
+                    !IsActive ||
+                    _isPresentationSuspended ||
+                    _isTrimInProgress)
+                {
+                    _refreshPending = true;
+                    return;
+                }
+
+                var hydratedSelected = _currentClip is { } currentClip
+                    ? hydratedClips.FirstOrDefault(clip => clip.FullPath.Equals(
+                        currentClip.FullPath,
+                        StringComparison.OrdinalIgnoreCase))
+                    : null;
+
+                ClipList.ItemsSource = hydratedClips;
+                _suppressSelectionAutoplay = true;
+                try
+                {
+                    ClipList.SelectedItem = hydratedSelected;
+                    if (hydratedSelected is not null)
+                    {
+                        ClipList.ScrollIntoView(hydratedSelected);
+                    }
+                }
+                finally
+                {
+                    _suppressSelectionAutoplay = false;
+                }
+
+                if (hydratedSelected is not null)
+                {
+                    _currentClip = hydratedSelected;
+                    PlayerPosterImage.DataContext = hydratedSelected;
+                }
+            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -536,6 +592,7 @@ public partial class LibraryWindow : Window
     {
         ReleasePlayerSource(rememberPosition: false);
         _currentClip = clip;
+        PlayerPosterImage.DataContext = clip;
         _isMediaOpenDeferred = true;
         _sourceReleasedForBackground = false;
         _playWhenOpened = false;
@@ -578,6 +635,7 @@ public partial class LibraryWindow : Window
 
         ReleasePlayerSource(rememberPosition: preserveRestorePosition);
         _currentClip = clip;
+        PlayerPosterImage.DataContext = clip;
         _isMediaOpenDeferred = false;
         _sourceReleasedForBackground = false;
         _playWhenOpened = autoplay;
@@ -621,6 +679,7 @@ public partial class LibraryWindow : Window
 
         ReleasePlayerSource(rememberPosition: false);
         _currentClip = null;
+        PlayerPosterImage.DataContext = null;
         _positionToRestore = null;
         _sourceReleasedForBackground = false;
         _playWhenOpened = false;
