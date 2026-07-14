@@ -61,6 +61,23 @@ public sealed class TrayIconService : IDisposable
         _notifyIcon.ShowBalloonTip(3500);
     }
 
+    public void ShowReplayStartupFailure(string detail)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var safeDetail = string.IsNullOrWhiteSpace(detail)
+            ? "Open ClipForge to review the saved capture settings and try again."
+            : detail.Trim();
+        if (safeDetail.Length > 220)
+        {
+            safeDetail = $"{safeDetail[..217]}...";
+        }
+
+        _notifyIcon.BalloonTipTitle = "Automatic replay did not start";
+        _notifyIcon.BalloonTipText = safeDetail;
+        _notifyIcon.BalloonTipIcon = Forms.ToolTipIcon.Warning;
+        _notifyIcon.ShowBalloonTip(5000);
+    }
+
     public void Dispose()
     {
         if (_disposed)

@@ -362,6 +362,25 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- Startup -->
+                            <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
+                                <StackPanel>
+                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="STARTUP" />
+                                    <CheckBox x:Name="StartReplayWithWindowsCheckBox" Margin="0,10,0,0"
+                                              Click="StartReplayWithWindowsCheckBox_Click"
+                                              Style="{StaticResource ToggleCheckBoxStyle}"
+                                              AutomationProperties.Name="Start ClipForge and replay with Windows"
+                                              AutomationProperties.HelpText="Starts ClipForge hidden in the notification area and begins the replay buffer after Windows sign-in.">
+                                        <TextBlock Text="Start ClipForge and replay with Windows"
+                                                   TextWrapping="Wrap" />
+                                    </CheckBox>
+                                    <TextBlock x:Name="StartupHintText" Margin="0,7,0,0"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Text="ClipForge starts hidden in the tray and uses your saved capture settings."
+                                               TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- Appearance -->
                             <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
                                 <StackPanel>

@@ -14,12 +14,15 @@ public partial class App : System.Windows.Application
         // This prevents a previously staged package from being applied implicitly at startup.
         VelopackApp.Build()
             .SetAutoApplyOnStartup(false)
+            .OnBeforeUninstallFastCallback(_ => StartupRegistrationService.TryRemoveForUninstall())
             .Run();
+
+        var launchOptions = AppLaunchOptions.Parse(args);
 
         using var singleInstance = SingleInstanceService.Acquire();
         if (!singleInstance.IsPrimary)
         {
-            if (!singleInstance.TrySignalPrimary())
+            if (launchOptions.ShouldActivateExistingInstance && !singleInstance.TrySignalPrimary())
             {
                 System.Windows.MessageBox.Show(
                     "ClipForge is already running. Open it from the system tray, or exit the existing instance before trying again.",
@@ -33,19 +36,26 @@ public partial class App : System.Windows.Application
 
         if (SingleInstanceService.HasLegacyClipForgeProcessInCurrentSession())
         {
-            System.Windows.MessageBox.Show(
-                "Another ClipForge process from an older build is already running. Exit every existing ClipForge instance from the system tray once, then start ClipForge again.",
-                "Close the older ClipForge instance",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Information);
+            if (launchOptions.ShouldActivateExistingInstance)
+            {
+                System.Windows.MessageBox.Show(
+                    "Another ClipForge process from an older build is already running. Exit every existing ClipForge instance from the system tray once, then start ClipForge again.",
+                    "Close the older ClipForge instance",
+                    System.Windows.MessageBoxButton.OK,
+                    System.Windows.MessageBoxImage.Information);
+            }
+
             return;
         }
 
         var app = new App();
         app.InitializeComponent();
+        var mainWindow = new MainWindow(launchOptions);
+        app.MainWindow = mainWindow;
         singleInstance.ActivationRequested += (_, _) =>
             QueuePrimaryWindowActivation(app, attemptsRemaining: 5);
         singleInstance.StartListening();
+        mainWindow.ShowForLaunch();
         app.Run();
     }
 
