@@ -58,6 +58,8 @@ public partial class MainWindow : Window
     private bool _engineReady;
     private bool _backgroundHintShown;
     private bool _libraryRefreshPending;
+    private bool _captureCriticalPresentationActive;
+    private bool _captureRestartInProgress;
     private bool _playerSourceReleasedForBackground;
     private bool _isPlayerPlaying;
     private bool _playWhenOpened;
@@ -439,8 +441,18 @@ public partial class MainWindow : Window
         {
             await RunCaptureCommandAsync(async () =>
             {
-                await _replayBufferService.StopAsync();
-                await StartReplayCoreAsync();
+                _captureRestartInProgress = true;
+                SetCaptureCriticalPresentationState(isActive: true);
+                try
+                {
+                    await _replayBufferService.StopAsync();
+                    await StartReplayCoreAsync();
+                }
+                finally
+                {
+                    _captureRestartInProgress = false;
+                    SetCaptureCriticalPresentationState(IsCaptureCriticalState(_latestState));
+                }
             });
         }
     }
@@ -484,16 +496,30 @@ public partial class MainWindow : Window
             throw new InvalidOperationException("Install the capture engine before starting Instant Replay.");
         }
 
-        // Embedded playback is presentation work and can feed its own audio back
-        // into desktop capture. Always leave it paused before capture starts/restarts.
-        PausePlayerForBackgroundWork();
-
         SyncSettingsFromControls();
         EnsureSaveDirectory();
         await PersistSettingsAsync();
-        await _replayBufferService.StartAsync(
-            BuildCaptureConfiguration(),
-            _lifetimeCancellation.Token);
+        var configuration = BuildCaptureConfiguration();
+
+        // Decoder graphs, media helpers, and thumbnail refreshes are presentation
+        // work. Release them before FFmpeg starts so capture owns the available
+        // GPU/CPU headroom and cannot feed preview audio back into desktop capture.
+        SetCaptureCriticalPresentationState(isActive: true);
+        try
+        {
+            await _replayBufferService.StartAsync(
+                configuration,
+                _lifetimeCancellation.Token);
+        }
+        catch
+        {
+            if (!_replayBufferService.IsRunning)
+            {
+                SetCaptureCriticalPresentationState(_captureRestartInProgress);
+            }
+
+            throw;
+        }
     }
 
     private CaptureConfiguration BuildCaptureConfiguration()
@@ -922,7 +948,8 @@ public partial class MainWindow : Window
         }
 
         _latestState = snapshot;
-        _libraryWindow?.UpdateReplayRunningState(_replayBufferService.IsRunning);
+        SetCaptureCriticalPresentationState(
+            _captureRestartInProgress || IsCaptureCriticalState(snapshot));
         if (IsVisible && IsActive)
         {
             UpdateControlsForState(snapshot);
@@ -940,6 +967,45 @@ public partial class MainWindow : Window
         if (snapshot.State == ReplayState.Faulted && !string.IsNullOrWhiteSpace(snapshot.Message))
         {
             ShowError(snapshot.Message);
+        }
+    }
+
+    private static bool IsCaptureCriticalState(ReplayStateSnapshot snapshot) =>
+        snapshot.State is ReplayState.Starting or ReplayState.Buffering or ReplayState.Ready or
+            ReplayState.Saving or ReplayState.Stopping;
+
+    private void SetCaptureCriticalPresentationState(bool isActive)
+    {
+        if (_captureCriticalPresentationActive == isActive)
+        {
+            return;
+        }
+
+        _captureCriticalPresentationActive = isActive;
+        _libraryWindow?.UpdateReplayRunningState(isActive);
+
+        if (isActive)
+        {
+            CancelActiveLibraryRefreshForBackground();
+            ReleasePlayerForBackground();
+            SetPlayerControlsEnabled(false);
+            PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+            TrimCurrentClipButton.IsEnabled = false;
+            return;
+        }
+
+        if (_isClosing || !IsVisible || !IsActive)
+        {
+            return;
+        }
+
+        if (_libraryRefreshPending || _pendingLibraryPreferredPath is not null)
+        {
+            _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
+        }
+        else if (_playerSourceReleasedForBackground && _currentClip is { } releasedClip)
+        {
+            SelectClip(releasedClip, autoplay: false);
         }
     }
 
@@ -1216,7 +1282,7 @@ public partial class MainWindow : Window
                 LastSavedPanel.Visibility = Visibility.Collapsed;
             }
 
-            if (IsVisible && IsActive)
+            if (IsVisible && IsActive && !_captureCriticalPresentationActive)
             {
                 _ = RefreshClipLibraryAsync(path);
             }
@@ -1773,7 +1839,8 @@ public partial class MainWindow : Window
             }
 
             _ = openLibrary.Activate();
-            openLibrary.UpdateReplayRunningState(_replayBufferService.IsRunning);
+            openLibrary.UpdateReplayRunningState(
+                _captureCriticalPresentationActive || _replayBufferService.IsRunning);
             if (beginTrim && preferredClip is not null)
             {
                 openLibrary.SelectClipAndBeginTrim(preferredClip);
@@ -1790,7 +1857,7 @@ public partial class MainWindow : Window
             _clipLibraryService,
             _clipTrimService,
             _settings.SaveDirectory,
-            _replayBufferService.IsRunning,
+            _captureCriticalPresentationActive || _replayBufferService.IsRunning,
             preferredClip,
             beginTrim)
         {
@@ -1938,6 +2005,12 @@ public partial class MainWindow : Window
             _pendingLibraryPreferredPath = preferredPath;
         }
 
+        if (_captureCriticalPresentationActive)
+        {
+            _libraryRefreshPending = true;
+            return;
+        }
+
         if (!IsVisible || !IsActive)
         {
             _libraryRefreshPending = true;
@@ -1967,7 +2040,7 @@ public partial class MainWindow : Window
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
-            if (!IsVisible || !IsActive)
+            if (_captureCriticalPresentationActive || !IsVisible || !IsActive)
             {
                 _libraryRefreshPending = true;
                 return;
@@ -2021,6 +2094,7 @@ public partial class MainWindow : Window
         {
             if (IsVisible &&
                 IsActive &&
+                !_captureCriticalPresentationActive &&
                 _playerSourceReleasedForBackground &&
                 _currentClip is { } releasedClip)
             {
@@ -2056,6 +2130,28 @@ public partial class MainWindow : Window
         {
             ClearPlayer();
             ShowError("The selected clip changed or is no longer a safe local ClipForge recording. Refresh the gallery and try again.");
+            return;
+        }
+
+        if (_captureCriticalPresentationActive)
+        {
+            ClipPlayer.Stop();
+            ClipPlayer.Close();
+            ClipPlayer.Source = null;
+            _currentClip = clip;
+            _playerSourceReleasedForBackground = true;
+            _playWhenOpened = false;
+            SetPlayerPlaying(false);
+            LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
+            PlayerEmptyState.Visibility = Visibility.Visible;
+            PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+            OpenCurrentClipButton.IsEnabled = true;
+            TrimCurrentClipButton.IsEnabled = false;
+            SetPlayerControlsEnabled(false);
+            SetSeekUi(TimeSpan.Zero, clip.Duration ?? TimeSpan.Zero);
+            PlayerTimeText.Text = clip.Duration is { } deferredDuration
+                ? $"0:00 / {FormatDuration(deferredDuration)}"
+                : "0:00 / --:--";
             return;
         }
 
@@ -2174,6 +2270,12 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaOpened(object sender, RoutedEventArgs e)
     {
+        if (!CanHandlePlayerMediaEvent())
+        {
+            SuppressLatePlayerMediaEvent();
+            return;
+        }
+
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         SetPlayerControlsEnabled(true);
         var shouldAutoplay = _playWhenOpened;
@@ -2189,6 +2291,12 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaEnded(object sender, RoutedEventArgs e)
     {
+        if (!CanHandlePlayerMediaEvent())
+        {
+            SuppressLatePlayerMediaEvent();
+            return;
+        }
+
         ClipPlayer.Pause();
         ClipPlayer.Position = TimeSpan.Zero;
         SetPlayerPlaying(false);
@@ -2197,6 +2305,12 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
     {
+        if (!CanHandlePlayerMediaEvent())
+        {
+            SuppressLatePlayerMediaEvent();
+            return;
+        }
+
         _playWhenOpened = false;
         SetPlayerPlaying(false);
         SetPlayerControlsEnabled(false);
@@ -2204,18 +2318,62 @@ public partial class MainWindow : Window
         ShowError($"This clip could not be played inside ClipForge. {e.ErrorException.Message}");
     }
 
+    private bool CanHandlePlayerMediaEvent() => ShouldHandlePlayerMediaEvent(
+        _captureCriticalPresentationActive,
+        _isClosing,
+        IsVisible,
+        IsActive,
+        _currentClip is not null,
+        ClipPlayer.Source is not null);
+
+    internal static bool ShouldHandlePlayerMediaEvent(
+        bool captureCritical,
+        bool isClosing,
+        bool isVisible,
+        bool isActive,
+        bool hasCurrentClip,
+        bool hasSource) =>
+        !captureCritical &&
+        !isClosing &&
+        isVisible &&
+        isActive &&
+        hasCurrentClip &&
+        hasSource;
+
+    private void SuppressLatePlayerMediaEvent()
+    {
+        _playWhenOpened = false;
+        ClipPlayer.Volume = 0;
+        if (ClipPlayer.Source is not null)
+        {
+            ClipPlayer.Stop();
+            ClipPlayer.Close();
+            ClipPlayer.Source = null;
+        }
+
+        _playerSourceReleasedForBackground = _currentClip is not null;
+        SetPlayerPlaying(false);
+        SetPlayerControlsEnabled(false);
+        PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+    }
+
     private void SetPlayerPlaying(bool isPlaying)
     {
-        _isPlayerPlaying = isPlaying;
-        PlayPauseButton.Content = isPlaying ? "⏸" : "▶";
-        PlayPauseButton.ToolTip = isPlaying ? "Pause clip" : "Play clip";
+        _isPlayerPlaying = isPlaying &&
+                           !_captureCriticalPresentationActive &&
+                           ClipPlayer.Source is not null;
+        PlayPauseButton.Content = _isPlayerPlaying ? "⏸" : "▶";
+        PlayPauseButton.ToolTip = _isPlayerPlaying ? "Pause clip" : "Play clip";
         PlayPauseButton.SetValue(
             System.Windows.Automation.AutomationProperties.NameProperty,
-            isPlaying ? "Pause selected clip" : "Play selected clip");
-        PlayerSurfacePlayButton.Visibility = !isPlaying && _currentClip is not null
+            _isPlayerPlaying ? "Pause selected clip" : "Play selected clip");
+        PlayerSurfacePlayButton.Visibility = !_isPlayerPlaying &&
+                                             !_captureCriticalPresentationActive &&
+                                             _currentClip is not null &&
+                                             ClipPlayer.Source is not null
             ? Visibility.Visible
             : Visibility.Collapsed;
-        if (isPlaying && IsActive && IsVisible)
+        if (_isPlayerPlaying && IsActive && IsVisible)
         {
             _playerTimer.Start();
         }
@@ -2408,6 +2566,11 @@ public partial class MainWindow : Window
 
         UpdateControlsForState(_latestState);
         UpdateStorageText();
+
+        if (_captureCriticalPresentationActive)
+        {
+            return;
+        }
 
         var libraryRefreshRequired = _libraryRefreshPending || _pendingLibraryPreferredPath is not null;
         if (!libraryRefreshRequired &&

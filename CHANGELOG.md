@@ -4,6 +4,35 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.7.0-beta.2] - 2026-07-13
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Fixed
+
+- Opening Trim from the main Latest clip player now waits for that exact clip to finish opening before it initializes or enables the editor. Direct and Library trimming therefore use the same decoded duration instead of racing the media player with a slightly longer container duration.
+- Trim output validation now compares the nominal source/output frame rate while retaining strict video, dimensions, audio, duration, path, and file-identity checks. Valid short 60 FPS selections are no longer rejected merely because their selection-local average frame rate differs from the complete rolling clip.
+- Clip export now pins each replay-buffer manifest entry to the configured two-second segment duration. This removes the periodic frame gaps previously introduced when AAC made a Matroska segment's container duration slightly longer than its video timeline.
+
+### Performance
+
+- Starting Instant Replay now cancels thumbnail/probe refreshes and fully releases the main and Library media decoders. Saved clips are queued for a paused refresh after capture stops instead of immediately reopening a WPF decoder while the game is being recorded.
+- Windows Graphics Capture skips its resize path when a fixed preset already matches the selected display's native even dimensions, avoiding unnecessary GPU scaling for common native 1080p capture.
+- Capture smoke validation now checks maximum video packet spacing, monotonic audio timestamps, and A/V duration alignment so two-second join stutter cannot pass on average-FPS measurements alone.
+
+### Interface
+
+- The important Library launcher is now a larger accent-colored **Open Library** button with clearer hover, keyboard-focus, tooltip, and accessibility treatment while retaining the selected appearance theme.
+
+### Verification note
+
+- The Release solution builds with zero warnings and errors, formatting is clean, and the deterministic suite passes 37/37 tests. A real three-segment 1920x1080 60 FPS AAC concat completed at 60.003 average FPS with a 17 ms maximum video-frame delta, monotonic audio DTS, and a 21.833 ms A/V duration delta.
+- A real 1920x1080 ClipForge recording that reports nominal 60 FPS but 59.164 average FPS produced a valid five-second trimmed copy at nominal 60 FPS and 58.65 selection-local average FPS. The original remained unchanged and no partial or orphaned helper remained.
+- The automated desktop-capture smoke could not access the interactive Windows desktop from this build session (`gdigrab` error 5), so game-specific frame-time impact still needs confirmation on the installed build and the affected friend's PC. These checks cannot guarantee zero performance impact on every game or hardware combination.
+
 ## [1.7.0-beta.1] - 2026-07-13
 
 ### Release status

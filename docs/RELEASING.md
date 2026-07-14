@@ -158,13 +158,14 @@ On the Windows capture test PC, validate the fixed-resolution and Source paths w
 $smokeProject = '.\tests\ClipForge.CaptureSmoke\ClipForge.CaptureSmoke.csproj'
 $smokeRoot = '.\artifacts\capture-release-smoke'
 dotnet build $smokeProject -c Release --no-restore
+dotnet run --project $smokeProject -c Release --no-build -- --concat-smoke --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 1080p --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution source --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --force-gdi --artifacts $smokeRoot
 ```
 
-The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A successful fallback run on one PC still does not replace validation on the affected or equivalent fallback/hybrid hardware before claiming that hardware-specific lag is resolved.
+The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. It also inspects packet timestamps: video frame spacing must stay within the configured FPS budget, audio DTS must remain monotonic, and audio/video stream durations must stay aligned across two-second replay-buffer joins. The desktop-independent `--concat-smoke` case builds three real 1920x1080 60 FPS AAC-backed segments and must complete with no join gap larger than 25 ms. Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A successful fallback run on one PC still does not replace validation on the affected or equivalent fallback/hybrid hardware before claiming that hardware-specific lag is resolved.
 
 ### Library trim smoke checklist
 
@@ -176,6 +177,8 @@ $trimSmokeRoot = '.\artifacts\trim-release-smoke'
 dotnet build $smokeProject -c Release --no-restore
 dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --artifacts $trimSmokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --audio --artifacts $trimSmokeRoot
+# Optional regression against a copied real ClipForge recording:
+dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --audio --trim-source C:\path\to\Clip_yyyy-MM-dd_HH-mm-ss.mp4 --artifacts $trimSmokeRoot
 ```
 
 The two automated trim runs create a synthetic ClipForge source with non-keyframe-aligned boundaries and validate duration, frame count, resolution, frame rate, audio-stream count, strict trimmed naming, original-file retention, partial cleanup, and helper-process termination. They complement rather than replace the following interactive player, filter, prompt, cancellation, and target-hardware checks.

@@ -45,6 +45,17 @@ try
             ffmpeg,
             artifactRoot,
             includeTrimAudio,
+            GetOption(args, "--trim-source"),
+            timeout.Token);
+        return 0;
+    }
+
+    if (args.Contains("--concat-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunConcatTimingSmokeAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
             timeout.Token);
         return 0;
     }
@@ -230,6 +241,21 @@ try
             $"Saved video contained {mediaInfo.FrameCount} frames over {duration:0.###} seconds; frame pacing was below the smoke-test floor.");
     }
 
+    var videoPacketTimes = await ReadPacketTimestampsAsync(
+        ffprobe,
+        clipPath,
+        "v:0",
+        "pts_time",
+        timeout.Token);
+    var maxVideoFrameDelta = ReadMaximumPositiveDelta(videoPacketTimes);
+    var maximumAllowedFrameDelta = 1.6 / framesPerSecond;
+    if (maxVideoFrameDelta > maximumAllowedFrameDelta)
+    {
+        throw new InvalidDataException(
+            $"Saved video contained a {maxVideoFrameDelta * 1000:0.###} ms frame gap; " +
+            $"expected at most {maximumAllowedFrameDelta * 1000:0.###} ms at {framesPerSecond} FPS.");
+    }
+
     var expectedAudioStreams = includeSystemAudio || includeMicrophone ? 1 : 0;
     if (mediaInfo.AudioStreamCount != expectedAudioStreams)
     {
@@ -237,11 +263,34 @@ try
             $"Saved clip contained {mediaInfo.AudioStreamCount} audio stream(s); expected {expectedAudioStreams}.");
     }
 
+    if (expectedAudioStreams > 0)
+    {
+        var audioPacketTimes = await ReadPacketTimestampsAsync(
+            ffprobe,
+            clipPath,
+            "a:0",
+            "dts_time",
+            timeout.Token);
+        AssertMonotonicTimestamps(audioPacketTimes, "audio DTS");
+
+        if (!double.IsFinite(mediaInfo.VideoDuration) ||
+            !double.IsFinite(mediaInfo.AudioDuration) ||
+            Math.Abs(mediaInfo.VideoDuration - mediaInfo.AudioDuration) >
+            Math.Max(0.05, 2d / framesPerSecond))
+        {
+            throw new InvalidDataException(
+                $"Saved clip A/V duration delta was " +
+                $"{Math.Abs(mediaInfo.VideoDuration - mediaInfo.AudioDuration) * 1000:0.###} ms; " +
+                "audio and video did not remain synchronized across segment joins.");
+        }
+    }
+
     Console.WriteLine($"PASS: {clipPath}");
     Console.WriteLine(
         $"Duration: {duration:0.###} seconds; size: {new FileInfo(clipPath).Length:N0} bytes; " +
         $"video: {mediaInfo.Width}x{mediaInfo.Height} at {mediaInfo.AverageFrameRate:0.###} FPS, " +
         $"frames: {mediaInfo.FrameCount.ToString(CultureInfo.InvariantCulture)}; " +
+        $"max frame delta: {maxVideoFrameDelta * 1000:0.###} ms; " +
         $"audio streams: {mediaInfo.AudioStreamCount}; " +
         $"system audio requested: {includeSystemAudio}; microphone requested: {includeMicrophone}");
     return 0;
@@ -259,11 +308,147 @@ static string? GetOption(string[] arguments, string name)
     return index >= 0 && index + 1 < arguments.Length ? arguments[index + 1] : null;
 }
 
+static async Task RunConcatTimingSmokeAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    CancellationToken cancellationToken)
+{
+    const int framesPerSecond = 60;
+    const int segmentCount = 3;
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException("The verified FFprobe tool is unavailable for concat smoke.");
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"concat-smoke-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(runDirectory);
+    var processRunner = new ClipMediaProcessRunner();
+    var segments = new List<string>(segmentCount);
+
+    for (var index = 0; index < segmentCount; index++)
+    {
+        var segmentPath = Path.Combine(runDirectory, $"segment-{index:D9}.mkv");
+        IReadOnlyList<string> generationArguments =
+        [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-f", "lavfi",
+            "-i", $"testsrc2=duration=2:size=1920x1080:rate={framesPerSecond}",
+            "-f", "lavfi",
+            "-i", $"sine=frequency={660 + (index * 110)}:sample_rate=48000:duration=2",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-g", "120",
+            "-keyint_min", "120",
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "48000",
+            "-ac", "2",
+            "-f", "matroska",
+            "-y",
+            segmentPath
+        ];
+        var generated = await processRunner.RunAsync(
+                ffmpeg,
+                generationArguments,
+                TimeSpan.FromMinutes(3),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!generated.Succeeded || !File.Exists(segmentPath))
+        {
+            throw new InvalidDataException(
+                $"Synthetic replay segment {index} failed: {generated.StandardError.Trim()}");
+        }
+
+        segments.Add(segmentPath);
+    }
+
+    var manifestPath = Path.Combine(runDirectory, "manifest.txt");
+    await File.WriteAllLinesAsync(
+            manifestPath,
+            ReplayBufferService.BuildConcatManifestLines(segments),
+            cancellationToken)
+        .ConfigureAwait(false);
+    var outputPath = Path.Combine(runDirectory, "Clip_2026-07-13_16-30-00.mp4");
+    var requestedDuration = TimeSpan.FromSeconds(
+        segmentCount * FfmpegArgumentBuilder.SegmentSeconds);
+    var concat = await processRunner.RunAsync(
+            ffmpeg,
+            FfmpegArgumentBuilder.BuildConcatArguments(
+                manifestPath,
+                outputPath,
+                TimeSpan.Zero,
+                requestedDuration),
+            TimeSpan.FromMinutes(3),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!concat.Succeeded || !File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
+    {
+        throw new InvalidDataException($"Synthetic replay concat failed: {concat.StandardError.Trim()}");
+    }
+
+    var media = await ReadMediaInfoAsync(ffprobe, outputPath, cancellationToken).ConfigureAwait(false);
+    var videoPacketTimes = await ReadPacketTimestampsAsync(
+            ffprobe,
+            outputPath,
+            "v:0",
+            "pts_time",
+            cancellationToken)
+        .ConfigureAwait(false);
+    var maxVideoFrameDelta = ReadMaximumPositiveDelta(videoPacketTimes);
+    if (media.Width != 1920 ||
+        media.Height != 1080 ||
+        Math.Abs(media.AverageFrameRate - framesPerSecond) > 0.25 ||
+        Math.Abs(media.FrameCount - segmentCount * 2 * framesPerSecond) > 2 ||
+        maxVideoFrameDelta > 0.025)
+    {
+        throw new InvalidDataException(
+            $"Concat timing regression: {media.Width}x{media.Height}, " +
+            $"{media.AverageFrameRate:0.###} FPS, {media.FrameCount} frames, " +
+            $"maximum frame delta {maxVideoFrameDelta * 1000:0.###} ms.");
+    }
+
+    if (media.AudioStreamCount != 1)
+    {
+        throw new InvalidDataException("Concat timing smoke did not retain exactly one mixed audio stream.");
+    }
+
+    var audioPacketTimes = await ReadPacketTimestampsAsync(
+            ffprobe,
+            outputPath,
+            "a:0",
+            "dts_time",
+            cancellationToken)
+        .ConfigureAwait(false);
+    AssertMonotonicTimestamps(audioPacketTimes, "audio DTS");
+    var avDurationDelta = Math.Abs(media.VideoDuration - media.AudioDuration);
+    if (!double.IsFinite(avDurationDelta) || avDurationDelta > 0.05)
+    {
+        throw new InvalidDataException(
+            $"Concat A/V duration delta was {avDurationDelta * 1000:0.###} ms; expected at most 50 ms.");
+    }
+
+    Console.WriteLine($"PASS concat timing: {outputPath}");
+    Console.WriteLine(
+        $"Concat: 1920x1080 at {media.AverageFrameRate:0.###} FPS, {media.FrameCount} frames, " +
+        $"maximum frame delta {maxVideoFrameDelta * 1000:0.###} ms, " +
+        $"A/V delta {avDurationDelta * 1000:0.###} ms, monotonic audio DTS.");
+}
+
 static async Task RunTrimSmokeAsync(
     FfmpegSetupService setup,
     string ffmpeg,
     string artifactRoot,
     bool includeAudio,
+    string? existingSourcePath,
     CancellationToken cancellationToken)
 {
     var ffprobe = setup.FindProbeExecutable()
@@ -274,60 +459,73 @@ static async Task RunTrimSmokeAsync(
         $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
     Directory.CreateDirectory(runDirectory);
     var sourcePath = Path.Combine(runDirectory, "Clip_2026-07-13_16-00-00.mp4");
-    var sourceArguments = new List<string>
+    if (!string.IsNullOrWhiteSpace(existingSourcePath))
     {
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
-        "-f", "lavfi",
-        "-i", "testsrc2=duration=8:size=640x360:rate=30"
-    };
-    if (includeAudio)
-    {
-        sourceArguments.AddRange(
-        [
-            "-f", "lavfi",
-            "-i", "sine=frequency=880:sample_rate=48000:duration=8"
-        ]);
-    }
+        var sourceOverride = Path.GetFullPath(existingSourcePath);
+        if (!File.Exists(sourceOverride))
+        {
+            throw new FileNotFoundException("The requested existing trim-smoke source was not found.", sourceOverride);
+        }
 
-    sourceArguments.AddRange(["-map", "0:v:0"]);
-    if (includeAudio)
-    {
-        sourceArguments.AddRange(["-map", "1:a:0"]);
-    }
-
-    sourceArguments.AddRange(
-    [
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-sc_threshold", "0"
-    ]);
-    if (includeAudio)
-    {
-        sourceArguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+        File.Copy(sourceOverride, sourcePath, overwrite: false);
     }
     else
     {
-        sourceArguments.Add("-an");
-    }
+        List<string> sourceArguments =
+        [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-f", "lavfi",
+            "-i", "testsrc2=duration=8:size=640x360:rate=30"
+        ];
+        if (includeAudio)
+        {
+            sourceArguments.AddRange(
+            [
+                "-f", "lavfi",
+                "-i", "sine=frequency=880:sample_rate=48000:duration=8"
+            ]);
+        }
 
-    sourceArguments.AddRange(["-movflags", "+faststart", "-f", "mp4", "-n", sourcePath]);
-    var processRunner = new ClipMediaProcessRunner();
-    var generation = await processRunner.RunAsync(
-            ffmpeg,
-            sourceArguments,
-            TimeSpan.FromMinutes(5),
-            cancellationToken)
-        .ConfigureAwait(false);
-    if (!generation.Succeeded || !File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
-    {
-        throw new InvalidDataException(
-            $"Synthetic trim source generation failed: {generation.StandardError.Trim()}");
+        sourceArguments.AddRange(["-map", "0:v:0"]);
+        if (includeAudio)
+        {
+            sourceArguments.AddRange(["-map", "1:a:0"]);
+        }
+
+        sourceArguments.AddRange(
+        [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-g", "60",
+            "-keyint_min", "60",
+            "-sc_threshold", "0"
+        ]);
+        if (includeAudio)
+        {
+            sourceArguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+        }
+        else
+        {
+            sourceArguments.Add("-an");
+        }
+
+        sourceArguments.AddRange(["-movflags", "+faststart", "-f", "mp4", "-n", sourcePath]);
+        var processRunner = new ClipMediaProcessRunner();
+        var generation = await processRunner.RunAsync(
+                ffmpeg,
+                sourceArguments,
+                TimeSpan.FromMinutes(5),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!generation.Succeeded || !File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
+        {
+            throw new InvalidDataException(
+                $"Synthetic trim source generation failed: {generation.StandardError.Trim()}");
+        }
     }
 
     var sourceHash = ComputeSha256(sourcePath);
@@ -339,7 +537,7 @@ static async Task RunTrimSmokeAsync(
             TimeSpan.FromMilliseconds(1113),
             TimeSpan.FromMilliseconds(6287),
             TimeSpan.FromSeconds(sourceDuration),
-            sourceMedia.AverageFrameRate,
+            sourceMedia.NominalFrameRate,
             out var expectedRange,
             out var rangeError))
     {
@@ -420,18 +618,20 @@ static async Task RunTrimSmokeAsync(
             $"expected {sourceMedia.Width}x{sourceMedia.Height}.");
     }
 
-    if (Math.Abs(outputMedia.AverageFrameRate - sourceMedia.AverageFrameRate) > 0.1)
+    if (Math.Abs(outputMedia.NominalFrameRate - sourceMedia.NominalFrameRate) > 0.1)
     {
         throw new InvalidDataException(
-            $"Trim frame rate was {outputMedia.AverageFrameRate:0.###}; " +
-            $"expected {sourceMedia.AverageFrameRate:0.###}.");
+            $"Trim nominal frame rate was {outputMedia.NominalFrameRate:0.###}; " +
+            $"expected {sourceMedia.NominalFrameRate:0.###}.");
     }
 
-    var expectedFrames = expectedRange.EndFrame - expectedRange.StartFrame;
-    if (Math.Abs(outputMedia.FrameCount - expectedFrames) > 2)
+    var expectedFrames = expectedRange.Duration.TotalSeconds * sourceMedia.AverageFrameRate;
+    var frameCountTolerance = Math.Max(2, Math.Ceiling(expectedFrames * 0.02));
+    if (Math.Abs(outputMedia.FrameCount - expectedFrames) > frameCountTolerance)
     {
         throw new InvalidDataException(
-            $"Trim contained {outputMedia.FrameCount} frames; expected approximately {expectedFrames}.");
+            $"Trim contained {outputMedia.FrameCount} frames; expected approximately " +
+            $"{expectedFrames:0.###} (tolerance {frameCountTolerance:0}).");
     }
 
     var expectedAudioStreams = includeAudio ? 1 : 0;
@@ -464,7 +664,8 @@ static async Task RunTrimSmokeAsync(
     Console.WriteLine(
         $"Trim: {expectedRange.Start.TotalSeconds:0.###}-{expectedRange.End.TotalSeconds:0.###}s, " +
         $"duration {outputDuration:0.###}s, frames {outputMedia.FrameCount}, " +
-        $"video {outputMedia.Width}x{outputMedia.Height} at {outputMedia.AverageFrameRate:0.###} FPS, " +
+        $"video {outputMedia.Width}x{outputMedia.Height} at nominal {outputMedia.NominalFrameRate:0.###} FPS " +
+        $"(average {outputMedia.AverageFrameRate:0.###}), " +
         $"audio streams {outputMedia.AudioStreamCount}, original retained, no partial/orphan helper.");
 }
 
@@ -564,7 +765,7 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
                  "-f", "mov",
                  "-protocol_whitelist", "file",
                  "-count_frames",
-                 "-show_entries", "stream=codec_type,width,height,avg_frame_rate,nb_read_frames",
+                 "-show_entries", "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,nb_read_frames,duration",
                  "-of", "json",
                  mediaPath
              })
@@ -585,6 +786,7 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
     using var document = JsonDocument.Parse(output);
     var streams = document.RootElement.GetProperty("streams");
     JsonElement? videoStream = null;
+    JsonElement? audioStream = null;
     var audioStreamCount = 0;
     foreach (var stream in streams.EnumerateArray())
     {
@@ -596,6 +798,7 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
         else if (string.Equals(codecType, "audio", StringComparison.Ordinal))
         {
             audioStreamCount++;
+            audioStream ??= stream;
         }
     }
 
@@ -605,6 +808,7 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
     }
 
     var averageFrameRate = ParseFraction(video.GetProperty("avg_frame_rate").GetString());
+    var nominalFrameRate = ParseFraction(video.GetProperty("r_frame_rate").GetString());
     if (!video.TryGetProperty("nb_read_frames", out var frameCountElement) ||
         !long.TryParse(
             frameCountElement.GetString(),
@@ -619,8 +823,105 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
         video.GetProperty("width").GetInt32(),
         video.GetProperty("height").GetInt32(),
         averageFrameRate,
+        nominalFrameRate,
         frameCount,
-        audioStreamCount);
+        audioStreamCount,
+        ReadOptionalDuration(video),
+        audioStream is { } audio ? ReadOptionalDuration(audio) : double.NaN);
+}
+
+static double ReadOptionalDuration(JsonElement stream) =>
+    stream.TryGetProperty("duration", out var durationElement) &&
+    double.TryParse(
+        durationElement.GetString(),
+        NumberStyles.Float,
+        CultureInfo.InvariantCulture,
+        out var duration) &&
+    duration > 0
+        ? duration
+        : double.NaN;
+
+static async Task<IReadOnlyList<double>> ReadPacketTimestampsAsync(
+    string ffprobe,
+    string mediaPath,
+    string streamSelector,
+    string entry,
+    CancellationToken cancellationToken)
+{
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = ffprobe,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true
+    };
+    foreach (var argument in new[]
+             {
+                 "-v", "error",
+                 "-f", "mov",
+                 "-protocol_whitelist", "file",
+                 "-select_streams", streamSelector,
+                 "-show_entries", $"packet={entry}",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 mediaPath
+             })
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+
+    using var process = Process.Start(startInfo)
+        ?? throw new InvalidOperationException("Could not start ffprobe for packet-timing validation.");
+    var output = await process.StandardOutput.ReadToEndAsync(cancellationToken);
+    var error = await process.StandardError.ReadToEndAsync(cancellationToken);
+    await process.WaitForExitAsync(cancellationToken);
+    if (process.ExitCode != 0)
+    {
+        throw new InvalidDataException($"ffprobe packet-timing validation failed: {error.Trim()}");
+    }
+
+    var timestamps = output
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(value => double.TryParse(
+            value,
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out var timestamp)
+            ? timestamp
+            : double.NaN)
+        .Where(double.IsFinite)
+        .ToArray();
+    if (timestamps.Length < 2)
+    {
+        throw new InvalidDataException(
+            $"ffprobe returned too few {streamSelector} packet timestamps for timing validation.");
+    }
+
+    return timestamps;
+}
+
+static double ReadMaximumPositiveDelta(IReadOnlyList<double> timestamps)
+{
+    var maximum = 0d;
+    for (var index = 1; index < timestamps.Count; index++)
+    {
+        maximum = Math.Max(maximum, timestamps[index] - timestamps[index - 1]);
+    }
+
+    return maximum;
+}
+
+static void AssertMonotonicTimestamps(IReadOnlyList<double> timestamps, string label)
+{
+    for (var index = 1; index < timestamps.Count; index++)
+    {
+        if (timestamps[index] + 0.000001 < timestamps[index - 1])
+        {
+            throw new InvalidDataException(
+                $"Saved clip {label} moved backwards at packet {index}: " +
+                $"{timestamps[index - 1]:0.######} to {timestamps[index]:0.######}.");
+        }
+    }
 }
 
 static double ParseFraction(string? value)
@@ -683,5 +984,8 @@ internal sealed record MediaInfo(
     int Width,
     int Height,
     double AverageFrameRate,
+    double NominalFrameRate,
     long FrameCount,
-    int AudioStreamCount);
+    int AudioStreamCount,
+    double VideoDuration,
+    double AudioDuration);

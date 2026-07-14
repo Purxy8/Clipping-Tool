@@ -413,8 +413,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _segmentDirectory ?? _bufferRoot,
                 $"export-{Guid.NewGuid():N}.txt");
 
-            var manifestLines = selectedSegments.Select(path =>
-                $"file '{EscapeConcatPath(path)}'");
+            var manifestLines = BuildConcatManifestLines(selectedSegments);
             await File.WriteAllLinesAsync(
                     manifestPath,
                     manifestLines,
@@ -867,6 +866,31 @@ public sealed class ReplayBufferService : IAsyncDisposable
         {
             return 0;
         }
+    }
+
+    /// <summary>
+    /// Builds a concat-demuxer manifest whose timeline advances by the known
+    /// video segment cadence rather than each Matroska file's longest stream.
+    /// AAC packets do not divide evenly into two seconds at 48 kHz, so relying
+    /// on container duration inserts a visible video gap at every segment join.
+    /// </summary>
+    internal static IReadOnlyList<string> BuildConcatManifestLines(
+        IEnumerable<string> segmentPaths)
+    {
+        ArgumentNullException.ThrowIfNull(segmentPaths);
+
+        var duration = FfmpegArgumentBuilder.SegmentSeconds.ToString(
+            "0.000000",
+            CultureInfo.InvariantCulture);
+        var lines = new List<string>();
+        foreach (var path in segmentPaths)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(path);
+            lines.Add($"file '{EscapeConcatPath(path)}'");
+            lines.Add($"duration {duration}");
+        }
+
+        return lines;
     }
 
     private async Task PumpDiagnosticsAsync(Process process)

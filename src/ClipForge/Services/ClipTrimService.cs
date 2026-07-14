@@ -228,7 +228,7 @@ public sealed class ClipTrimService
                 requestedStart,
                 requestedEnd,
                 sourceMetadata.Value.Duration,
-                sourceMetadata.Value.FramesPerSecond,
+                sourceMetadata.Value.NominalFramesPerSecond,
                 out var range,
                 out var rangeError))
         {
@@ -248,7 +248,9 @@ public sealed class ClipTrimService
         }
 
         var framesPerSecond = Math.Clamp(
-            (int)Math.Round(sourceMetadata.Value.FramesPerSecond, MidpointRounding.AwayFromZero),
+            (int)Math.Round(
+                sourceMetadata.Value.NominalFramesPerSecond,
+                MidpointRounding.AwayFromZero),
             1,
             MaximumFramesPerSecond);
         var encoder = await SelectEncoderAsync(
@@ -329,13 +331,24 @@ public sealed class ClipTrimService
                     ProbeTimeout,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (outputMetadata is null ||
-                !IsExpectedOutput(outputMetadata.Value, range.Duration, sourceMetadata.Value))
+            if (outputMetadata is null)
             {
                 return new ClipTrimResult(
                     ClipTrimStatus.OutputValidationFailed,
                     null,
-                    "The generated MP4 failed ClipForge's media validation.");
+                    "The generated MP4 could not be read back by ClipForge's media validator.");
+            }
+
+            if (!TryValidateExpectedOutput(
+                    outputMetadata.Value,
+                    range.Duration,
+                    sourceMetadata.Value,
+                    out var validationFailure))
+            {
+                return new ClipTrimResult(
+                    ClipTrimStatus.OutputValidationFailed,
+                    null,
+                    $"The generated MP4 failed ClipForge's media validation. {validationFailure}");
             }
 
             if (!ClipLibraryService.TryValidatePinnedDirectChildFile(
@@ -559,11 +572,23 @@ public sealed class ClipTrimService
 
             if (videoStream is not { } video ||
                 !TryReadPositiveInt(video, "width", out var width) ||
-                !TryReadPositiveInt(video, "height", out var height) ||
-                !TryReadFrameRate(video, out var framesPerSecond))
+                !TryReadPositiveInt(video, "height", out var height))
             {
                 return null;
             }
+
+            if (!TryReadFrameRate(video, "avg_frame_rate", out var framesPerSecond) &&
+                !TryReadFrameRate(video, "r_frame_rate", out framesPerSecond))
+            {
+                return null;
+            }
+
+            var nominalFramesPerSecond = TryReadFrameRate(
+                video,
+                "r_frame_rate",
+                out var parsedNominalFramesPerSecond)
+                ? parsedNominalFramesPerSecond
+                : framesPerSecond;
 
             double durationSeconds = double.NaN;
             if (video.TryGetProperty("duration", out var streamDuration))
@@ -591,6 +616,7 @@ public sealed class ClipTrimService
                 width,
                 height,
                 framesPerSecond,
+                nominalFramesPerSecond,
                 hasAudio);
         }
         catch (Exception exception) when (exception is JsonException or OverflowException or FormatException)
@@ -612,38 +638,38 @@ public sealed class ClipTrimService
                value <= 32_768;
     }
 
-    private static bool TryReadFrameRate(JsonElement video, out double framesPerSecond)
+    private static bool TryReadFrameRate(
+        JsonElement video,
+        string propertyName,
+        out double framesPerSecond)
     {
         framesPerSecond = 0;
-        foreach (var propertyName in new[] { "avg_frame_rate", "r_frame_rate" })
+        if (!video.TryGetProperty(propertyName, out var property) ||
+            property.ValueKind != JsonValueKind.String)
         {
-            if (!video.TryGetProperty(propertyName, out var property) ||
-                property.ValueKind != JsonValueKind.String)
-            {
-                continue;
-            }
-
-            var parts = property.GetString()?.Split('/', 2);
-            if (parts is not { Length: 2 } ||
-                !double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator) ||
-                !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator) ||
-                !double.IsFinite(numerator) ||
-                !double.IsFinite(denominator) ||
-                numerator <= 0 ||
-                denominator <= 0)
-            {
-                continue;
-            }
-
-            var parsed = numerator / denominator;
-            if (double.IsFinite(parsed) && parsed > 0 && parsed <= MaximumFramesPerSecond)
-            {
-                framesPerSecond = parsed;
-                return true;
-            }
+            return false;
         }
 
-        return false;
+        var parts = property.GetString()?.Split('/', 2);
+        if (parts is not { Length: 2 } ||
+            !double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator) ||
+            !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator) ||
+            !double.IsFinite(numerator) ||
+            !double.IsFinite(denominator) ||
+            numerator <= 0 ||
+            denominator <= 0)
+        {
+            return false;
+        }
+
+        var parsed = numerator / denominator;
+        if (!double.IsFinite(parsed) || parsed <= 0 || parsed > MaximumFramesPerSecond)
+        {
+            return false;
+        }
+
+        framesPerSecond = parsed;
+        return true;
     }
 
     private static bool TryReadPositiveDouble(JsonElement element, out double value)
@@ -661,18 +687,54 @@ public sealed class ClipTrimService
         return double.IsFinite(value) && value > 0;
     }
 
-    private static bool IsExpectedOutput(
+    private static bool TryValidateExpectedOutput(
         TrimMediaMetadata output,
         TimeSpan expectedDuration,
-        TrimMediaMetadata source)
+        TrimMediaMetadata source,
+        out string failure)
     {
-        var toleranceSeconds = Math.Max(0.15, (2 / source.FramesPerSecond) + 0.05);
-        var frameRateTolerance = Math.Max(0.05, source.FramesPerSecond * 0.002);
-        return output.Width == source.Width &&
-               output.Height == source.Height &&
-               output.HasAudio == source.HasAudio &&
-               Math.Abs(output.FramesPerSecond - source.FramesPerSecond) <= frameRateTolerance &&
-               Math.Abs(output.Duration.TotalSeconds - expectedDuration.TotalSeconds) <= toleranceSeconds;
+        var toleranceSeconds = Math.Max(
+            0.15,
+            (2 / source.NominalFramesPerSecond) + 0.05);
+        if (output.Width != source.Width || output.Height != source.Height)
+        {
+            failure = $"Video dimensions were {output.Width}x{output.Height}; expected {source.Width}x{source.Height}.";
+            return false;
+        }
+
+        if (output.HasAudio != source.HasAudio)
+        {
+            failure = source.HasAudio
+                ? "The trimmed copy is missing the source audio stream."
+                : "The trimmed copy contains an unexpected audio stream.";
+            return false;
+        }
+
+        // avg_frame_rate is selection-local for timestamp-variable captures and
+        // legitimately changes when a short range is re-encoded. r_frame_rate is
+        // the stable nominal cadence that the capture and encoder promise.
+        var frameRateTolerance = Math.Max(0.05, source.NominalFramesPerSecond * 0.002);
+        if (Math.Abs(output.NominalFramesPerSecond - source.NominalFramesPerSecond) >
+            frameRateTolerance)
+        {
+            failure = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Nominal frame rate was {output.NominalFramesPerSecond:0.###} FPS; expected {source.NominalFramesPerSecond:0.###} FPS.");
+            return false;
+        }
+
+        var durationDifference = Math.Abs(
+            output.Duration.TotalSeconds - expectedDuration.TotalSeconds);
+        if (durationDifference > toleranceSeconds)
+        {
+            failure = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Duration was {output.Duration.TotalSeconds:0.###}s; expected {expectedDuration.TotalSeconds:0.###}s (tolerance {toleranceSeconds:0.###}s).");
+            return false;
+        }
+
+        failure = string.Empty;
+        return true;
     }
 
     private static bool HasSufficientWorkingSpace(
@@ -828,6 +890,7 @@ public sealed class ClipTrimService
         int Width,
         int Height,
         double FramesPerSecond,
+        double NominalFramesPerSecond,
         bool HasAudio);
 
     private readonly record struct EncoderCacheKey(
