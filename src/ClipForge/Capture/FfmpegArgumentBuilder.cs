@@ -23,12 +23,17 @@ internal static class FfmpegArgumentBuilder
         CaptureConfiguration configuration,
         IReadOnlyList<AudioInputSpecification> audioInputs,
         VideoEncodingStrategy encodingStrategy,
-        string segmentDirectory)
+        string segmentDirectory,
+        int segmentStartNumber = 0)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(audioInputs);
         ArgumentNullException.ThrowIfNull(encodingStrategy);
         ArgumentException.ThrowIfNullOrWhiteSpace(segmentDirectory);
+        if (segmentStartNumber < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(segmentStartNumber));
+        }
 
         if (configuration.FramesPerSecond is < 1 or > 240)
         {
@@ -111,7 +116,7 @@ internal static class FfmpegArgumentBuilder
             "-segment_time_delta", segmentTimeDelta.ToString("0.########", CultureInfo.InvariantCulture),
             "-reset_timestamps", "1",
             "-segment_format", "matroska",
-            "-segment_start_number", "0",
+            "-segment_start_number", Invariant(segmentStartNumber),
             "-y",
             Path.Combine(segmentDirectory, "segment-%09d.mkv")
         ]);

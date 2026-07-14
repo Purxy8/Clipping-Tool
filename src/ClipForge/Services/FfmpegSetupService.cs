@@ -30,24 +30,36 @@ public sealed class FfmpegSetupService
     private readonly Dictionary<string, VerifiedToolStamp> _verifiedTools =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly string _installDirectory;
+    private readonly string _expectedFfmpegSha256;
 
     public FfmpegSetupService(string? installDirectory = null)
+        : this(installDirectory, ExpectedFfmpegSha256)
+    {
+    }
+
+    // Test-only construction keeps cache invalidation deterministic without weakening the public pin.
+    internal FfmpegSetupService(string? installDirectory, string expectedFfmpegSha256)
     {
         _installDirectory = installDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ClipForge",
             "Tools",
             "FFmpeg");
+        _expectedFfmpegSha256 = expectedFfmpegSha256;
     }
 
-    public string? FindExecutable()
+    public string? FindExecutable() => FindExecutable(forceVerification: false);
+
+    internal string? FindExecutable(bool forceVerification)
     {
         if (IsExternalToolDeveloperModeEnabled())
         {
             var configuredPath = Environment.GetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH");
             foreach (var candidate in GetExternalToolCandidates(configuredPath, ExecutableName))
             {
-                if (IsUsableRegularFile(candidate))
+                if (forceVerification
+                        ? IsVerifiedTool(candidate, _expectedFfmpegSha256, forceVerification: true)
+                        : IsUsableRegularFile(candidate))
                 {
                     return Path.GetFullPath(candidate);
                 }
@@ -56,13 +68,65 @@ public sealed class FfmpegSetupService
 
         foreach (var candidate in GetPrivateToolCandidates(ExecutableName))
         {
-            if (IsVerifiedTool(candidate, ExpectedFfmpegSha256))
+            if (IsVerifiedTool(candidate, _expectedFfmpegSha256, forceVerification))
             {
                 return Path.GetFullPath(candidate);
             }
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Opens and hashes the exact executable file that a caller is about to
+    /// launch. FileShare.Read prevents same-user replacement, deletion, or
+    /// modification until the returned lease is disposed after Process.Start.
+    /// </summary>
+    internal FileStream? OpenVerifiedExecutableLease(string path)
+    {
+        FileStream? stream = null;
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            var info = new FileInfo(fullPath);
+            if (!info.Exists ||
+                info.Length is <= 0 or > MaximumExecutableBytes ||
+                (info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return null;
+            }
+
+            var developerExternalPath = IsConfiguredDeveloperExecutablePath(fullPath);
+            if (!developerExternalPath)
+            {
+                EnsureSafeDirectoryChain(info.DirectoryName!);
+            }
+
+            stream = new FileStream(
+                fullPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 128 * 1024,
+                FileOptions.SequentialScan);
+            var actualHash = Convert.ToHexStringLower(SHA256.HashData(stream));
+            if (!developerExternalPath &&
+                !actualHash.Equals(_expectedFfmpegSha256, StringComparison.Ordinal))
+            {
+                stream.Dispose();
+                return null;
+            }
+
+            stream.Position = 0;
+            return stream;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException or InvalidOperationException)
+        {
+            stream?.Dispose();
+            return null;
+        }
     }
 
     public async Task<string> DownloadAsync(
@@ -371,7 +435,10 @@ public sealed class FfmpegSetupService
         }
     }
 
-    private bool IsVerifiedTool(string path, string expectedSha256)
+    private bool IsVerifiedTool(
+        string path,
+        string expectedSha256,
+        bool forceVerification = false)
     {
         try
         {
@@ -388,10 +455,14 @@ public sealed class FfmpegSetupService
             var stamp = new VerifiedToolStamp(info.Length, info.LastWriteTimeUtc, expectedSha256);
             lock (_verificationGate)
             {
-                if (_verifiedTools.TryGetValue(fullPath, out var verified) && verified == stamp)
+                if (!forceVerification &&
+                    _verifiedTools.TryGetValue(fullPath, out var verified) &&
+                    verified == stamp)
                 {
                     return true;
                 }
+
+                _verifiedTools.Remove(fullPath);
             }
 
             using var stream = new FileStream(
@@ -442,6 +513,36 @@ public sealed class FfmpegSetupService
     private static bool IsExternalToolDeveloperModeEnabled() =>
         Environment.GetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE")
             ?.Equals("1", StringComparison.Ordinal) == true;
+
+    private static bool IsConfiguredDeveloperExecutablePath(string fullPath)
+    {
+        if (!IsExternalToolDeveloperModeEnabled())
+        {
+            return false;
+        }
+
+        foreach (var candidate in GetExternalToolCandidates(
+                     Environment.GetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH"),
+                     ExecutableName))
+        {
+            try
+            {
+                if (Path.GetFullPath(candidate).Equals(
+                        fullPath,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            catch (Exception exception) when (
+                exception is ArgumentException or NotSupportedException or SecurityException)
+            {
+                // Ignore an invalid PATH entry and continue to the resolved tool.
+            }
+        }
+
+        return false;
+    }
 
     private static void EnsureSafeDirectoryChain(string directoryPath)
     {

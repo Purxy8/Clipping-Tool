@@ -115,7 +115,15 @@ try
             "Microphone audio was requested, but no active Windows capture device was available.");
     }
     var verifyPruning = args.Contains("--prune", StringComparer.OrdinalIgnoreCase);
+    var verifyRenewal = args.Contains("--renew", StringComparer.OrdinalIgnoreCase);
+    var renewalCount = verifyRenewal
+        ? ParseRenewalCount(GetOption(args, "--renew-count"))
+        : 0;
     var forceGdi = args.Contains("--force-gdi", StringComparer.OrdinalIgnoreCase);
+    if (verifyRenewal && forceGdi)
+    {
+        throw new ArgumentException("--renew requires the Windows Graphics Capture path.");
+    }
     var resolutionId = GetOption(args, "--resolution") ?? "720p";
     var resolution = ResolutionOption.All.FirstOrDefault(option =>
         option.Id.Equals(resolutionId, StringComparison.OrdinalIgnoreCase))
@@ -139,6 +147,8 @@ try
     var runLabel = $"{mode}-{resolution.Id}-{framesPerSecond}fps{backendLabel}";
     var clipDirectory = Path.Combine(artifactRoot, $"clips-{runLabel}");
     var bufferDirectory = Path.Combine(artifactRoot, $"buffer-{runLabel}");
+    var renewalReportPath = Path.Combine(artifactRoot, $"renewal-{runLabel}.json");
+    var renewalReports = new List<RenewalSmokeReport>();
     Directory.CreateDirectory(clipDirectory);
 
     var configuration = new CaptureConfiguration(
@@ -230,6 +240,145 @@ try
             $"working set {performance.WorkingSetBytes / (1024d * 1024d):0.0} MB, " +
             $"priority {performance.Priority}, encoder {replay.ActiveEncoderDescription ?? "unknown"}");
         await buffered.Task.WaitAsync(TimeSpan.FromSeconds(30), timeout.Token);
+        if (verifyRenewal)
+        {
+            for (var renewalIndex = 1; renewalIndex <= renewalCount; renewalIndex++)
+            {
+                var previousProcessId = replay.CaptureProcessId
+                    ?? throw new InvalidDataException(
+                        $"The WGC process id was unavailable before renewal {renewalIndex}.");
+                var beforeRenewal = ReadSegmentSnapshots(bufferDirectory);
+                if (beforeRenewal.Count < 3)
+                {
+                    throw new InvalidDataException(
+                        "The replay ring did not contain enough completed segments to verify renewal retention.");
+                }
+
+                AssertContiguousSegmentIds(beforeRenewal, $"before renewal {renewalIndex}");
+                var previousTail = beforeRenewal[^1];
+                var retainedBeforeRenewal = beforeRenewal
+                    .Take(beforeRenewal.Count - 1)
+                    .ToArray();
+                var lastRetainedSegmentId = retainedBeforeRenewal[^1].Id;
+                var refreshRequestedUtc = DateTimeOffset.UtcNow;
+                var refreshTimer = Stopwatch.StartNew();
+                var renewed = await replay.RefreshCaptureAsync(previousProcessId, timeout.Token);
+                refreshTimer.Stop();
+                var refreshCompletedUtc = DateTimeOffset.UtcNow;
+                if (!renewed)
+                {
+                    throw new InvalidDataException(
+                        $"WGC process renewal {renewalIndex} was unexpectedly rejected.");
+                }
+
+                var replacementProcessId = replay.CaptureProcessId
+                    ?? throw new InvalidDataException(
+                        $"The replacement WGC process id was unavailable after renewal {renewalIndex}.");
+                if (replacementProcessId == previousProcessId)
+                {
+                    throw new InvalidDataException(
+                        $"WGC renewal {renewalIndex} did not replace the FFmpeg process.");
+                }
+
+                var immediatelyAfterRenewal = ReadSegmentSnapshots(bufferDirectory);
+                if (immediatelyAfterRenewal.Count == 0)
+                {
+                    throw new InvalidDataException(
+                        $"WGC renewal {renewalIndex} left no segment in the replay ring.");
+                }
+
+                AssertContiguousSegmentIds(
+                    immediatelyAfterRenewal,
+                    $"immediately after renewal {renewalIndex}");
+                var replacementFirstSegmentId = immediatelyAfterRenewal[^1].Id;
+                if (replacementFirstSegmentId <= lastRetainedSegmentId)
+                {
+                    throw new InvalidDataException(
+                        $"WGC renewal {renewalIndex} reset or reused completed segment ids: " +
+                        $"last retained {lastRetainedSegmentId}, replacement {replacementFirstSegmentId}.");
+                }
+
+                var rollover = await WaitForCompletedReplacementSegmentAsync(
+                    bufferDirectory,
+                    replacementFirstSegmentId,
+                    timeout.Token);
+                AssertContiguousSegmentIds(
+                    rollover.Segments,
+                    $"after replacement segment rollover {renewalIndex}");
+                var completedReplacement = rollover.Segments.Single(segment =>
+                    segment.Id == replacementFirstSegmentId);
+                if (completedReplacement.Length <= 0)
+                {
+                    throw new InvalidDataException(
+                        $"Replacement process {replacementProcessId} produced an empty completed segment.");
+                }
+
+                var priorVersionOfReplacementSegment = beforeRenewal.FirstOrDefault(segment =>
+                    segment.Id == replacementFirstSegmentId);
+                if (priorVersionOfReplacementSegment is not null &&
+                    priorVersionOfReplacementSegment.Length == completedReplacement.Length &&
+                    priorVersionOfReplacementSegment.LastWriteTimeUtc >= completedReplacement.LastWriteTimeUtc)
+                {
+                    throw new InvalidDataException(
+                        $"Replacement process {replacementProcessId} did not rewrite segment " +
+                        $"{replacementFirstSegmentId} before its successor appeared.");
+                }
+
+                if (retainedBeforeRenewal.Any(segment => !File.Exists(segment.Path)))
+                {
+                    throw new InvalidDataException(
+                        $"WGC renewal {renewalIndex} removed a completed segment from the existing replay ring.");
+                }
+
+                if (!replay.IsRunning)
+                {
+                    throw new InvalidDataException(
+                        $"Replay stopped after WGC process renewal {renewalIndex}.");
+                }
+
+                var successorSegmentId = rollover.Segments
+                    .Where(segment => segment.Id > replacementFirstSegmentId)
+                    .Min(segment => segment.Id);
+                var report = new RenewalSmokeReport(
+                    renewalIndex,
+                    previousProcessId,
+                    replacementProcessId,
+                    refreshRequestedUtc,
+                    refreshCompletedUtc,
+                    refreshTimer.Elapsed.TotalMilliseconds,
+                    previousTail.Id,
+                    previousTail.LastWriteTimeUtc,
+                    retainedBeforeRenewal.Length,
+                    lastRetainedSegmentId,
+                    replacementFirstSegmentId,
+                    completedReplacement.Path,
+                    completedReplacement.Length,
+                    completedReplacement.LastWriteTimeUtc,
+                    successorSegmentId,
+                    rollover.ObservedUtc);
+                renewalReports.Add(report);
+                await WriteRenewalReportAsync(
+                    renewalReportPath,
+                    runLabel,
+                    renewalReports,
+                    timeout.Token);
+
+                Console.WriteLine(
+                    $"Renewal {renewalIndex}/{renewalCount}: FFmpeg {previousProcessId} -> " +
+                    $"{replacementProcessId}; API restart window " +
+                    $"{refreshRequestedUtc:O} .. {refreshCompletedUtc:O} " +
+                    $"({refreshTimer.Elapsed.TotalMilliseconds:0.0} ms); retained " +
+                    $"{retainedBeforeRenewal.Length} completed segment(s); replacement segment " +
+                    $"{replacementFirstSegmentId} completed before segment {successorSegmentId} appeared.");
+            }
+
+            if (renewalReports.Select(report => report.ReplacementProcessId).Distinct().Count() != renewalCount)
+            {
+                throw new InvalidDataException(
+                    "Consecutive WGC renewals reused a replacement FFmpeg process id.");
+            }
+        }
+
         if (verifyPruning)
         {
             await Task.Delay(TimeSpan.FromSeconds(8), timeout.Token);
@@ -251,6 +400,32 @@ try
             }
 
             Console.WriteLine($"Pruning: {retainedSegments} segment(s) retained after rollover");
+        }
+
+        if (renewalReports.Count == 2)
+        {
+            var ringBeforeSave = ReadSegmentSnapshots(bufferDirectory);
+            AssertContiguousSegmentIds(ringBeforeSave, "before the cross-renewal save");
+            var completedForSixSecondSave = ringBeforeSave
+                .Take(Math.Max(0, ringBeforeSave.Count - 1))
+                .TakeLast(3)
+                .Select(segment => segment.Id)
+                .ToArray();
+            var replacementSegmentIds = renewalReports
+                .Select(report => report.ReplacementFirstSegmentId)
+                .ToArray();
+            if (replacementSegmentIds.Any(id => !completedForSixSecondSave.Contains(id)))
+            {
+                throw new InvalidDataException(
+                    "The final six-second save would not span completed segments produced by both " +
+                    $"replacement processes. Selected ids: {string.Join(", ", completedForSixSecondSave)}; " +
+                    $"replacement ids: {string.Join(", ", replacementSegmentIds)}.");
+            }
+
+            Console.WriteLine(
+                $"Cross-renewal save provenance: completed segment ids " +
+                $"{string.Join(", ", completedForSixSecondSave)} include both replacements " +
+                $"({string.Join(", ", replacementSegmentIds)}).");
         }
 
         clipPath = await replay.SaveClipAsync(TimeSpan.FromSeconds(6), clipDirectory, timeout.Token);
@@ -360,6 +535,12 @@ try
               $"longest identical run: {motionStats.MaximumIdenticalDurationMilliseconds:0.###} ms; ") +
         $"audio streams: {mediaInfo.AudioStreamCount}; " +
         $"system audio requested: {includeSystemAudio}; microphone requested: {includeMicrophone}");
+    if (renewalReports.Count > 0)
+    {
+        Console.WriteLine(
+            $"Renewal report: {renewalReportPath} ({renewalReports.Count} consecutive renewal(s))");
+    }
+
     return 0;
 }
 catch (Exception exception)
@@ -373,6 +554,122 @@ static string? GetOption(string[] arguments, string name)
     var index = Array.FindIndex(arguments, argument =>
         string.Equals(argument, name, StringComparison.OrdinalIgnoreCase));
     return index >= 0 && index + 1 < arguments.Length ? arguments[index + 1] : null;
+}
+
+static int ParseRenewalCount(string? value)
+{
+    if (value is null)
+    {
+        // A renewal smoke is intended to prove the process can be rotated more
+        // than once in one uninterrupted replay session. Callers can still use
+        // --renew-count 1 for a faster local diagnostic.
+        return 2;
+    }
+
+    if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var count) ||
+        count is < 1 or > 5)
+    {
+        throw new ArgumentOutOfRangeException(
+            nameof(value),
+            "--renew-count must be an integer between 1 and 5.");
+    }
+
+    return count;
+}
+
+static IReadOnlyList<SegmentSnapshot> ReadSegmentSnapshots(string bufferDirectory) =>
+    Directory
+        .EnumerateFiles(bufferDirectory, "segment-*.mkv", SearchOption.AllDirectories)
+        .Select(path =>
+        {
+            var file = new FileInfo(path);
+            return new SegmentSnapshot(
+                ParseSegmentId(file.Name),
+                file.FullName,
+                file.Length,
+                file.LastWriteTimeUtc);
+        })
+        .OrderBy(segment => segment.Id)
+        .ThenBy(segment => segment.Path, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+static int ParseSegmentId(string fileName)
+{
+    const string prefix = "segment-";
+    const string extension = ".mkv";
+    if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+        !fileName.EndsWith(extension, StringComparison.OrdinalIgnoreCase) ||
+        !int.TryParse(
+            fileName.AsSpan(prefix.Length, fileName.Length - prefix.Length - extension.Length),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var id) ||
+        id < 0)
+    {
+        throw new InvalidDataException($"Unexpected replay segment name '{fileName}'.");
+    }
+
+    return id;
+}
+
+static void AssertContiguousSegmentIds(
+    IReadOnlyList<SegmentSnapshot> segments,
+    string phase)
+{
+    for (var index = 1; index < segments.Count; index++)
+    {
+        if (segments[index].Id != segments[index - 1].Id + 1)
+        {
+            throw new InvalidDataException(
+                $"Replay segment ids were not contiguous {phase}: " +
+                $"{segments[index - 1].Id} -> {segments[index].Id}.");
+        }
+    }
+}
+
+static async Task<ReplacementSegmentRollover> WaitForCompletedReplacementSegmentAsync(
+    string bufferDirectory,
+    int replacementFirstSegmentId,
+    CancellationToken cancellationToken)
+{
+    var timer = Stopwatch.StartNew();
+    while (timer.Elapsed < TimeSpan.FromSeconds(10))
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var segments = ReadSegmentSnapshots(bufferDirectory);
+        if (segments.Any(segment => segment.Id == replacementFirstSegmentId) &&
+            segments.Any(segment => segment.Id > replacementFirstSegmentId))
+        {
+            return new ReplacementSegmentRollover(
+                segments,
+                DateTimeOffset.UtcNow);
+        }
+
+        await Task.Delay(50, cancellationToken);
+    }
+
+    throw new InvalidDataException(
+        $"Replacement segment {replacementFirstSegmentId} did not complete within 10 seconds.");
+}
+
+static Task WriteRenewalReportAsync(
+    string reportPath,
+    string runLabel,
+    IReadOnlyList<RenewalSmokeReport> renewals,
+    CancellationToken cancellationToken)
+{
+    var artifact = new RenewalSmokeArtifact(
+        SchemaVersion: 1,
+        GeneratedUtc: DateTimeOffset.UtcNow,
+        RunLabel: runLabel,
+        RenewalCount: renewals.Count,
+        Renewals: renewals.ToArray());
+    return File.WriteAllTextAsync(
+        reportPath,
+        JsonSerializer.Serialize(
+            artifact,
+            new JsonSerializerOptions { WriteIndented = true }),
+        cancellationToken);
 }
 
 static async Task RunResolutionMatrixAsync(
@@ -1747,6 +2044,41 @@ internal sealed record CapturePerformanceSample(
     double NormalizedCpuPercent,
     long WorkingSetBytes,
     ProcessPriorityClass Priority);
+
+internal sealed record SegmentSnapshot(
+    int Id,
+    string Path,
+    long Length,
+    DateTimeOffset LastWriteTimeUtc);
+
+internal sealed record ReplacementSegmentRollover(
+    IReadOnlyList<SegmentSnapshot> Segments,
+    DateTimeOffset ObservedUtc);
+
+internal sealed record RenewalSmokeReport(
+    int RenewalIndex,
+    int PreviousProcessId,
+    int ReplacementProcessId,
+    DateTimeOffset RefreshRequestedUtc,
+    DateTimeOffset RefreshCompletedUtc,
+    double RefreshApiWindowMilliseconds,
+    int PreviousTailSegmentId,
+    DateTimeOffset PreviousTailLastWriteTimeUtc,
+    int RetainedCompletedSegmentCount,
+    int LastRetainedSegmentId,
+    int ReplacementFirstSegmentId,
+    string ReplacementCompletedSegmentPath,
+    long ReplacementCompletedSegmentBytes,
+    DateTimeOffset ReplacementCompletedSegmentLastWriteTimeUtc,
+    int SuccessorSegmentId,
+    DateTimeOffset SuccessorObservedUtc);
+
+internal sealed record RenewalSmokeArtifact(
+    int SchemaVersion,
+    DateTimeOffset GeneratedUtc,
+    string RunLabel,
+    int RenewalCount,
+    IReadOnlyList<RenewalSmokeReport> Renewals);
 
 internal sealed record MatrixSource(string Id, int Width, int Height);
 

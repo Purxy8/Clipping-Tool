@@ -10,23 +10,32 @@ internal sealed record CaptureStarvationAssessment(
     TimeSpan Window);
 
 /// <summary>
-/// Detects severe source starvation from FFmpeg's cumulative CFR counters. It
+/// Detects source starvation from FFmpeg's cumulative CFR counters. It
 /// deliberately requires a fullscreen foreground surface, so a static desktop
-/// cannot be mistaken for a failed game capture.
+/// cannot be mistaken for a failed game capture. Severe starvation is detected
+/// quickly, while moderate starvation is only considered after a sustained
+/// window in an aged capture session.
 /// </summary>
 internal sealed class CaptureStarvationWatchdog
 {
     private const double RequiredFullscreenSampleRatio = 0.75;
     private const double RequiredRecentInputSampleRatio = 0.75;
     private static readonly TimeSpan ConfirmationWindow = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan HealthyCadenceConfirmationWindow = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan ModerateConfirmationWindow = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ModerateMinimumCaptureUptime = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MinimumInputEvidenceSpan = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan HealthyCadenceMinimumInputEvidenceSpan = TimeSpan.FromSeconds(9);
+    private static readonly TimeSpan ModerateMinimumInputEvidenceSpan = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan FullscreenEligibilityLossResetWindow = TimeSpan.FromSeconds(4);
-    private static readonly TimeSpan MaximumHistory = TimeSpan.FromSeconds(24);
+    private static readonly TimeSpan MaximumHistory = TimeSpan.FromSeconds(32);
     private readonly int _targetFramesPerSecond;
     private readonly Queue<Observation> _observations = new();
     private bool _triggered;
+    private bool _observedHealthyActiveCadence;
     private long _fullscreenEligibilityLostAt = -1;
     private long _lastTimestamp = -1;
+    private CaptureProgressSample? _lastSample;
 
     public CaptureStarvationWatchdog(int targetFramesPerSecond)
     {
@@ -40,7 +49,8 @@ internal sealed class CaptureStarvationWatchdog
 
     public CaptureStarvationAssessment? Observe(
         CaptureProgressSample sample,
-        CaptureForegroundContext context)
+        CaptureForegroundContext context,
+        TimeSpan? captureUptime = null)
     {
         ArgumentNullException.ThrowIfNull(sample);
         if (_triggered || sample.Timestamp <= _lastTimestamp)
@@ -48,16 +58,18 @@ internal sealed class CaptureStarvationWatchdog
             return null;
         }
 
-        if (_observations.TryPeek(out var previous) &&
-            (sample.Frame < previous.Sample.Frame ||
-             sample.DuplicatedFrames < previous.Sample.DuplicatedFrames ||
-             sample.OutputTimeMicroseconds < previous.Sample.OutputTimeMicroseconds))
+        if (_lastSample is { } previous &&
+            (sample.Frame < previous.Frame ||
+             sample.DuplicatedFrames < previous.DuplicatedFrames ||
+             sample.OutputTimeMicroseconds < previous.OutputTimeMicroseconds))
         {
             _observations.Clear();
+            _observedHealthyActiveCadence = false;
             _fullscreenEligibilityLostAt = -1;
         }
 
         _lastTimestamp = sample.Timestamp;
+        _lastSample = sample;
         if (context.IsFullscreenOnCapturedDisplay)
         {
             _fullscreenEligibilityLostAt = -1;
@@ -78,6 +90,7 @@ internal sealed class CaptureStarvationWatchdog
                     sample.Timestamp) >= FullscreenEligibilityLossResetWindow)
             {
                 _observations.Clear();
+                _observedHealthyActiveCadence = false;
                 return null;
             }
         }
@@ -92,14 +105,116 @@ internal sealed class CaptureStarvationWatchdog
             return null;
         }
 
-        var baseline = FindBaseline(sample.Timestamp, ConfirmationWindow);
+        var assessment = AssessWindow(
+            sample,
+            context,
+            ConfirmationWindow,
+            MinimumInputEvidenceSpan,
+            minimumDuplicateRatio: 0.90,
+            maximumUniqueFrameRateRatio: 0.10);
+
+        if (!_observedHealthyActiveCadence)
+        {
+            _observedHealthyActiveCadence = HasHealthyActiveCadence(sample, context);
+        }
+
+        if (assessment is null &&
+            _observedHealthyActiveCadence &&
+            captureUptime is not null &&
+            captureUptime.Value >= ModerateMinimumCaptureUptime)
+        {
+            // A WGC source can degrade without reaching the severe threshold:
+            // FFmpeg still emits the requested CFR stream, but most frames are
+            // duplicates. Requiring healthy active cadence earlier in this same
+            // FFmpeg process, an aged session, twenty seconds of evidence, and at
+            // most 28% meaningful source cadence distinguishes degradation from
+            // a game that has legitimately produced only 15/16 FPS since launch.
+            assessment = AssessWindow(
+                sample,
+                context,
+                ModerateConfirmationWindow,
+                ModerateMinimumInputEvidenceSpan,
+                minimumDuplicateRatio: 0.66,
+                maximumUniqueFrameRateRatio: 0.28);
+        }
+
+        if (assessment is null)
+        {
+            return null;
+        }
+
+        _triggered = true;
+        return assessment;
+    }
+
+    private bool HasHealthyActiveCadence(
+        CaptureProgressSample sample,
+        CaptureForegroundContext context)
+    {
+        var baseline = FindBaseline(sample.Timestamp, HealthyCadenceConfirmationWindow);
+        if (baseline is null)
+        {
+            return false;
+        }
+
+        var elapsed = Stopwatch.GetElapsedTime(baseline.Sample.Timestamp, sample.Timestamp);
+        if (elapsed < HealthyCadenceConfirmationWindow)
+        {
+            return false;
+        }
+
+        var window = _observations
+            .Where(observation => observation.Sample.Timestamp >= baseline.Sample.Timestamp)
+            .ToArray();
+        if (window.Length < 3 ||
+            window.Count(observation => observation.Context.IsFullscreenOnCapturedDisplay) /
+            (double)window.Length < RequiredFullscreenSampleRatio)
+        {
+            return false;
+        }
+
+        var inputObservations = window
+            .Where(observation => observation.Context.HasRecentInput)
+            .ToArray();
+        if (!context.HasRecentInput ||
+            inputObservations.Length < 2 ||
+            inputObservations.Length / (double)window.Length < RequiredRecentInputSampleRatio ||
+            Stopwatch.GetElapsedTime(
+                inputObservations[0].Sample.Timestamp,
+                inputObservations[^1].Sample.Timestamp) < HealthyCadenceMinimumInputEvidenceSpan)
+        {
+            return false;
+        }
+
+        var frameDelta = sample.Frame - baseline.Sample.Frame;
+        var duplicateDelta = sample.DuplicatedFrames - baseline.Sample.DuplicatedFrames;
+        var elapsedSeconds = elapsed.TotalSeconds;
+        if (frameDelta <= 0 || duplicateDelta < 0 ||
+            frameDelta < _targetFramesPerSecond * elapsedSeconds * 0.70)
+        {
+            return false;
+        }
+
+        var uniqueFramesPerSecond = Math.Max(0, frameDelta - duplicateDelta) / elapsedSeconds;
+        return uniqueFramesPerSecond >= _targetFramesPerSecond * 0.50;
+    }
+
+    private CaptureStarvationAssessment? AssessWindow(
+        CaptureProgressSample sample,
+        CaptureForegroundContext context,
+        TimeSpan confirmationWindow,
+        TimeSpan minimumInputEvidenceSpan,
+        double minimumDuplicateRatio,
+        double maximumUniqueFrameRateRatio)
+    {
+        var baseline = FindBaseline(sample.Timestamp, confirmationWindow);
         if (baseline is null)
         {
             return null;
         }
 
         var elapsed = Stopwatch.GetElapsedTime(baseline.Sample.Timestamp, sample.Timestamp);
-        if (elapsed < ConfirmationWindow)
+        if (elapsed < confirmationWindow)
         {
             return null;
         }
@@ -122,17 +237,16 @@ internal sealed class CaptureStarvationWatchdog
             inputObservations.Length / (double)window.Length < RequiredRecentInputSampleRatio ||
             Stopwatch.GetElapsedTime(
                 inputObservations[0].Sample.Timestamp,
-                inputObservations[^1].Sample.Timestamp) < MinimumInputEvidenceSpan)
+                inputObservations[^1].Sample.Timestamp) < minimumInputEvidenceSpan)
         {
             return null;
         }
 
         // HasRecentInput remains true for several seconds after a single input.
-        // Requiring broad coverage and evidence separated by six seconds proves
-        // continuing activity across the confirmation window. Consequently a
-        // paused cutscene or other fully idle/static fullscreen scene cannot be
-        // restarted solely because CFR duplicated its unchanged image.
-
+        // Requiring broad coverage and time-separated evidence proves continuing
+        // activity across the confirmation window. Consequently a paused cutscene
+        // or other fully idle/static fullscreen scene cannot be restarted solely
+        // because CFR duplicated its unchanged image.
         var frameDelta = sample.Frame - baseline.Sample.Frame;
         var duplicateDelta = sample.DuplicatedFrames - baseline.Sample.DuplicatedFrames;
         var elapsedSeconds = elapsed.TotalSeconds;
@@ -144,13 +258,12 @@ internal sealed class CaptureStarvationWatchdog
 
         var duplicateRatio = duplicateDelta / (double)frameDelta;
         var uniqueFramesPerSecond = Math.Max(0, frameDelta - duplicateDelta) / elapsedSeconds;
-        if (duplicateRatio < 0.90 ||
-            uniqueFramesPerSecond > Math.Max(3, _targetFramesPerSecond * 0.10))
+        if (duplicateRatio < minimumDuplicateRatio ||
+            uniqueFramesPerSecond > Math.Max(3, _targetFramesPerSecond * maximumUniqueFrameRateRatio))
         {
             return null;
         }
 
-        _triggered = true;
         return new CaptureStarvationAssessment(
             duplicateRatio,
             uniqueFramesPerSecond,

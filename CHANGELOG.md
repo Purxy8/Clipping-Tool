@@ -4,6 +4,36 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.4] - 2026-07-15
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Fixed
+
+- Long-running Windows Graphics Capture sessions now renew their FFmpeg/WGC frame pool every 30 minutes to mitigate the observed long-session degradation in which picture freshness collapsed while CFR timestamps falsely continued at 60 FPS.
+- Renewal waits briefly for the next two-second segment boundary, retains every completed replay segment in the existing ring, drops at most the new partial tail, reconnects selected audio devices, and resumes at the next safe segment number. Same-size Windows display/device transitions and resume from sleep use the same buffer-preserving path when the selected display returns with compatible source/output dimensions. Changed dimensions (or GDI's baked geometry) follow the full restart path, direct-WGC coordinate-only moves remain in place, and a display that remains unavailable stops replay safely.
+- The first starvation/hang recovery now preserves the replay ring instead of clearing it. A second real fault retains the existing bounded Source-safety fallback, while routine scheduled renewals do not consume that two-event fault budget.
+- Routine renewal keeps replay logically active so a save hotkey queues behind the short maintenance window, does not tear down an in-use Main/Library player, re-hashes the pinned FFmpeg executable before creating the replacement, and bounds graceful-stop, forced-kill, and cleanup waits so a wedged child cannot hold ClipForge's lifecycle gates forever.
+
+### Reliability
+
+- A second conservative health tier can detect an aged active-fullscreen process that first sustained healthy cadence and later degraded near 16 meaningful FPS at a 60 FPS target. A session that has always run at 15/16 FPS does not arm this tier; legitimate 24/30 FPS content does not trigger it, and a replacement-process counter reset or sustained fullscreen exit clears the earlier healthy latch. The original severe eight-second detector remains unchanged.
+- ClipForge now treats premature EOF or failure of either FFmpeg progress/diagnostic pump as a broken capture-control channel instead of allowing a live child process to backpressure silently.
+
+### Root-cause evidence
+
+- The reported `00:26` clip decoded cleanly as 1920x1080 CFR 60 with exactly 10,800 frames and continuous audio, but perceptual analysis found 120.92 seconds (67.17%) of frozen picture and only about 16 meaningful visual updates per second. A clip made immediately after the same recorder started was healthy, and its FFmpeg PID had remained unchanged for approximately 3 hours 42 minutes.
+- Sparse HUD changes kept packet timestamps and some pixels advancing, which explains why the previous 90%-duplicate and seven-second hard-hang checks did not fire. The bounded process lifetime is therefore the primary protection; the moderate counter tier is additional coverage rather than a claim of pixel-perfect classification.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors, formatting and whitespace checks are clean, and the deterministic suite passes 47/47 tests. New assertions cover resumed segment numbering, negative-number rejection, the exact 30-minute WGC boundary, GDI exclusion, prior-healthy-then-degraded detection, always-low/young/idle exclusions, counter-reset isolation, legitimate 17/24/30 FPS cases, and separate scheduled/fault recovery budgets.
+- Interactive 1920x1080 60 FPS WGC/NVIDIA NVENC renewal passed two consecutive replacements in one desktop-audio session. The FFmpeg PID changed each time, 3 then 5 completed segments remained, replacement segment IDs continued at 4 then 6, and the pre-save six-second ring snapshot contained completed segments 4/5/6 from both replacement processes. The validated MP4 contained 359 decoded frames over 6.005 seconds at 60.003 FPS, no video-frame timestamp gap above 17 ms, 283 continuous audio packets with at most a 0.001 ms timeline gap, and a clean full decode. The two API windows were 2.53 and 3.19 seconds, including time deliberately spent waiting at a segment boundary while the old process was still capturing; a persisted JSON report records PID and segment provenance.
+- These checks directly verify renewal and ring continuity on the development PC. They cannot compress a real multi-hour Call of Duty session into an automated test, so affected-game validation after installing this beta remains necessary before describing every driver/game combination as universally lag-free.
+
 ## [1.9.0-beta.3] - 2026-07-14
 
 ### Release status
