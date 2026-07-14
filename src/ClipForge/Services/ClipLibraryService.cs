@@ -151,6 +151,22 @@ public sealed class ClipLibraryService
         bool includeThumbnails,
         ClipLibraryFilter filter,
         CancellationToken cancellationToken = default)
+        => await GetRecentClipsAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                filter,
+                ClipThumbnailPolicy.GenerateMissing,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<ClipLibraryItem>> GetRecentClipsAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipLibraryFilter filter,
+        ClipThumbnailPolicy thumbnailPolicy,
+        CancellationToken cancellationToken = default)
     {
         if (count is < 1 or > MaximumClipCount)
         {
@@ -160,6 +176,11 @@ public sealed class ClipLibraryService
         if (!Enum.IsDefined(filter))
         {
             throw new ArgumentOutOfRangeException(nameof(filter));
+        }
+
+        if (!Enum.IsDefined(thumbnailPolicy))
+        {
+            throw new ArgumentOutOfRangeException(nameof(thumbnailPolicy));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -250,7 +271,9 @@ public sealed class ClipLibraryService
             }
         }
 
-        if (includeThumbnails && clips.Count > 0)
+        if (includeThumbnails &&
+            thumbnailPolicy != ClipThumbnailPolicy.None &&
+            clips.Count > 0)
         {
             using var thumbnailBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             thumbnailBudget.CancelAfter(MaximumTotalThumbnailDuration);
@@ -263,6 +286,7 @@ public sealed class ClipLibraryService
                     thumbnail = await GetThumbnailAsync(
                             discovery.RootDirectory,
                             clips[index],
+                            allowGeneration: thumbnailPolicy == ClipThumbnailPolicy.GenerateMissing,
                             thumbnailBudget.Token)
                         .ConfigureAwait(false);
                 }
@@ -383,6 +407,24 @@ public sealed class ClipLibraryService
                 saveDirectory,
                 count,
                 includeThumbnails,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return clips.Count == 0 ? ClipLibrarySnapshot.Empty : new ClipLibrarySnapshot(clips);
+    }
+
+    public async Task<ClipLibrarySnapshot> LoadAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipThumbnailPolicy thumbnailPolicy,
+        CancellationToken cancellationToken = default)
+    {
+        var clips = await GetRecentClipsAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                ClipLibraryFilter.All,
+                thumbnailPolicy,
                 cancellationToken)
             .ConfigureAwait(false);
         return clips.Count == 0 ? ClipLibrarySnapshot.Empty : new ClipLibrarySnapshot(clips);
@@ -566,6 +608,18 @@ public sealed class ClipLibraryService
         string saveDirectory,
         ClipLibraryItem clip,
         CancellationToken cancellationToken = default)
+        => await GetThumbnailAsync(
+                saveDirectory,
+                clip,
+                allowGeneration: true,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<string?> GetThumbnailAsync(
+        string saveDirectory,
+        ClipLibraryItem clip,
+        bool allowGeneration,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(clip);
         cancellationToken.ThrowIfCancellationRequested();
@@ -593,6 +647,11 @@ public sealed class ClipLibraryService
                 PruneLegacyThumbnail(clip, pinnedContext);
                 return thumbnailPath;
             }
+        }
+
+        if (!allowGeneration)
+        {
+            return null;
         }
 
         await _thumbnailGate.WaitAsync(cancellationToken).ConfigureAwait(false);

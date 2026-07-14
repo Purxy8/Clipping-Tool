@@ -30,6 +30,10 @@ public sealed class ClipTrimService
     private readonly IClipMediaProcessRunner _processRunner;
     private readonly SemaphoreSlim _trimGate = new(1, 1);
     private readonly Dictionary<EncoderCacheKey, VideoEncodingStrategy> _encoderCache = [];
+    private int _replayBlockingTrimWork;
+
+    public bool HasReplayBlockingTrimWork =>
+        Volatile.Read(ref _replayBlockingTrimWork) > 0;
 
     public ClipTrimService(FfmpegSetupService ffmpegSetupService)
         : this(
@@ -68,9 +72,36 @@ public sealed class ClipTrimService
         TimeSpan start,
         TimeSpan end,
         CancellationToken cancellationToken = default)
+        => await TrimAsync(
+                saveDirectory,
+                source,
+                start,
+                end,
+                ClipTrimExecutionMode.Standard,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<ClipTrimResult> TrimAsync(
+        string saveDirectory,
+        ClipLibraryItem source,
+        TimeSpan start,
+        TimeSpan end,
+        ClipTrimExecutionMode executionMode,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(source);
+        if (!Enum.IsDefined(executionMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(executionMode));
+        }
+
         var enteredGate = false;
+        var replayBlockingWork = executionMode == ClipTrimExecutionMode.Standard;
+        if (replayBlockingWork)
+        {
+            Interlocked.Increment(ref _replayBlockingTrimWork);
+        }
+
         try
         {
             await _trimGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -80,6 +111,7 @@ public sealed class ClipTrimService
                     source,
                     start,
                     end,
+                    executionMode,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -102,6 +134,11 @@ public sealed class ClipTrimService
             if (enteredGate)
             {
                 _trimGate.Release();
+            }
+
+            if (replayBlockingWork)
+            {
+                Interlocked.Decrement(ref _replayBlockingTrimWork);
             }
         }
     }
@@ -187,6 +224,7 @@ public sealed class ClipTrimService
         ClipLibraryItem source,
         TimeSpan requestedStart,
         TimeSpan requestedEnd,
+        ClipTrimExecutionMode executionMode,
         CancellationToken cancellationToken)
     {
         var ffmpegPath = ClipLibraryService.GetSafeToolPath(_findFfmpeg());
@@ -253,13 +291,15 @@ public sealed class ClipTrimService
                 MidpointRounding.AwayFromZero),
             1,
             MaximumFramesPerSecond);
-        var encoder = await SelectEncoderAsync(
-                ffmpegPath,
-                sourceMetadata.Value.Width,
-                sourceMetadata.Value.Height,
-                framesPerSecond,
-                cancellationToken)
-            .ConfigureAwait(false);
+        var encoder = executionMode == ClipTrimExecutionMode.ReplayCoexisting
+            ? VideoEncodingStrategy.SoftwareGdi
+            : await SelectEncoderAsync(
+                    ffmpegPath,
+                    sourceMetadata.Value.Width,
+                    sourceMetadata.Value.Height,
+                    framesPerSecond,
+                    cancellationToken)
+                .ConfigureAwait(false);
 
         string? stagingPath = CreateUniqueStagingPath(pinnedSource.RootDirectoryPath);
         try
@@ -273,12 +313,14 @@ public sealed class ClipTrimService
                     sourceMetadata.Value.HasAudio,
                     framesPerSecond,
                     encoder,
+                    executionMode,
                     timeout,
                     cancellationToken)
                 .ConfigureAwait(false);
 
             if (!execution.Succeeded &&
                 !execution.TimedOut &&
+                executionMode == ClipTrimExecutionMode.Standard &&
                 encoder.IsHardwareEncoder)
             {
                 TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
@@ -298,6 +340,7 @@ public sealed class ClipTrimService
                         sourceMetadata.Value.HasAudio,
                         framesPerSecond,
                         software,
+                        executionMode,
                         timeout,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -397,6 +440,7 @@ public sealed class ClipTrimService
         bool includeAudio,
         int framesPerSecond,
         VideoEncodingStrategy encoder,
+        ClipTrimExecutionMode executionMode,
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
@@ -407,7 +451,8 @@ public sealed class ClipTrimService
             range.Duration,
             includeAudio,
             framesPerSecond,
-            encoder);
+            encoder,
+            executionMode == ClipTrimExecutionMode.ReplayCoexisting);
         return await _processRunner.RunAsync(
                 ffmpegPath,
                 arguments,
@@ -921,6 +966,12 @@ public enum ClipTrimStatus
     EncodingFailed,
     OutputValidationFailed,
     CommitFailed
+}
+
+public enum ClipTrimExecutionMode
+{
+    Standard,
+    ReplayCoexisting
 }
 
 public sealed record ClipTrimResult(

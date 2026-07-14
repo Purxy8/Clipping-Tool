@@ -351,6 +351,10 @@
                             <TextBlock x:Name="SelectedClipDetailsText" Margin="0,4,0,0"
                                        Style="{DynamicResource MutedTextStyle}"
                                        Text="Choose any recording from the library to watch it here." />
+                            <TextBlock x:Name="ReplayPlaybackHintText" Margin="0,4,0,0"
+                                       Visibility="Collapsed" TextWrapping="Wrap"
+                                       FontSize="10" Foreground="{DynamicResource WarningBrush}"
+                                       Text="Replay is active: preview starts muted. Unmute only if you want its audio in the rolling buffer." />
                         </StackPanel>
                         <Border Grid.Column="1" Padding="9,5" VerticalAlignment="Center"
                                 Background="{DynamicResource AccentSoftBrush}" CornerRadius="8">
@@ -364,7 +368,7 @@
                     </Grid>
 
                     <Border Grid.Row="1" Background="{DynamicResource WindowBrush}" CornerRadius="12" ClipToBounds="True">
-                        <Grid>
+                        <Grid x:Name="LibraryPlayerHost">
                             <MediaElement x:Name="LibraryPlayer"
                                           LoadedBehavior="Manual"
                                           UnloadedBehavior="Manual"
@@ -528,8 +532,8 @@
 
                                 <TextBlock x:Name="TrimContentionText" Grid.Row="3" Margin="0,9,0,0"
                                            Visibility="Collapsed" TextWrapping="Wrap"
-                                           Foreground="{DynamicResource WarningBrush}"
-                                           Text="Stop replay before exporting a trim. This keeps capture smooth while you play." />
+                                           Foreground="{DynamicResource SuccessBrush}"
+                                           Text="Replay-safe export is active: one software thread, real-time pacing, and Idle priority." />
 
                                 <Grid Grid.Row="4" Margin="0,10,0,0">
                                     <StackPanel x:Name="TrimActionsPanel" Orientation="Horizontal" HorizontalAlignment="Right">

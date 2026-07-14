@@ -22,9 +22,11 @@ internal static class Program
             ("Windows autostart launch options", TestLaunchOptionsAsync),
             ("Windows autostart registration policy", TestStartupRegistrationAsync),
             ("Windows autostart replay decision", TestAutoStartReplayPolicyAsync),
+            ("Replay presentation state policy", TestReplayPresentationStatePolicyAsync),
             ("Hotkey gesture validation", TestHotkeyGesturesAsync),
             ("Storage estimate helpers", TestStorageEstimatorAsync),
             ("FFmpeg capture arguments", TestCaptureArgumentsAsync),
+            ("Capture geometry matrix", TestCaptureGeometryMatrixAsync),
             ("FFmpeg encoder strategies", TestEncoderStrategiesAsync),
             ("FFmpeg capability priority", TestEncoderCapabilityPriorityAsync),
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
@@ -266,6 +268,48 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestReplayPresentationStatePolicyAsync()
+    {
+        (ReplayState State, bool IsSession, bool SuspendsPresentation)[] cases =
+        [
+            (ReplayState.Stopped, false, false),
+            (ReplayState.Starting, true, true),
+            (ReplayState.Buffering, true, false),
+            (ReplayState.Ready, true, false),
+            (ReplayState.Saving, true, true),
+            (ReplayState.Faulted, false, false),
+            (ReplayState.Stopping, true, true)
+        ];
+
+        Assert.SequenceEqual(
+            Enum.GetValues<ReplayState>(),
+            cases.Select(item => item.State),
+            "The replay presentation matrix must explicitly cover every ReplayState.");
+        foreach (var item in cases)
+        {
+            var snapshot = CreateReplayStateSnapshot(item.State);
+            Assert.Equal(
+                item.IsSession,
+                MainWindow.IsReplaySessionState(snapshot),
+                $"{item.State} has the wrong replay-session classification.");
+            Assert.Equal(
+                item.SuspendsPresentation,
+                MainWindow.IsCapturePresentationSuspendedState(snapshot),
+                $"{item.State} has the wrong presentation-suspension classification.");
+            Assert.True(!item.SuspendsPresentation || item.IsSession,
+                $"{item.State} cannot suspend presentation outside an active replay session.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static ReplayStateSnapshot CreateReplayStateSnapshot(ReplayState state) =>
+        new(
+            state,
+            AvailableDuration: TimeSpan.Zero,
+            Retention: TimeSpan.FromMinutes(2),
+            BufferBytes: 0);
+
     private static Task TestBackgroundColorPolicyAsync()
     {
         Assert.Equal(
@@ -458,6 +502,31 @@ internal static class Program
             userSelection.ContinueAfterOpened,
             "A foreground user selection should continue after muted media priming completes.");
 
+        var replaySafeSelection = LibraryMediaOpenPlan.Create(
+            autoplay: true,
+            playbackVolume: 0);
+        Assert.Equal(0d, replaySafeSelection.PrimeVolume,
+            "Replay-safe media priming must remain silent.");
+        Assert.Equal(0d, replaySafeSelection.PlaybackVolume,
+            "Replay-safe playback must stay muted until the user explicitly opts in to audio.");
+        Assert.True(replaySafeSelection.MustPrimeWithPlay && replaySafeSelection.ContinueAfterOpened,
+            "A replay-safe foreground selection must still build and continue its media graph.");
+        Assert.True(
+            LibraryWindow.ShouldDeferAutomaticMediaOpen(
+                replayRunning: true,
+                beginTrimWhenReady: false),
+            "Opening Library during replay must not allocate a decoder without user intent.");
+        Assert.True(
+            !LibraryWindow.ShouldDeferAutomaticMediaOpen(
+                replayRunning: true,
+                beginTrimWhenReady: true),
+            "An explicit direct-trim request must be allowed to attach its source during replay.");
+        Assert.True(
+            !LibraryWindow.ShouldDeferAutomaticMediaOpen(
+                replayRunning: false,
+                beginTrimWhenReady: false),
+            "Normal Library browsing may preload the selected paused clip.");
+
         var requestedPath = @"C:\Clips\Clip_2026-07-13_15-00-00.mp4";
         Assert.True(
             !LibraryWindow.ShouldBeginRequestedTrim(
@@ -489,6 +558,23 @@ internal static class Program
                 hasCurrentClip: true,
                 hasSource: true),
             "A foreground player event with a live source should be handled.");
+        foreach (var state in new[] { ReplayState.Buffering, ReplayState.Ready })
+        {
+            var snapshot = CreateReplayStateSnapshot(state);
+            Assert.True(MainWindow.IsReplaySessionState(snapshot),
+                $"{state} must remain part of the active replay session.");
+            Assert.True(!MainWindow.IsCapturePresentationSuspendedState(snapshot),
+                $"{state} must not suspend foreground playback presentation.");
+            Assert.True(
+                MainWindow.ShouldHandlePlayerMediaEvent(
+                    captureCritical: false,
+                    isClosing: false,
+                    isVisible: true,
+                    isActive: true,
+                    hasCurrentClip: true,
+                    hasSource: true),
+                $"A foreground {state} replay player event should be handled.");
+        }
         Assert.True(
             !MainWindow.ShouldHandlePlayerMediaEvent(
                 captureCritical: true,
@@ -638,10 +724,9 @@ internal static class Program
             arguments.Any(argument => argument.Contains("amix=inputs=2", StringComparison.Ordinal)),
             "Two selected audio endpoints must be mixed.");
         Assert.Equal(
-            "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear," +
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p",
+            "scale=1280:720:flags=fast_bilinear,format=yuv420p",
             GetArgumentAfter(arguments, "-vf"),
-            "Fixed-resolution GDI capture must use the low-impact scaling path.");
+            "Fixed-resolution GDI capture must downscale directly without a padded canvas.");
         Assert.True(
             arguments[^1].EndsWith("segment-%09d.mkv", StringComparison.Ordinal),
             "Capture output must be a numbered Matroska segment pattern.");
@@ -654,12 +739,234 @@ internal static class Program
             [],
             @"C:\Buffer");
         Assert.Equal(
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "null,format=yuv420p",
             GetArgumentAfter(sourceArguments, "-vf"),
             "Source/native GDI capture must remain a no-resize path.");
 
         return Task.CompletedTask;
     }
+
+    private static Task TestCaptureGeometryMatrixAsync()
+    {
+        (int Width, int Height)[] displaySizes =
+        [
+            (1280, 720),
+            (1366, 768),
+            (1600, 900),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1080),
+            (2560, 1440),
+            (3440, 1440),
+            (3840, 2160),
+            (5120, 1440),
+            (1024, 768),
+            (1080, 1080),
+            (1080, 1920),
+            (1919, 1079),
+            (1365, 767)
+        ];
+
+        var caseNumber = 0;
+        foreach (var (sourceWidth, sourceHeight) in displaySizes)
+        {
+            foreach (var resolution in ResolutionOption.All)
+            {
+                caseNumber++;
+                var display = new DisplayOption(
+                    $@"\\.\DISPLAY{caseNumber}",
+                    $"Matrix display {caseNumber}",
+                    0,
+                    0,
+                    sourceWidth,
+                    sourceHeight,
+                    true,
+                    caseNumber);
+                var configuration = new CaptureConfiguration(
+                    display,
+                    resolution,
+                    60,
+                    TimeSpan.FromMinutes(2),
+                    false,
+                    null,
+                    false,
+                    null,
+                    @"C:\Clips");
+                var expected = ResolveExpectedCaptureSize(
+                    sourceWidth,
+                    sourceHeight,
+                    resolution);
+                var actual = CaptureGeometry.ResolveOutputSize(display, resolution);
+                var context = $"{sourceWidth}x{sourceHeight} at {resolution.Id}";
+
+                Assert.Equal(expected.Width, actual.Width, $"{context} resolved the wrong output width.");
+                Assert.Equal(expected.Height, actual.Height, $"{context} resolved the wrong output height.");
+                Assert.Equal(
+                    expected.RequiresScaling,
+                    actual.RequiresScaling,
+                    $"{context} reported the wrong scaling state.");
+                Assert.True(actual.Width >= 2 && actual.Height >= 2,
+                    $"{context} produced an invalid output size.");
+                Assert.True(actual.Width % 2 == 0 && actual.Height % 2 == 0,
+                    $"{context} did not produce encoder-safe even dimensions.");
+                Assert.True(actual.Width <= sourceWidth - sourceWidth % 2,
+                    $"{context} upscaled the source width.");
+                Assert.True(actual.Height <= sourceHeight - sourceHeight % 2,
+                    $"{context} upscaled the source height.");
+                if (resolution.Width is { } maximumWidth && resolution.Height is { } maximumHeight)
+                {
+                    Assert.True(actual.Width <= maximumWidth && actual.Height <= maximumHeight,
+                        $"{context} exceeded its preset bounds.");
+                }
+
+                var aspectCrossProductError = Math.Abs(
+                    actual.Width * (long)sourceHeight - actual.Height * (long)sourceWidth);
+                var maximumEvenRoundingError = 2L * sourceWidth + 2L * sourceHeight;
+                Assert.True(aspectCrossProductError <= maximumEvenRoundingError,
+                    $"{context} did not preserve the source aspect ratio within even-pixel rounding.");
+
+                var gdiArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+                    configuration,
+                    [],
+                    VideoEncodingStrategy.SoftwareGdi,
+                    @"C:\Buffer");
+                var gdiFilter = GetArgumentAfter(gdiArguments, "-vf") ?? string.Empty;
+                var expectedGdiFilter = expected.RequiresScaling
+                    ? $"scale={expected.Width}:{expected.Height}:flags=fast_bilinear,format=yuv420p"
+                    : sourceWidth % 2 == 0 && sourceHeight % 2 == 0
+                        ? "null,format=yuv420p"
+                        : "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear,format=yuv420p";
+                Assert.Equal(expectedGdiFilter, gdiFilter,
+                    $"{context} built the wrong GDI geometry filter.");
+                Assert.True(!gdiFilter.Contains("pad=", StringComparison.Ordinal),
+                    $"{context} reintroduced a padded GDI canvas.");
+
+                var wgcArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+                    configuration,
+                    [],
+                    new VideoEncodingStrategy(
+                        VideoEncoderKind.NvidiaNvenc,
+                        DesktopCaptureBackend.WindowsGraphicsCapture),
+                    @"C:\Buffer");
+                var wgcFilter = GetArgumentAfter(wgcArguments, "-i") ?? string.Empty;
+                var expectedWgcGeometry = expected.RequiresScaling
+                    ? $":width={expected.Width}:height={expected.Height}:resize_mode=scale:scale_mode=bilinear"
+                    : ":width=-2:height=-2:resize_mode=crop:scale_mode=point";
+                Assert.True(wgcFilter.Contains(expectedWgcGeometry, StringComparison.Ordinal),
+                    $"{context} built the wrong WGC geometry path: {wgcFilter}");
+                Assert.True(!wgcFilter.Contains("resize_mode=scale_aspect", StringComparison.Ordinal),
+                    $"{context} reintroduced the padded WGC aspect scaler.");
+            }
+        }
+
+        Assert.Equal(75, caseNumber, "The capture geometry Cartesian matrix is incomplete.");
+        Assert.Equal(
+            (1920, 804, true),
+            ResolveExpectedCaptureSize(
+                3440,
+                1440,
+                ResolutionOption.All.Single(option => option.Id == "1080p")),
+            "Ultrawide 1080p bounds should choose the closest even secondary axis.");
+        Assert.Equal(
+            (608, 1080, true),
+            ResolveExpectedCaptureSize(
+                1080,
+                1920,
+                ResolutionOption.All.Single(option => option.Id == "1080p")),
+            "Portrait 1080p bounds should choose the closest even secondary axis.");
+
+        var originalDisplay = new DisplayOption(
+            @"\.\DISPLAY1",
+            "Original",
+            0,
+            0,
+            2560,
+            1440,
+            true,
+            0);
+        var movedDisplay = originalDisplay with { Left = 2560 };
+        var fixedOutputDisplay = originalDisplay with { Width = 1920, Height = 1080 };
+        var squareDisplay = originalDisplay with { Width = 1080, Height = 1080 };
+        var sourceResolution = ResolutionOption.All.Single(option => option.Id == "source");
+        var fullHdResolution = ResolutionOption.All.Single(option => option.Id == "1080p");
+        var wgcStrategy = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.WindowsGraphicsCapture);
+        var wgcSourcePlan = new CaptureSessionPlan(originalDisplay, sourceResolution, wgcStrategy);
+        var wgcFixedPlan = new CaptureSessionPlan(originalDisplay, fullHdResolution, wgcStrategy);
+        var gdiPlan = new CaptureSessionPlan(
+            originalDisplay,
+            fullHdResolution,
+            VideoEncodingStrategy.SoftwareGdi);
+
+        Assert.True(
+            !CaptureGeometry.RequiresRestartForDisplayChange(wgcFixedPlan, movedDisplay),
+            "A coordinate-only WGC change must not erase the rolling buffer.");
+        Assert.True(
+            CaptureGeometry.RequiresRestartForDisplayChange(gdiPlan, movedDisplay),
+            "GDI must restart when its baked desktop coordinates change.");
+        Assert.True(
+            !CaptureGeometry.RequiresRestartForDisplayChange(wgcFixedPlan, fixedOutputDisplay),
+            "WGC should keep a fixed 1080p stream when its resolved output remains 1920x1080.");
+        Assert.True(
+            CaptureGeometry.RequiresRestartForDisplayChange(wgcSourcePlan, fixedOutputDisplay),
+            "Source/native must restart when its encoded dimensions change.");
+        Assert.True(
+            CaptureGeometry.RequiresRestartForDisplayChange(wgcFixedPlan, squareDisplay),
+            "A square custom mode that changes encoded dimensions must restart safely.");
+        Assert.True(
+            MainWindow.ShouldRestartReplayAfterDisplayChange(
+                replayStartRequested: true,
+                replayRunning: false,
+                captureRestartInProgress: false,
+                capturePlan: wgcFixedPlan,
+                currentDisplay: fixedOutputDisplay),
+            "A WGC fault before the debounce completes must recover the requested replay session.");
+        Assert.True(
+            !MainWindow.ShouldRestartReplayAfterDisplayChange(
+                replayStartRequested: false,
+                replayRunning: true,
+                captureRestartInProgress: false,
+                capturePlan: wgcSourcePlan,
+                currentDisplay: fixedOutputDisplay),
+            "An explicit user stop must win over a late display-change event.");
+        return Task.CompletedTask;
+    }
+
+    private static (int Width, int Height, bool RequiresScaling) ResolveExpectedCaptureSize(
+        int sourceWidth,
+        int sourceHeight,
+        ResolutionOption resolution)
+    {
+        var evenSourceWidth = sourceWidth - sourceWidth % 2;
+        var evenSourceHeight = sourceHeight - sourceHeight % 2;
+        if (resolution.Width is not { } maximumWidth || resolution.Height is not { } maximumHeight ||
+            (sourceWidth <= maximumWidth && sourceHeight <= maximumHeight))
+        {
+            return (evenSourceWidth, evenSourceHeight, false);
+        }
+
+        int width;
+        int height;
+        if ((long)maximumWidth * sourceHeight <= (long)maximumHeight * sourceWidth)
+        {
+            width = maximumWidth;
+            height = RoundExpectedToEven(sourceHeight * (double)maximumWidth / sourceWidth);
+        }
+        else
+        {
+            height = maximumHeight;
+            width = RoundExpectedToEven(sourceWidth * (double)maximumHeight / sourceHeight);
+        }
+
+        return (
+            Math.Min(evenSourceWidth, Math.Min(maximumWidth - maximumWidth % 2, width)),
+            Math.Min(evenSourceHeight, Math.Min(maximumHeight - maximumHeight % 2, height)),
+            width != evenSourceWidth || height != evenSourceHeight);
+    }
+
+    private static int RoundExpectedToEven(double value) =>
+        Math.Max(2, (int)Math.Round(value / 2d, MidpointRounding.AwayFromZero) * 2);
 
     private static Task TestEncoderStrategiesAsync()
     {
@@ -750,12 +1057,12 @@ internal static class Program
             @"C:\Buffer");
         Assert.True(
             nativeFullHdGraphics.Any(argument => argument.Contains(
-                ":width=-2:height=-2:resize_mode=scale_aspect",
+                ":width=-2:height=-2:resize_mode=crop:scale_mode=point",
                 StringComparison.Ordinal)),
             "A fixed preset that matches the native display must bypass WGC resizing.");
         Assert.True(
             graphicsNvenc.Any(argument => argument.Contains(
-                ":width=1920:height=1080:resize_mode=scale_aspect",
+                ":width=1920:height=1080:resize_mode=scale:scale_mode=bilinear",
                 StringComparison.Ordinal)),
             "A smaller fixed preset must retain WGC aspect-preserving scaling.");
 
@@ -1107,6 +1414,41 @@ internal static class Program
             Assert.True(!silentArguments.Contains("0:a:0?", StringComparer.Ordinal),
                 "A silent trim must not add an optional audio mapping.");
             Assert.ContainsSequence(silentArguments, "-c:v", "h264_nvenc");
+
+            var replayCoexistingArguments = FfmpegArgumentBuilder.BuildTrimArguments(
+                inputPath,
+                outputPath,
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(4),
+                includeAudio: true,
+                framesPerSecond: 60,
+                VideoEncodingStrategy.SoftwareGdi,
+                replayCoexisting: true);
+            Assert.ContainsSequence(
+                replayCoexistingArguments,
+                "-filter_threads", "1",
+                "-threads", "1",
+                "-readrate", "1");
+            Assert.ContainsSequence(replayCoexistingArguments, "-c:v", "libx264");
+            Assert.Equal(
+                2,
+                replayCoexistingArguments.Count(argument => argument == "-threads"),
+                "Replay-coexisting trim must constrain both decoding and software encoding.");
+            Assert.True(
+                replayCoexistingArguments
+                    .Select((argument, index) => (argument, index))
+                    .Where(item => item.argument == "-threads")
+                    .All(item => item.index + 1 < replayCoexistingArguments.Count &&
+                                 replayCoexistingArguments[item.index + 1] == "1"),
+                "Every replay-coexisting trim thread limit must be one.");
+            Assert.True(
+                Array.IndexOf(replayCoexistingArguments.ToArray(), "-readrate") <
+                Array.IndexOf(replayCoexistingArguments.ToArray(), "-i"),
+                "Replay pacing must be applied before opening the trim input.");
+            Assert.True(
+                !replayCoexistingArguments.Any(argument =>
+                    argument is "h264_nvenc" or "h264_qsv" or "h264_amf"),
+                "Replay-coexisting trim must not claim a hardware encoder used by live capture.");
 
             Assert.Throws<ArgumentOutOfRangeException>(
                 () => FfmpegArgumentBuilder.BuildTrimArguments(
@@ -1625,6 +1967,31 @@ internal static class Program
                 clips[0].ThumbnailPath,
                 secondLoad[0].ThumbnailPath,
                 "An unchanged clip must have a deterministic thumbnail cache key.");
+
+            var missingCachedThumbnail = clips[0].ThumbnailPath
+                ?? throw new InvalidOperationException("The generated thumbnail path was missing.");
+            File.Delete(missingCachedThumbnail);
+            var thumbnailRunsBeforeCachedOnlyLoad = runner.ThumbnailRunCount;
+            var cachedOnlyLoad = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 5,
+                    includeThumbnails: true,
+                    filter: ClipLibraryFilter.All,
+                    thumbnailPolicy: ClipThumbnailPolicy.CachedOnly)
+                .ConfigureAwait(false);
+            Assert.Equal(2, cachedOnlyLoad.Count,
+                "Cached-only discovery must still return safely probed clips.");
+            Assert.Equal(
+                thumbnailRunsBeforeCachedOnlyLoad,
+                runner.ThumbnailRunCount,
+                "Cached-only discovery must never start FFmpeg for a missing thumbnail.");
+            Assert.True(
+                cachedOnlyLoad.Single(item => item.FileName == clips[0].FileName).ThumbnailPath is null,
+                "A missing cached-only thumbnail must remain absent instead of being regenerated.");
+            Assert.True(
+                cachedOnlyLoad.Single(item => item.FileName == clips[1].FileName).ThumbnailPath is { } cachedPath &&
+                File.Exists(cachedPath),
+                "Cached-only discovery should continue exposing an existing valid thumbnail.");
             Assert.True(
                 ClipLibraryService.IsCurrentClipSafe(clipsDirectory, clips[0]),
                 "A freshly discovered unchanged recording should pass the pre-playback identity check.");
@@ -1823,6 +2190,46 @@ internal static class Program
             Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
                 "A successful trim left a partial output behind.");
 
+            var replayCoexistingRunner = new FakeTrimMediaProcessRunner();
+            var replayCoexistingService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                replayCoexistingRunner);
+            var replayCoexisting = await replayCoexistingService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.Succeeded, replayCoexisting.Status,
+                $"Replay-coexisting trim failed: {replayCoexisting.Message}");
+            Assert.Equal(1, replayCoexistingRunner.TrimRunCount,
+                "Replay-coexisting trim must launch one bounded software export.");
+            var replayFfmpegInvocations = replayCoexistingRunner.Invocations
+                .Where(invocation => Path.GetFileName(invocation.ExecutablePath).Equals(
+                    "ffmpeg.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            Assert.Equal(1, replayFfmpegInvocations.Length,
+                "Replay-coexisting trim must skip all hardware encoder probes.");
+            var replayTrimArguments = replayFfmpegInvocations[0].Arguments;
+            Assert.ContainsSequence(
+                replayTrimArguments,
+                "-filter_threads", "1",
+                "-threads", "1",
+                "-readrate", "1");
+            Assert.ContainsSequence(replayTrimArguments, "-c:v", "libx264", "-preset", "ultrafast");
+            Assert.True(
+                !replayTrimArguments.Any(argument =>
+                    argument is "h264_nvenc" or "h264_qsv" or "h264_amf"),
+                "Replay-coexisting service trim claimed a live-capture hardware encoder.");
+            Assert.True(
+                !replayTrimArguments.Contains("lavfi", StringComparer.Ordinal),
+                "Replay-coexisting service trim unexpectedly ran an encoder capability probe.");
+            Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
+                "Replay-coexisting trim left a partial output behind.");
+
             var variableAverageRunner = new FakeTrimMediaProcessRunner
             {
                 SourceAverageFrameRate = "355/6",
@@ -1921,12 +2328,47 @@ internal static class Program
                 await cancellationRunner.TrimStarted.Task
                     .WaitAsync(TimeSpan.FromSeconds(10))
                     .ConfigureAwait(false);
+                Assert.True(
+                    cancellationService.HasReplayBlockingTrimWork,
+                    "A standard trim must keep replay blocked while cancellation is still unwinding.");
                 cancellation.Cancel();
                 var cancelled = await trimTask.ConfigureAwait(false);
                 Assert.Equal(ClipTrimStatus.Cancelled, cancelled.Status,
                     "A cancelled export did not return Cancelled.");
                 Assert.True(!cancelled.Succeeded && cancelled.OutputPath is null,
                     "A cancelled export returned an output path.");
+                Assert.True(
+                    !cancellationService.HasReplayBlockingTrimWork,
+                    "The shared replay block did not clear after the standard trim finished cancelling.");
+            }
+
+            var coexistCancellationRunner = new FakeTrimMediaProcessRunner
+            {
+                WaitForTrimCancellation = true
+            };
+            var coexistCancellationService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                coexistCancellationRunner);
+            using (var cancellation = new CancellationTokenSource())
+            {
+                var trimTask = coexistCancellationService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(4),
+                    ClipTrimExecutionMode.ReplayCoexisting,
+                    cancellation.Token);
+                await coexistCancellationRunner.TrimStarted.Task
+                    .WaitAsync(TimeSpan.FromSeconds(10))
+                    .ConfigureAwait(false);
+                Assert.True(
+                    !coexistCancellationService.HasReplayBlockingTrimWork,
+                    "A paced replay-coexisting trim must not block replay start/restart.");
+                cancellation.Cancel();
+                var cancelled = await trimTask.ConfigureAwait(false);
+                Assert.Equal(ClipTrimStatus.Cancelled, cancelled.Status,
+                    "A cancelled replay-coexisting export did not return Cancelled.");
             }
 
             Assert.True(File.Exists(sourcePath), "Cancellation removed the original.");

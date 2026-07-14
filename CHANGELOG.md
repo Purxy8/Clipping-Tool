@@ -4,6 +4,40 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.1] - 2026-07-14
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Fixed
+
+- Fixed-resolution capture no longer forces every display into a padded 16:9 canvas. The 720p/1080p/1440p/2160p choices are now aspect-preserving **up to** bounds that never upscale, keep custom square, portrait, 4:3, 16:10, and ultrawide geometry, and bypass resizing when the selected display already fits.
+- Library and latest-player media are no longer disabled for the entire replay session. Browsing, play/pause, seeking, and frame-accurate trimming remain available while replay is steadily buffering or ready; only the short start, save, and stop transitions suspend presentation and release the decoder.
+- Opening or refreshing Library during replay no longer allocates a decoder until the user explicitly selects Play or requests Trim. Main and Library replace the WPF media element for every new source so a late event from a closed graph cannot mutate or autoplay the next clip.
+- A standard trim keeps replay startup blocked until cancellation has actually unwound, even if Library closes. A replay-coexisting trim remains restart-compatible.
+- A debounced Windows display-mode refresh re-resolves the selected monitor by device name. Source/output-size changes and GDI's baked geometry restart safely, while direct WGC coordinate-only or same-output fixed-preset changes preserve the current rolling buffer. Explicit replay intent now survives a mode-transition fault and recovers using the newest geometry.
+
+### Performance
+
+- Direct hardware Windows Graphics Capture runs at Normal priority so a fullscreen foreground workload is less likely to starve the capture feed. Compatibility, GDI, and software capture fallbacks remain below normal, while media probes, thumbnails, and other auxiliary FFmpeg work run at Idle priority.
+- During steady replay, Recent and Library refreshes use existing cached thumbnails instead of starting missing thumbnail decodes, and media is connected only for the explicitly selected foreground player. Replay-time playback starts muted because unmuted desktop playback can be captured by the rolling buffer.
+- Replay-coexisting trim forces real-time-paced one-thread `libx264`, skips hardware-encoder probes, avoids the GPU encoder, and runs at Idle priority. This protects capture headroom at the cost of an export that can take at least approximately the selected duration.
+
+### Verification coverage
+
+- Added a desktop-independent `--resolution-matrix` smoke mode for exhaustive geometry checks plus curated real 30/60 FPS encodes across standard, 16:10, 4:3, ultrawide, super-ultrawide, square, portrait, and odd-sized inputs. `--matrix-exhaustive` encodes every source/preset pair.
+- Added an interactive `--wgc-matrix` mode for sequential Source and fixed-preset checks against the selected live Windows display, including cadence/motion validation, and a `--replay-trim-smoke` mode that exercises a constrained trim while real replay capture remains active.
+- These checks do not reproduce every game's exclusive-fullscreen composition path, custom internal resolution, affected GPU/driver, or input-latency conditions. Target-game validation on affected or equivalent hardware remains required before claiming a hardware-specific stutter is resolved.
+
+### Verification note
+
+- The Release solution builds with zero warnings and errors, formatting is clean, `git diff --check` is clean, and the deterministic suite passes 42/42 tests. The NuGet audit reports no known vulnerable direct or transitive package from the configured sources.
+- The exhaustive desktop-independent run passed 75/75 source/preset geometry cases and all 150 real encodes (75 at 30 FPS and 75 at 60 FPS). Every case reported the expected size, frame rate, and frame count, met the 33.334/16.667 ms cadence limits, and decoded with a 0.0% duplicate ratio across standard, 16:10, 4:3, square, portrait, ultrawide, super-ultrawide, and odd-sized inputs.
+- The replay-coexisting audio trim smoke produced a validated 5.221-second, 156-frame 640x360 30 FPS MP4 with one audio stream, retained the original, and left no partial or orphaned helper process.
+- This automated build session cannot access the interactive Windows Graphics Capture desktop (`gdigrab` error 5 after fallback). Fullscreen/custom-mode motion cadence and game impact still require confirmation on the installed build and affected PC; these results are not a universal zero-stutter guarantee.
+
 ## [1.8.0-beta.1] - 2026-07-14
 
 ### Release status

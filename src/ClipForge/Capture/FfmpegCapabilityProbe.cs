@@ -96,8 +96,11 @@ internal sealed class FfmpegCapabilityProbe
     {
         var diagnostics = new List<string>();
         VideoEncodingStrategy? firstHardwareGdiFallback = null;
-        var targetWidth = configuration.Resolution.Width ?? configuration.Display.Width;
-        var targetHeight = configuration.Resolution.Height ?? configuration.Display.Height;
+        var outputSize = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution);
+        var targetWidth = outputSize.Width;
+        var targetHeight = outputSize.Height;
 
         foreach (var encoder in HardwarePreference)
         {

@@ -63,6 +63,13 @@ public enum ClipLibraryFilter
     Trimmed
 }
 
+public enum ClipThumbnailPolicy
+{
+    GenerateMissing,
+    CachedOnly,
+    None
+}
+
 internal readonly record struct ClipFileIdentity(
     ulong VolumeSerialNumber,
     ulong FileIdLow,
