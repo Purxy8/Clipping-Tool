@@ -88,13 +88,13 @@ internal static class CaptureGeometry
                    previousDisplay.Height != currentDisplay.Height;
         }
 
-        // WGC tracks the selected monitor across coordinate changes and can
-        // resize a changing source into an unchanged fixed output texture. Only
-        // restart when the encoded frame dimensions themselves must change.
-        var previousOutput = ResolveOutputSize(previousDisplay, capturePlan.Resolution);
-        var currentOutput = ResolveOutputSize(currentDisplay, capturePlan.Resolution);
-        return previousOutput.Width != currentOutput.Width ||
-               previousOutput.Height != currentOutput.Height;
+        // WGC tracks coordinate-only moves, but an exclusive-fullscreen mode
+        // transition can invalidate or starve its frame pool even when a fixed
+        // preset still resolves to the same encoded size. Reacquire the monitor
+        // whenever its source dimensions change instead of preserving a buffer
+        // that may contain CFR duplicates of a stale surface.
+        return previousDisplay.Width != currentDisplay.Width ||
+               previousDisplay.Height != currentDisplay.Height;
     }
 
     private static int MakeEven(int value) => value - value % 2;

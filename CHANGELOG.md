@@ -4,6 +4,43 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.3] - 2026-07-14
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Fixed
+
+- Windows Graphics Capture now reacquires its frame pool whenever the selected monitor's source dimensions change, including fullscreen/custom-mode transitions whose fixed preset still resolves to the same encoded size. Coordinate-only monitor moves continue without discarding the buffer.
+- Fixed WGC presets now use the capture source's low-overhead point sampler for required downscaling, while **Source** and already-fitting presets stay on the native surface path instead of activating the resizer.
+
+### Reliability
+
+- The capture process now exposes machine-readable FFmpeg progress to a conservative WGC health monitor. It can distinguish an advancing CFR stream made almost entirely of duplicate frames from a static desktop by requiring a fullscreen foreground window, sustained coverage, and recent-input-aware confirmation; it also detects an alive recorder whose progress and segments both stop advancing.
+- Automatic recovery is bounded per manual replay session. The first detection reacquires the same verified WGC strategy; the second freshly probes temporary, non-persisted **Source** geometry and proceeds only with a verified WGC path. Later detections warn without starting a restart loop. A recovery waits for an active clip save to finish and rejects stale events from an earlier FFmpeg PID.
+- Each continuous FFmpeg capture child is attached immediately to a private Windows Job Object with kill-on-close containment. Normal shutdown remains graceful, while abrupt ClipForge termination no longer intentionally leaves its owned recorder running.
+
+### Performance
+
+- Required fixed-preset scaling now favors reduced live shader work over bilinear filtering, and the redundant capture-side FPS filter was removed so the WGC source and final CFR output own cadence without an extra filter stage.
+- Progress health monitoring parses one small text record per second and does not decode the rolling video or scan the complete buffer.
+
+### Release validation
+
+- Interactive WGC release checks now require decoded-motion validation for Source and fixed presets because nominal CFR timestamps alone can hide repeated stale frames.
+- Capture-lifecycle validation now includes a disposable parent-termination check proving that the exact Job-owned FFmpeg child exits promptly, in addition to normal Start/Stop/Exit coverage. These checks remain machine-specific and do not establish universal lag-free fullscreen capture.
+
+### Verification note
+
+- The Release solution builds with zero warnings and errors, formatting and whitespace checks are clean, the deterministic suite passes 47/47 tests, and the current NuGet audit reports no known vulnerable direct or transitive packages from the configured source.
+- Regression coverage verifies the point-scaled/bypass argument paths, removal of the redundant FPS filter, complete progress-record parsing, healthy/non-fullscreen/transient/active/idle starvation cases, continuing-input gating, 75% fullscreen sampling, sustained eligibility reset, source-size restart policy, and kill-on-close owned-child lifetime. Code review separately verifies the save-deferred, PID-scoped, freshly probed Source recovery branch.
+- Live WGC smoke on the development PC produced a 1920x1080 mixed-audio clip with 359 frames over 6.016 seconds at 60.003 FPS and a Source/native 2560x1440 mixed-audio clip with the same duration, frame count, and cadence. The desktop-independent matrix passed 75 geometry combinations and 36 real 30/60 FPS motion encodes with 0.0% duplicates.
+- A three-frame-per-three-second synthetic input followed by final CFR pacing reported 177 duplicate frames out of 180 through the new progress channel; the removed capture-side FPS filter masked the same condition by reporting zero, confirming why it could not support recovery diagnostics.
+- The Job Object coverage verifies both explicit handle disposal and abrupt termination of a separate owner process without killing its child directly.
+- The deterministic checks do not recreate Call of Duty, an affected exclusive-fullscreen composition path, or sustained GPU contention. The progress watchdog observes CFR-inserted duplicates rather than decoding pixels, so a source that supplies already-timestamped identical frames can evade it. Decoded-motion validation on the affected or equivalent target PC remains required before this change can be described as universally resolving fullscreen stutter.
+
 ## [1.9.0-beta.2] - 2026-07-14
 
 ### Release status

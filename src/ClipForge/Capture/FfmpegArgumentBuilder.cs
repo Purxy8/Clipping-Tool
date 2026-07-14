@@ -46,7 +46,10 @@ internal static class FfmpegArgumentBuilder
         var arguments = new List<string>
         {
             "-hide_banner",
-            "-loglevel", "warning"
+            "-loglevel", "warning",
+            "-nostats",
+            "-stats_period", "1",
+            "-progress", "pipe:1"
         };
 
         AddVideoInput(arguments, configuration, encodingStrategy);
@@ -415,11 +418,14 @@ internal static class FfmpegArgumentBuilder
 
         if (output.RequiresScaling)
         {
-            // Resolve the aspect-preserving dimensions before FFmpeg starts.
-            // resize_mode=scale can then use the smaller direct destination and
-            // avoids clearing/drawing a padded scale_aspect texture every frame.
+            // Resolve the aspect-preserving dimensions before FFmpeg starts. WGC's
+            // point sampler is deliberately used for the live replay path: it does
+            // less shader work than bilinear scaling and preserves more headroom
+            // while a fullscreen game owns most of the GPU. The exact output path
+            // is exercised by the runtime graphics-capture probe, which falls back
+            // to a transfer or GDI when the selected adapter cannot sustain it.
             filter += $":width={output.Width}:height={output.Height}" +
-                      ":resize_mode=scale:scale_mode=bilinear";
+                      ":resize_mode=scale:scale_mode=point";
         }
         else
         {
@@ -430,8 +436,6 @@ internal static class FfmpegArgumentBuilder
             // round the native monitor size down to the requested multiple.
             filter += ":width=-2:height=-2:resize_mode=crop:scale_mode=point";
         }
-
-        filter += $",fps={Invariant(configuration.FramesPerSecond)}";
 
         if (!encodingStrategy.RequiresSystemMemoryTransfer)
         {

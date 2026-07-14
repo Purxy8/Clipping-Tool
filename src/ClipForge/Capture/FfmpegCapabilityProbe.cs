@@ -101,6 +101,7 @@ internal sealed class FfmpegCapabilityProbe
             configuration.Resolution);
         var targetWidth = outputSize.Width;
         var targetHeight = outputSize.Height;
+        var graphicsPath = DescribeGraphicsPath(outputSize);
 
         foreach (var encoder in HardwarePreference)
         {
@@ -141,14 +142,16 @@ internal sealed class FfmpegCapabilityProbe
 
             if (graphicsProbe.Succeeded)
             {
-                diagnostics.Add($"Selected {graphicsStrategy.Description} after runtime verification.");
+                diagnostics.Add(
+                    $"Selected {graphicsStrategy.Description} with {graphicsPath} after runtime verification.");
                 return new FfmpegCapabilitySelection(
                     graphicsStrategy,
                     string.Join(' ', diagnostics));
             }
 
             diagnostics.Add(
-                $"Direct Windows Graphics Capture unavailable: {Summarize(graphicsProbe.Diagnostic)}");
+                $"Direct Windows Graphics Capture with {graphicsPath} unavailable: " +
+                Summarize(graphicsProbe.Diagnostic));
 
             var transferStrategy = graphicsStrategy with
             {
@@ -164,14 +167,16 @@ internal sealed class FfmpegCapabilityProbe
 
             if (transferProbe.Succeeded)
             {
-                diagnostics.Add($"Selected {transferStrategy.Description} after runtime verification.");
+                diagnostics.Add(
+                    $"Selected {transferStrategy.Description} with {graphicsPath} after runtime verification.");
                 return new FfmpegCapabilitySelection(
                     transferStrategy,
                     string.Join(' ', diagnostics));
             }
 
             diagnostics.Add(
-                $"Windows Graphics Capture compatibility transfer unavailable: {Summarize(transferProbe.Diagnostic)}");
+                $"Windows Graphics Capture compatibility transfer with {graphicsPath} unavailable: " +
+                Summarize(transferProbe.Diagnostic));
         }
 
         if (firstHardwareGdiFallback is not null)
@@ -197,14 +202,15 @@ internal sealed class FfmpegCapabilityProbe
 
         if (softwareGraphicsProbe.Succeeded)
         {
-            diagnostics.Add($"Selected {softwareGraphics.Description}.");
+            diagnostics.Add($"Selected {softwareGraphics.Description} with {graphicsPath}.");
             return new FfmpegCapabilitySelection(
                 softwareGraphics,
                 string.Join(' ', diagnostics));
         }
 
         diagnostics.Add(
-            $"Windows Graphics Capture unavailable: {Summarize(softwareGraphicsProbe.Diagnostic)}");
+            $"Windows Graphics Capture with {graphicsPath} unavailable: " +
+            Summarize(softwareGraphicsProbe.Diagnostic));
         diagnostics.Add($"Selected {VideoEncodingStrategy.SoftwareGdi.Description} as the safe fallback.");
         return new FfmpegCapabilitySelection(
             VideoEncodingStrategy.SoftwareGdi,
@@ -271,6 +277,11 @@ internal sealed class FfmpegCapabilityProbe
             .Trim();
         return summary.Length <= 240 ? summary : summary[^240..];
     }
+
+    private static string DescribeGraphicsPath(CaptureOutputSize outputSize) =>
+        outputSize.RequiresScaling
+            ? $"low-overhead point scaling to {outputSize.Width}x{outputSize.Height}"
+            : $"native {outputSize.Width}x{outputSize.Height} surfaces";
 }
 
 internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner

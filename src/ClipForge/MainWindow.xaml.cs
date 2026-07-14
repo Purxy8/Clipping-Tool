@@ -63,6 +63,8 @@ public partial class MainWindow : Window
     private bool _libraryRefreshPending;
     private bool _captureCriticalPresentationActive;
     private bool _captureRestartInProgress;
+    private bool _captureRecoveryQueued;
+    private bool _automaticCaptureSourceFallback;
     private bool _replayStartRequested;
     private bool _playerSourceReleasedForBackground;
     private bool _isPlayerPlaying;
@@ -84,6 +86,7 @@ public partial class MainWindow : Window
     private bool _refreshingDisplaySelection;
     private string? _lastTrayStatus;
     private bool? _lastTrayCanSave;
+    private int _automaticCaptureRecoveryCount;
 
     public MainWindow()
         : this(AppLaunchOptions.Interactive)
@@ -97,6 +100,8 @@ public partial class MainWindow : Window
         _clipLibraryService = new ClipLibraryService(_ffmpegSetupService);
         _clipTrimService = new ClipTrimService(_ffmpegSetupService);
         _replayBufferService.StateChanged += ReplayBufferService_StateChanged;
+        _replayBufferService.CaptureRecoveryRequested +=
+            ReplayBufferService_CaptureRecoveryRequested;
         _appUpdateService.StateChanged += AppUpdateService_StateChanged;
 
         InitializeComponent();
@@ -319,10 +324,12 @@ public partial class MainWindow : Window
             if (_replayBufferService.IsRunning)
             {
                 _replayStartRequested = false;
+                ResetAutomaticCaptureRecovery();
                 await _replayBufferService.StopAsync();
             }
             else
             {
+                ResetAutomaticCaptureRecovery();
                 await StartReplayCoreAsync();
             }
         });
@@ -523,6 +530,7 @@ public partial class MainWindow : Window
              _captureRestartInProgress ||
              _replayStartRequested))
         {
+            ResetAutomaticCaptureRecovery();
             await RunCaptureCommandAsync(async () =>
             {
                 if (_isClosing)
@@ -610,15 +618,20 @@ public partial class MainWindow : Window
     {
         try
         {
+            ResetAutomaticCaptureRecovery();
             // Windows can report the signed-in desktop before GPU and audio
             // endpoints are fully ready. Give them a short bounded window.
             await Task.Delay(TimeSpan.FromSeconds(3), _lifetimeCancellation.Token);
 
-            var error = await RunCaptureCommandAsync(StartReplayCoreAsync, showError: false);
+            var error = await RunCaptureCommandAsync(
+                () => StartReplayCoreAsync(),
+                showError: false);
             if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
             {
                 await Task.Delay(TimeSpan.FromSeconds(4), _lifetimeCancellation.Token);
-                error = await RunCaptureCommandAsync(StartReplayCoreAsync, showError: false);
+                error = await RunCaptureCommandAsync(
+                    () => StartReplayCoreAsync(),
+                    showError: false);
             }
 
             if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
@@ -634,7 +647,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task StartReplayCoreAsync()
+    private async Task StartReplayCoreAsync(
+        bool sourceSafetyMode = false,
+        VideoEncodingStrategy? sessionStrategyOverride = null)
     {
         if (_clipTrimService.HasReplayBlockingTrimWork)
         {
@@ -658,6 +673,18 @@ public partial class MainWindow : Window
         }
 
         var configuration = BuildCaptureConfiguration();
+        if (sourceSafetyMode)
+        {
+            if (sessionStrategyOverride is not null)
+            {
+                throw new InvalidOperationException(
+                    "Source safety recovery must runtime-verify the native capture geometry.");
+            }
+
+            var sourceResolution = ResolutionOption.All.First(option =>
+                option.Width is null && option.Height is null);
+            configuration = configuration with { Resolution = sourceResolution };
+        }
 
         // Decoder graphs, media helpers, and thumbnail refreshes are presentation
         // work. Release them before FFmpeg starts so capture owns the available
@@ -666,9 +693,20 @@ public partial class MainWindow : Window
         try
         {
             _replayStartRequested = true;
-            await _replayBufferService.StartAsync(
-                configuration,
-                _lifetimeCancellation.Token);
+            if (sessionStrategyOverride is null && !sourceSafetyMode)
+            {
+                await _replayBufferService.StartAsync(
+                    configuration,
+                    _lifetimeCancellation.Token);
+            }
+            else
+            {
+                await _replayBufferService.StartAsync(
+                    configuration,
+                    _lifetimeCancellation.Token,
+                    sessionStrategyOverride,
+                    sourceSafetyMode);
+            }
         }
         catch
         {
@@ -1237,6 +1275,120 @@ public partial class MainWindow : Window
         public nint Handle { get; } = handle;
     }
 
+    private void ReplayBufferService_CaptureRecoveryRequested(
+        object? sender,
+        CaptureRecoveryRequestedEventArgs eventArgs)
+    {
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() =>
+                ReplayBufferService_CaptureRecoveryRequested(sender, eventArgs));
+            return;
+        }
+
+        if (_captureRecoveryQueued)
+        {
+            return;
+        }
+
+        _captureRecoveryQueued = true;
+        _ = RecoverCaptureAsync(eventArgs);
+    }
+
+    private async Task RecoverCaptureAsync(CaptureRecoveryRequestedEventArgs eventArgs)
+    {
+        try
+        {
+            while (!_isClosing &&
+                   _replayBufferService.IsRunning &&
+                   _latestState.State == ReplayState.Saving)
+            {
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(250),
+                    _lifetimeCancellation.Token);
+            }
+
+            if (_isClosing ||
+                !_replayStartRequested ||
+                !_replayBufferService.IsRunning ||
+                eventArgs.ProcessId != _replayBufferService.CaptureProcessId)
+            {
+                return;
+            }
+
+            var strategy = _replayBufferService.LastCapturePlan?.Strategy;
+            if (strategy?.CaptureBackend != DesktopCaptureBackend.WindowsGraphicsCapture)
+            {
+                return;
+            }
+
+            await RunCaptureCommandAsync(async () =>
+            {
+                if (_isClosing ||
+                    !_replayStartRequested ||
+                    !_replayBufferService.IsRunning ||
+                    eventArgs.ProcessId != _replayBufferService.CaptureProcessId)
+                {
+                    return;
+                }
+
+                if (_automaticCaptureRecoveryCount >= 2)
+                {
+                    ShowError(
+                        "Capture pacing is still unstable after automatic recovery. " +
+                        "ClipForge kept replay running and will not restart it repeatedly.");
+                    return;
+                }
+
+                var useSourceSafetyMode = _automaticCaptureRecoveryCount == 1;
+                _automaticCaptureRecoveryCount++;
+
+                _captureRestartInProgress = true;
+                SetCaptureCriticalPresentationState(isActive: true);
+                try
+                {
+                    await _replayBufferService.StopAsync();
+                    if (!_isClosing && _replayStartRequested)
+                    {
+                        // The first recovery deliberately reacquires the exact
+                        // verified path. The second changes geometry to Source,
+                        // so it must probe that native geometry instead of
+                        // reusing a strategy proven only for the fixed preset.
+                        await StartReplayCoreAsync(
+                            useSourceSafetyMode,
+                            useSourceSafetyMode ? null : strategy);
+                        _automaticCaptureSourceFallback = useSourceSafetyMode;
+                    }
+                }
+                finally
+                {
+                    _captureRestartInProgress = false;
+                    SetCaptureCriticalPresentationState(
+                        IsCapturePresentationSuspendedState(_latestState));
+                }
+            });
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Application shutdown supersedes a queued capture recovery.
+        }
+        finally
+        {
+            _captureRecoveryQueued = false;
+        }
+    }
+
+    private void ResetAutomaticCaptureRecovery()
+    {
+        _automaticCaptureRecoveryCount = 0;
+        _automaticCaptureSourceFallback = false;
+    }
+
     private void ReplayBufferService_StateChanged(object? sender, ReplayStateSnapshot snapshot)
     {
         if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
@@ -1383,7 +1535,13 @@ public partial class MainWindow : Window
         SaveClipButton.IsEnabled = canSave;
         if (_replayBufferService.ActiveEncoderDescription is { Length: > 0 } encoderDescription)
         {
-            EncoderStatusText.Text = $"Performance mode: {encoderDescription}";
+            var displayedEncoderDescription = _automaticCaptureSourceFallback &&
+                                              !encoderDescription.Contains(
+                                                  "Source safety mode",
+                                                  StringComparison.OrdinalIgnoreCase)
+                ? $"{encoderDescription} (Source safety mode)"
+                : encoderDescription;
+            EncoderStatusText.Text = $"Performance mode: {displayedEncoderDescription}";
             EncoderStatusText.Foreground = Brush(
                 encoderDescription.Contains("software", StringComparison.OrdinalIgnoreCase)
                     ? "WarningBrush"
@@ -3259,6 +3417,8 @@ public partial class MainWindow : Window
         finally
         {
             _replayBufferService.StateChanged -= ReplayBufferService_StateChanged;
+            _replayBufferService.CaptureRecoveryRequested -=
+                ReplayBufferService_CaptureRecoveryRequested;
             _appUpdateService.StateChanged -= AppUpdateService_StateChanged;
             _hotkeyService.SaveClipPressed -= HotkeyService_SaveClipPressed;
             _hotkeyService.ToggleOverlayPressed -= HotkeyService_ToggleOverlayPressed;

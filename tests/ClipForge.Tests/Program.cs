@@ -13,8 +13,16 @@ namespace ClipForge.Tests;
 
 internal static class Program
 {
-    private static async Task<int> Main()
+    private const string CaptureJobCrashHelperArgument = "--capture-job-crash-helper";
+
+    private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 2 &&
+            string.Equals(args[0], CaptureJobCrashHelperArgument, StringComparison.Ordinal))
+        {
+            return await RunCaptureJobCrashHelperAsync(args[1]).ConfigureAwait(false);
+        }
+
         (string Name, Func<Task> Run)[] tests =
         [
             ("Replay length preset catalog", TestReplayLengthPresetsAsync),
@@ -26,7 +34,11 @@ internal static class Program
             ("Hotkey gesture validation", TestHotkeyGesturesAsync),
             ("Storage estimate helpers", TestStorageEstimatorAsync),
             ("FFmpeg capture arguments", TestCaptureArgumentsAsync),
+            ("WGC low-overhead capture path", TestWgcLowOverheadCapturePathAsync),
+            ("FFmpeg progress parser", TestCaptureProgressParserAsync),
+            ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
             ("Capture geometry matrix", TestCaptureGeometryMatrixAsync),
+            ("Capture process job lifetime", TestCaptureProcessJobLifetimeAsync),
             ("FFmpeg encoder strategies", TestEncoderStrategiesAsync),
             ("FFmpeg capability priority", TestEncoderCapabilityPriorityAsync),
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
@@ -747,6 +759,447 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestWgcLowOverheadCapturePathAsync()
+    {
+        var configuration = new CaptureConfiguration(
+            new DisplayOption(@"\\.\DISPLAY1", "Primary display", 0, 0, 2560, 1440, true, 0),
+            ResolutionOption.All.Single(option => option.Id == "1080p"),
+            60,
+            TimeSpan.FromMinutes(2),
+            false,
+            null,
+            false,
+            null,
+            @"C:\Clips");
+        var strategy = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.WindowsGraphicsCapture);
+
+        var arguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration,
+            [],
+            strategy,
+            @"C:\Buffer");
+        var captureFilter = GetArgumentAfter(arguments, "-i") ?? string.Empty;
+
+        Assert.True(
+            captureFilter.Contains(
+                ":width=1920:height=1080:resize_mode=scale:scale_mode=point",
+                StringComparison.Ordinal),
+            "Fixed-resolution WGC capture must use the low-overhead point scaler.");
+        Assert.True(
+            !captureFilter.Contains("scale_mode=bilinear", StringComparison.Ordinal),
+            "The live WGC path must not reintroduce the expensive bilinear sampler.");
+        Assert.True(
+            captureFilter.Split(',').All(part =>
+                !part.StartsWith("fps=", StringComparison.OrdinalIgnoreCase)),
+            "WGC must not synthesize duplicate frames through a lavfi fps filter.");
+        Assert.True(
+            captureFilter.Contains(":max_framerate=60", StringComparison.Ordinal),
+            "WGC should still request the configured maximum capture rate at the source.");
+        Assert.ContainsSequence(arguments, "-fps_mode", "cfr", "-r", "60");
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestCaptureProcessJobLifetimeAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using (var currentProcess = Process.GetCurrentProcess())
+        {
+            Assert.Throws<InvalidOperationException>(
+                () => CaptureProcessJob.Attach(currentProcess),
+                "The job helper must refuse to attach the ClipForge process itself.");
+        }
+
+        var pingPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "ping.exe");
+        Assert.True(File.Exists(pingPath), "The Windows ping helper was not found for the job-object test.");
+
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = pingPath,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
+        };
+        process.StartInfo.ArgumentList.Add("-t");
+        process.StartInfo.ArgumentList.Add("127.0.0.1");
+
+        Assert.True(process.Start(), "The isolated job-object test process did not start.");
+        try
+        {
+            using var job = CaptureProcessJob.Attach(process);
+            await Task.Delay(TimeSpan.FromMilliseconds(150)).ConfigureAwait(false);
+            Assert.True(
+                !process.HasExited,
+                "The isolated job-object test process exited before ownership was exercised.");
+
+            job.Dispose();
+            await process.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.True(
+                process.HasExited,
+                "Closing the capture job did not terminate its owned process.");
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+        }
+
+        var pipeName = $"ClipForge-JobCrash-{Guid.NewGuid():N}";
+        await using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.In,
+            maxNumberOfServerInstances: 1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+        using var helper = CreateCaptureJobCrashHelperProcess(pipeName);
+        Assert.True(helper.Start(), "The isolated crash-owner helper did not start.");
+
+        int ownedPingProcessId = 0;
+        Process? ownedPing = null;
+        try
+        {
+            using var connectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await server.WaitForConnectionAsync(connectionTimeout.Token).ConfigureAwait(false);
+            using var reader = new StreamReader(server, leaveOpen: true);
+            var processIdLine = await reader.ReadLineAsync(connectionTimeout.Token).ConfigureAwait(false);
+            Assert.True(
+                int.TryParse(processIdLine, CultureInfo.InvariantCulture, out ownedPingProcessId),
+                "The crash-owner helper did not report its owned process ID.");
+
+            ownedPing = Process.GetProcessById(ownedPingProcessId);
+            Assert.True(
+                string.Equals(ownedPing.ProcessName, "PING", StringComparison.OrdinalIgnoreCase) &&
+                !ownedPing.HasExited,
+                "The crash-owner helper did not create the expected isolated ping process.");
+
+            // Kill only the helper, not its process tree. The ping process must
+            // exit because Windows closes the helper's last Job Object handle,
+            // which models abrupt ClipForge termination rather than Dispose().
+            helper.Kill(entireProcessTree: false);
+            await helper.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            await ownedPing.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.True(
+                ownedPing.HasExited,
+                "Abrupt owner termination left its Job-owned process running.");
+        }
+        finally
+        {
+            if (!helper.HasExited)
+            {
+                helper.Kill(entireProcessTree: false);
+                await helper.WaitForExitAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+
+            if (ownedPing is not null)
+            {
+                if (!ownedPing.HasExited &&
+                    string.Equals(ownedPing.ProcessName, "PING", StringComparison.OrdinalIgnoreCase))
+                {
+                    ownedPing.Kill(entireProcessTree: true);
+                    await ownedPing.WaitForExitAsync()
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                        .ConfigureAwait(false);
+                }
+
+                ownedPing.Dispose();
+            }
+        }
+    }
+
+    private static Process CreateCaptureJobCrashHelperProcess(string pipeName)
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The test executable path is unavailable.");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        if (string.Equals(
+                Path.GetFileNameWithoutExtension(executable),
+                "dotnet",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            startInfo.ArgumentList.Add(
+                System.Reflection.Assembly.GetEntryAssembly()?.Location
+                ?? throw new InvalidOperationException("The test assembly path is unavailable."));
+        }
+
+        startInfo.ArgumentList.Add(CaptureJobCrashHelperArgument);
+        startInfo.ArgumentList.Add(pipeName);
+        return new Process { StartInfo = startInfo };
+    }
+
+    private static async Task<int> RunCaptureJobCrashHelperAsync(string pipeName)
+    {
+        var pingPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "ping.exe");
+        using var ping = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = pingPath,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
+        };
+        ping.StartInfo.ArgumentList.Add("-t");
+        ping.StartInfo.ArgumentList.Add("127.0.0.1");
+        if (!ping.Start())
+        {
+            return 2;
+        }
+
+        using var job = CaptureProcessJob.Attach(ping);
+        using var connectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var client = new NamedPipeClientStream(
+            ".",
+            pipeName,
+            PipeDirection.Out,
+            PipeOptions.Asynchronous);
+        await client.ConnectAsync(connectionTimeout.Token).ConfigureAwait(false);
+        await using var writer = new StreamWriter(client) { AutoFlush = true };
+        await writer.WriteLineAsync(
+                ping.Id.ToString(CultureInfo.InvariantCulture))
+            .ConfigureAwait(false);
+        await Task.Delay(Timeout.InfiniteTimeSpan).ConfigureAwait(false);
+        return 0;
+    }
+
+    private static Task TestCaptureProgressParserAsync()
+    {
+        var parser = new CaptureProgressParser();
+        Assert.True(
+            !parser.TryParse(null, 1, out _),
+            "A null FFmpeg progress line must be ignored.");
+        Assert.True(
+            !parser.TryParse("malformed", 2, out _),
+            "A malformed FFmpeg progress line must be ignored.");
+        Assert.True(
+            !parser.TryParse("frame=120", 3, out _),
+            "A partial progress record must not be emitted.");
+        Assert.True(
+            !parser.TryParse("unknown_counter=999", 4, out _),
+            "Unknown numeric progress keys must be ignored.");
+        Assert.True(
+            !parser.TryParse("speed=1.0x", 5, out _),
+            "Unknown non-numeric progress keys must be ignored.");
+        Assert.True(
+            !parser.TryParse("frame=-1", 6, out _),
+            "Negative counters must not replace a valid partial value.");
+        _ = parser.TryParse("dup_frames=116", 7, out _);
+        _ = parser.TryParse("drop_frames=2", 8, out _);
+        _ = parser.TryParse("out_time_us=2000000", 9, out _);
+
+        Assert.True(
+            parser.TryParse("progress=continue", 10, out var sample),
+            "A complete FFmpeg progress record was not emitted at its boundary.");
+        Assert.True(sample is not null, "The progress parser returned a null completed record.");
+        Assert.Equal(120L, sample!.Frame, "The parsed frame counter is incorrect.");
+        Assert.Equal(116L, sample.DuplicatedFrames, "The parsed duplicate counter is incorrect.");
+        Assert.Equal(2L, sample.DroppedFrames, "The parsed dropped-frame counter is incorrect.");
+        Assert.Equal(2_000_000L, sample.OutputTimeMicroseconds, "The parsed output time is incorrect.");
+        Assert.Equal(10L, sample.Timestamp, "The completed record must use its boundary timestamp.");
+
+        _ = parser.TryParse("frame=240", 11, out _);
+        _ = parser.TryParse("dup_frames=230", 12, out _);
+        Assert.True(
+            !parser.TryParse("progress=continue", 13, out _),
+            "A record missing out_time_us must not be emitted.");
+        _ = parser.TryParse("dup_frames=231", 14, out _);
+        _ = parser.TryParse("out_time_us=4000000", 15, out _);
+        Assert.True(
+            !parser.TryParse("progress=end", 16, out _),
+            "A partial record boundary must clear prior fields rather than leak them forward.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestCaptureStarvationWatchdogAsync()
+    {
+        var fullscreenRecent = new CaptureForegroundContext(
+            IsFullscreenOnCapturedDisplay: true,
+            HasRecentInput: true);
+        var fullscreenIdle = fullscreenRecent with { HasRecentInput = false };
+        var windowedRecent = fullscreenRecent with { IsFullscreenOnCapturedDisplay = false };
+
+        var healthy = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            var assessment = healthy.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: second),
+                fullscreenRecent);
+            Assert.True(
+                assessment is null,
+                "Healthy fullscreen capture must not trigger starvation recovery.");
+        }
+
+        var windowed = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            var assessment = windowed.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                windowedRecent);
+            Assert.True(
+                assessment is null,
+                "Severe duplicates outside fullscreen must not trigger starvation recovery.");
+        }
+
+        var transient = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            var duplicatedFrames = second <= 4
+                ? 58L * second
+                : 58L * 4;
+            var assessment = transient.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames),
+                fullscreenRecent);
+            Assert.True(
+                assessment is null,
+                "A short duplicate burst followed by healthy frames must not trigger recovery.");
+        }
+
+        var severeRecent = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? recentAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            recentAssessment = severeRecent.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                fullscreenRecent);
+        }
+
+        Assert.True(
+            recentAssessment is not null,
+            "A sustained 97% duplicate fullscreen stream with recent input must trigger recovery.");
+        Assert.True(
+            recentAssessment!.DuplicateRatio >= 0.96,
+            "The starvation assessment reported an unexpectedly low duplicate ratio.");
+        Assert.True(
+            recentAssessment.UniqueFramesPerSecond <= 2.1,
+            "The starvation assessment reported too many unique frames.");
+        Assert.True(
+            severeRecent.Observe(
+                CreateProgressSample(9, frame: 540, duplicatedFrames: 522),
+                fullscreenRecent) is null,
+            "A watchdog must emit at most one recovery request per capture session.");
+
+        var severeIdle = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 30; second++)
+        {
+            Assert.True(
+                severeIdle.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                    fullscreenIdle) is null,
+                "A fully idle/static fullscreen stream must not trigger destructive recovery.");
+        }
+
+        var singleInputPulse = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 16; second++)
+        {
+            var context = second <= 5 ? fullscreenRecent : fullscreenIdle;
+            Assert.True(
+                singleInputPulse.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                    context) is null,
+                "One input pulse whose recent-input flag decays after five seconds must not trigger recovery.");
+        }
+
+        var transientFullscreenMiss = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? transientFullscreenAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            var context = second == 3 ? windowedRecent : fullscreenRecent;
+            transientFullscreenAssessment = transientFullscreenMiss.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                context);
+        }
+
+        Assert.True(
+            transientFullscreenAssessment is not null,
+            "One transient fullscreen probe miss must not hide sustained active starvation.");
+
+        var insufficientFullscreenCoverage = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 8; second++)
+        {
+            var context = second is 2 or 4 or 6 ? windowedRecent : fullscreenRecent;
+            Assert.True(
+                insufficientFullscreenCoverage.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                    context) is null,
+                "A candidate with less than 75% fullscreen coverage must not trigger recovery.");
+        }
+
+        var fullscreenReset = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 7; second++)
+        {
+            _ = fullscreenReset.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                fullscreenRecent);
+        }
+
+        for (var second = 8; second <= 12; second++)
+        {
+            Assert.True(
+                fullscreenReset.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                    windowedRecent) is null,
+                "A sustained fullscreen eligibility loss must not trigger recovery.");
+        }
+
+        for (var second = 13; second <= 20; second++)
+        {
+            Assert.True(
+                fullscreenReset.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 58L * second),
+                    fullscreenRecent) is null,
+                "Returning after a sustained eligibility loss must start a fresh confirmation window.");
+        }
+
+        Assert.True(
+            fullscreenReset.Observe(
+                CreateProgressSample(21, frame: 1_260, duplicatedFrames: 1_218),
+                fullscreenRecent) is not null,
+            "A fresh sustained fullscreen starvation window should still trigger recovery.");
+
+        return Task.CompletedTask;
+    }
+
+    private static CaptureProgressSample CreateProgressSample(
+        int seconds,
+        long frame,
+        long duplicatedFrames) =>
+        new(
+            frame,
+            duplicatedFrames,
+            DroppedFrames: 0,
+            OutputTimeMicroseconds: checked(seconds * 1_000_000L),
+            Timestamp: checked(seconds * (long)Stopwatch.Frequency));
+
     private static Task TestCaptureGeometryMatrixAsync()
     {
         (int Width, int Height)[] displaySizes =
@@ -851,7 +1304,7 @@ internal static class Program
                     @"C:\Buffer");
                 var wgcFilter = GetArgumentAfter(wgcArguments, "-i") ?? string.Empty;
                 var expectedWgcGeometry = expected.RequiresScaling
-                    ? $":width={expected.Width}:height={expected.Height}:resize_mode=scale:scale_mode=bilinear"
+                    ? $":width={expected.Width}:height={expected.Height}:resize_mode=scale:scale_mode=point"
                     : ":width=-2:height=-2:resize_mode=crop:scale_mode=point";
                 Assert.True(wgcFilter.Contains(expectedWgcGeometry, StringComparison.Ordinal),
                     $"{context} built the wrong WGC geometry path: {wgcFilter}");
@@ -907,8 +1360,8 @@ internal static class Program
             CaptureGeometry.RequiresRestartForDisplayChange(gdiPlan, movedDisplay),
             "GDI must restart when its baked desktop coordinates change.");
         Assert.True(
-            !CaptureGeometry.RequiresRestartForDisplayChange(wgcFixedPlan, fixedOutputDisplay),
-            "WGC should keep a fixed 1080p stream when its resolved output remains 1920x1080.");
+            CaptureGeometry.RequiresRestartForDisplayChange(wgcFixedPlan, fixedOutputDisplay),
+            "WGC must reacquire the monitor after a source mode change even when fixed output remains 1920x1080.");
         Assert.True(
             CaptureGeometry.RequiresRestartForDisplayChange(wgcSourcePlan, fixedOutputDisplay),
             "Source/native must restart when its encoded dimensions change.");
@@ -1063,9 +1516,9 @@ internal static class Program
             "A fixed preset that matches the native display must bypass WGC resizing.");
         Assert.True(
             graphicsNvenc.Any(argument => argument.Contains(
-                ":width=1920:height=1080:resize_mode=scale:scale_mode=bilinear",
+                ":width=1920:height=1080:resize_mode=scale:scale_mode=point",
                 StringComparison.Ordinal)),
-            "A smaller fixed preset must retain WGC aspect-preserving scaling.");
+            "A smaller fixed preset must use the low-overhead WGC point scaler.");
 
         var amfTransferStrategy = new VideoEncodingStrategy(
             VideoEncoderKind.AmdAmf,
