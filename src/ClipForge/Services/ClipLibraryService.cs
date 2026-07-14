@@ -303,6 +303,69 @@ public sealed class ClipLibraryService
         return new ReadOnlyCollection<ClipLibraryItem>(clips);
     }
 
+    /// <summary>
+    /// Fills a bounded number of missing thumbnail paths for an already validated
+    /// clip snapshot. This lets the UI paint cached metadata immediately, then
+    /// hydrate visible cards without repeating discovery or media probes.
+    /// </summary>
+    internal async Task<IReadOnlyList<ClipLibraryItem>> HydrateThumbnailsAsync(
+        string saveDirectory,
+        IReadOnlyList<ClipLibraryItem> clips,
+        int maximumMissingThumbnails,
+        CancellationToken cancellationToken = default,
+        string? preferredClipPath = null)
+    {
+        ArgumentNullException.ThrowIfNull(clips);
+        if (maximumMissingThumbnails is < 0 or > MaximumClipCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumMissingThumbnails),
+                $"The thumbnail hydration limit must be between 0 and {MaximumClipCount}.");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var hydrated = clips.ToArray();
+        if (maximumMissingThumbnails == 0 ||
+            hydrated.Length == 0 ||
+            hydrated.All(clip => clip.ThumbnailPath is not null))
+        {
+            return new ReadOnlyCollection<ClipLibraryItem>(hydrated);
+        }
+
+        using var thumbnailBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        thumbnailBudget.CancelAfter(MaximumTotalThumbnailDuration);
+        var missingIndices = Enumerable.Range(0, hydrated.Length)
+            .Where(index => hydrated[index].ThumbnailPath is null)
+            .OrderByDescending(index =>
+                preferredClipPath is { Length: > 0 } &&
+                hydrated[index].FullPath.Equals(preferredClipPath, StringComparison.OrdinalIgnoreCase))
+            .Take(maximumMissingThumbnails);
+
+        foreach (var index in missingIndices)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string? thumbnail;
+            try
+            {
+                thumbnail = await GetThumbnailAsync(
+                        saveDirectory,
+                        hydrated[index],
+                        allowGeneration: true,
+                        thumbnailBudget.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (
+                thumbnailBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            hydrated[index] = hydrated[index] with { ThumbnailPath = thumbnail };
+        }
+
+        return new ReadOnlyCollection<ClipLibraryItem>(hydrated);
+    }
+
     private async Task<ProbeOutcome> GetValidatedProbeAsync(
         string ffprobePath,
         ClipCandidate candidate,

@@ -2497,6 +2497,38 @@ public partial class MainWindow : Window
             {
                 _pendingLibraryPreferredPath = null;
             }
+
+            if (IsReplaySessionState(_latestState) &&
+                snapshot.Clips.Any(clip => clip.ThumbnailPath is null))
+            {
+                // Paint the cached snapshot first, then fill only the bounded
+                // recent strip while ClipForge remains foreground. Extraction
+                // is serialized, single-threaded and Idle priority, and this
+                // refresh token is cancelled as soon as the game regains focus
+                // or capture enters a critical transition.
+                var hydratedClips = await _clipLibraryService.HydrateThumbnailsAsync(
+                    _settings.SaveDirectory,
+                    snapshot.Clips,
+                    maximumMissingThumbnails: requestedCount,
+                    refreshCancellation.Token);
+
+                refreshCancellation.Token.ThrowIfCancellationRequested();
+                if (_captureCriticalPresentationActive || !IsVisible || !IsActive)
+                {
+                    _libraryRefreshPending = true;
+                    return;
+                }
+
+                RecentClipsItemsControl.ItemsSource = hydratedClips;
+                if (_currentClip is { } currentClip &&
+                    hydratedClips.FirstOrDefault(clip => clip.FullPath.Equals(
+                        currentClip.FullPath,
+                        StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrentClip)
+                {
+                    _currentClip = hydratedCurrentClip;
+                    ClipPlayerPosterImage.DataContext = hydratedCurrentClip;
+                }
+            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -2546,6 +2578,7 @@ public partial class MainWindow : Window
         }
 
         ReplaceClipPlayerElement();
+        ClipPlayerPosterImage.DataContext = clip;
 
         if (_captureCriticalPresentationActive)
         {
@@ -2617,6 +2650,7 @@ public partial class MainWindow : Window
     private void ClearPlayer()
     {
         ReplaceClipPlayerElement();
+        ClipPlayerPosterImage.DataContext = null;
         _currentClip = null;
         _playerSourceReleasedForBackground = false;
         _playWhenOpened = false;
