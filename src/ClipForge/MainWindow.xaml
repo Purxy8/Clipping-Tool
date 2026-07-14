@@ -25,6 +25,15 @@
         <Style x:Key="AnimatedPrimaryButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource PrimaryButtonStyle}" />
 
+        <Style x:Key="LibraryLaunchButtonStyle" TargetType="{x:Type Button}"
+               BasedOn="{StaticResource PrimaryButtonStyle}">
+            <Setter Property="MinWidth" Value="112" />
+            <Setter Property="Height" Value="36" />
+            <Setter Property="MinHeight" Value="36" />
+            <Setter Property="Padding" Value="15,6" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
         <Style x:Key="AppearanceSwatchButtonStyle" TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
             <Setter Property="Width" Value="34" />
@@ -654,10 +663,12 @@
                             </Grid.ColumnDefinitions>
                             <TextBlock FontSize="15" FontWeight="SemiBold" Text="Recent clips" />
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                                <Button x:Name="OpenLibraryButton" Height="32" MinHeight="32" Margin="0,0,10,0"
-                                        Padding="13,5" Content="Library" Click="OpenLibraryButton_Click"
-                                        Style="{StaticResource QuietButtonStyle}"
-                                        AutomationProperties.Name="Open full clip library" />
+                                <Button x:Name="OpenLibraryButton" Margin="0,0,10,0"
+                                        Content="Open Library" Click="OpenLibraryButton_Click"
+                                        Style="{StaticResource LibraryLaunchButtonStyle}"
+                                        ToolTip="Browse all saved clips"
+                                        AutomationProperties.Name="Open full clip library"
+                                        AutomationProperties.HelpText="Browse and play all saved clips" />
                                 <TextBlock Margin="0,0,7,0" VerticalAlignment="Center"
                                            Style="{StaticResource MutedTextStyle}" Text="Latest" />
                                 <ComboBox x:Name="RecentClipCountComboBox" Width="68" Height="30" MinHeight="30"

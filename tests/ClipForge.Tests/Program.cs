@@ -340,6 +340,56 @@ internal static class Program
         Assert.True(
             userSelection.ContinueAfterOpened,
             "A foreground user selection should continue after muted media priming completes.");
+
+        var requestedPath = @"C:\Clips\Clip_2026-07-13_15-00-00.mp4";
+        Assert.True(
+            !LibraryWindow.ShouldBeginRequestedTrim(
+                requestPending: true,
+                mediaReady: false,
+                currentClipPath: requestedPath,
+                requestedClipPath: requestedPath),
+            "Direct trim must remain pending until MediaOpened establishes the real duration.");
+        Assert.True(
+            !LibraryWindow.ShouldBeginRequestedTrim(
+                requestPending: true,
+                mediaReady: true,
+                currentClipPath: @"C:\Clips\Clip_2026-07-13_14-00-00.mp4",
+                requestedClipPath: requestedPath),
+            "A late MediaOpened event for another clip must not start the requested trim.");
+        Assert.True(
+            LibraryWindow.ShouldBeginRequestedTrim(
+                requestPending: true,
+                mediaReady: true,
+                currentClipPath: requestedPath,
+                requestedClipPath: requestedPath),
+            "The exact direct-trim request should start once its media graph is ready.");
+        Assert.True(
+            MainWindow.ShouldHandlePlayerMediaEvent(
+                captureCritical: false,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                hasCurrentClip: true,
+                hasSource: true),
+            "A foreground player event with a live source should be handled.");
+        Assert.True(
+            !MainWindow.ShouldHandlePlayerMediaEvent(
+                captureCritical: true,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                hasCurrentClip: true,
+                hasSource: true),
+            "A queued MediaOpened event must not re-enable playback during capture.");
+        Assert.True(
+            !MainWindow.ShouldHandlePlayerMediaEvent(
+                captureCritical: false,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                hasCurrentClip: true,
+                hasSource: false),
+            "A late player event without a source must be suppressed.");
         return Task.CompletedTask;
     }
 
@@ -560,6 +610,37 @@ internal static class Program
         Assert.True(
             !graphicsNvenc.Any(argument => argument.Contains("hwdownload", StringComparison.Ordinal)),
             "Direct graphics capture should keep frames on the GPU.");
+
+        var nativeFullHdConfiguration = configuration with
+        {
+            Display = new DisplayOption(
+                @"\\.\DISPLAY1",
+                "Display 1",
+                0,
+                0,
+                1920,
+                1080,
+                true,
+                0),
+            Resolution = ResolutionOption.All.Single(option => option.Id == "1080p")
+        };
+        var nativeFullHdGraphics = FfmpegArgumentBuilder.BuildCaptureArguments(
+            nativeFullHdConfiguration,
+            [],
+            new VideoEncodingStrategy(
+                VideoEncoderKind.NvidiaNvenc,
+                DesktopCaptureBackend.WindowsGraphicsCapture),
+            @"C:\Buffer");
+        Assert.True(
+            nativeFullHdGraphics.Any(argument => argument.Contains(
+                ":width=-2:height=-2:resize_mode=scale_aspect",
+                StringComparison.Ordinal)),
+            "A fixed preset that matches the native display must bypass WGC resizing.");
+        Assert.True(
+            graphicsNvenc.Any(argument => argument.Contains(
+                ":width=1920:height=1080:resize_mode=scale_aspect",
+                StringComparison.Ordinal)),
+            "A smaller fixed preset must retain WGC aspect-preserving scaling.");
 
         var amfTransferStrategy = new VideoEncodingStrategy(
             VideoEncoderKind.AmdAmf,
@@ -824,6 +905,21 @@ internal static class Program
 
     private static Task TestConcatArgumentsAsync()
     {
+        var manifestLines = ReplayBufferService.BuildConcatManifestLines(
+        [
+            @"C:\Buffer\segment-000000001.mkv",
+            @"C:\Buffer\segment-000000002.mkv"
+        ]);
+        Assert.SequenceEqual(
+        [
+            "file 'C:/Buffer/segment-000000001.mkv'",
+            "duration 2.000000",
+            "file 'C:/Buffer/segment-000000002.mkv'",
+            "duration 2.000000"
+        ],
+            manifestLines,
+            "Concat manifests must advance by the known video cadence instead of AAC-long container durations.");
+
         var arguments = FfmpegArgumentBuilder.BuildConcatArguments(
             @"C:\Buffer\manifest.txt",
             @"C:\Clips\clip.mp4",
@@ -1604,6 +1700,43 @@ internal static class Program
                 "A software trim should launch exactly one export after hardware probes fail.");
             Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
                 "A successful trim left a partial output behind.");
+
+            var variableAverageRunner = new FakeTrimMediaProcessRunner
+            {
+                SourceAverageFrameRate = "355/6",
+                OutputAverageFrameRate = "294/5"
+            };
+            var variableAverageService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                variableAverageRunner);
+            var variableAverage = await variableAverageService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.Succeeded, variableAverage.Status,
+                "A valid nominal-60 FPS trim was rejected because its selection-local average FPS changed.");
+
+            var wrongNominalRunner = new FakeTrimMediaProcessRunner
+            {
+                SourceAverageFrameRate = "355/6",
+                OutputAverageFrameRate = "294/5",
+                OutputNominalFrameRate = "30/1"
+            };
+            var wrongNominalService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                wrongNominalRunner);
+            var wrongNominal = await wrongNominalService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.OutputValidationFailed, wrongNominal.Status,
+                "A genuinely different nominal output frame rate passed trim validation.");
 
             var trimRunsBeforeInvalidRange = successRunner.TrimRunCount;
             var invalidRange = await successService.TrimAsync(
@@ -2514,6 +2647,14 @@ internal static class Program
 
         public bool WaitForTrimCancellation { get; init; }
 
+        public string SourceAverageFrameRate { get; init; } = "60/1";
+
+        public string OutputAverageFrameRate { get; init; } = "60/1";
+
+        public string SourceNominalFrameRate { get; init; } = "60/1";
+
+        public string OutputNominalFrameRate { get; init; } = "60/1";
+
         public int TrimRunCount { get; private set; }
 
         public async Task<ClipMediaProcessResult> RunAsync(
@@ -2534,9 +2675,16 @@ internal static class Program
                     ? ReturnInvalidOutputMetadata ? 99 : _lastTrimDurationSeconds
                     : 10;
                 var durationText = duration.ToString("0.######", CultureInfo.InvariantCulture);
+                var averageFrameRate = isTrimPartial
+                    ? OutputAverageFrameRate
+                    : SourceAverageFrameRate;
+                var nominalFrameRate = isTrimPartial
+                    ? OutputNominalFrameRate
+                    : SourceNominalFrameRate;
                 var output =
                     $"{{\"streams\":[{{\"codec_type\":\"video\",\"width\":1280,\"height\":720," +
-                    $"\"avg_frame_rate\":\"60/1\",\"r_frame_rate\":\"60/1\",\"duration\":\"{durationText}\"}}," +
+                    $"\"avg_frame_rate\":\"{averageFrameRate}\",\"r_frame_rate\":\"{nominalFrameRate}\"," +
+                    $"\"duration\":\"{durationText}\"}}," +
                     $"{{\"codec_type\":\"audio\",\"duration\":\"{durationText}\"}}]," +
                     $"\"format\":{{\"duration\":\"{durationText}\"}}}}";
                 return new ClipMediaProcessResult(0, output, string.Empty, false);

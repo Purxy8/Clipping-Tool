@@ -399,12 +399,16 @@ internal static class FfmpegArgumentBuilder
                      ":output_fmt=bgra";
 
         if (configuration.Resolution.Width is { } width &&
-            configuration.Resolution.Height is { } height)
+            configuration.Resolution.Height is { } height &&
+            (width != configuration.Display.Width || height != configuration.Display.Height))
         {
             filter += $":width={width}:height={height}:resize_mode=scale_aspect";
         }
         else
         {
+            // Source/native and a fixed preset that already matches the monitor
+            // should not activate the D3D11 resizer. Encoding at the existing
+            // size avoids needless GPU copy/scaling work over a foreground game.
             // H.264 encoders require even dimensions. Negative gfxcapture sizes
             // round the native monitor size down to the requested multiple.
             filter += ":width=-2:height=-2:resize_mode=scale_aspect";
