@@ -83,6 +83,7 @@ public partial class MainWindow : Window
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
     private CancellationTokenSource? _displayModeChangeCancellation;
+    private int _displayModeWgcRenewalRequested;
     private bool _refreshingDisplaySelection;
     private string? _lastTrayStatus;
     private bool? _lastTrayCanSave;
@@ -124,6 +125,7 @@ public partial class MainWindow : Window
         PreviewKeyDown += MainWindow_PreviewKeyDown;
         System.Windows.Application.Current.SessionEnding += Application_SessionEnding;
         SystemEvents.DisplaySettingsChanged += SystemEvents_DisplaySettingsChanged;
+        SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -780,14 +782,36 @@ public partial class MainWindow : Window
             return;
         }
 
-        _ = Dispatcher.BeginInvoke(QueueDisplayModeRefresh);
+        _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: false));
     }
 
-    private void QueueDisplayModeRefresh()
+    private void SystemEvents_PowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode != PowerModes.Resume ||
+            _isClosing ||
+            Dispatcher.HasShutdownStarted ||
+            Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        // WGC's Direct3D frame pool belongs to the graphics device generation
+        // that existed before sleep. Re-resolve the display after Windows has
+        // restored it, then renew a same-size WGC process just like a display
+        // mode transition.
+        _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: true));
+    }
+
+    private void QueueDisplayModeRefresh(bool forceWgcRenewal)
     {
         if (_isClosing)
         {
             return;
+        }
+
+        if (forceWgcRenewal)
+        {
+            Volatile.Write(ref _displayModeWgcRenewalRequested, 1);
         }
 
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
@@ -811,12 +835,54 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var displays = _deviceDiscoveryService.GetDisplays();
-            var currentDisplay = FindDisplayByDeviceName(displays, selectedDisplay.DeviceName);
+            IReadOnlyList<DisplayOption> displays = [];
+            DisplayOption? currentDisplay = null;
+            Win32Exception? lastDiscoveryError = null;
+            for (var attempt = 0; attempt < 8 && currentDisplay is null; attempt++)
+            {
+                try
+                {
+                    displays = _deviceDiscoveryService.GetDisplays();
+                    currentDisplay = FindDisplayByDeviceName(
+                        displays,
+                        selectedDisplay.DeviceName);
+                    lastDiscoveryError = null;
+                }
+                catch (Win32Exception exception)
+                {
+                    // Display enumeration can briefly fail while the graphics
+                    // stack is rebuilding after resume. Retry below.
+                    lastDiscoveryError = exception;
+                }
+
+                if (currentDisplay is null && attempt < 7)
+                {
+                    await Task.Delay(
+                        TimeSpan.FromMilliseconds(600),
+                        refreshCancellation.Token);
+                }
+            }
+
             if (currentDisplay is null)
             {
+                if (_replayBufferService.IsRunning)
+                {
+                    await RunCaptureCommandAsync(
+                        () => _replayBufferService.StopAsync(),
+                        showError: false);
+                }
+
+                var detail = lastDiscoveryError is null
+                    ? "The selected display did not return after Windows resumed."
+                    : $"Windows could not enumerate the selected display. {lastDiscoveryError.Message}";
+                ShowError(
+                    $"{detail} Instant Replay was stopped safely and will retry when Windows reports that the display has returned.");
                 return;
             }
+
+            var forceWgcRenewal = Interlocked.Exchange(
+                ref _displayModeWgcRenewalRequested,
+                0) != 0;
 
             var geometryChanged = currentDisplay.Left != selectedDisplay.Left ||
                                   currentDisplay.Top != selectedDisplay.Top ||
@@ -825,6 +891,20 @@ public partial class MainWindow : Window
                                   currentDisplay.MonitorIndex != selectedDisplay.MonitorIndex;
             if (!geometryChanged)
             {
+                if (ShouldRestartReplayAfterDisplayChange(
+                        _replayStartRequested,
+                        _replayBufferService.IsRunning,
+                        _captureRestartInProgress,
+                        _replayBufferService.LastCapturePlan,
+                        currentDisplay))
+                {
+                    await CaptureConfigurationChangedAsync(restartRequired: true);
+                }
+                else
+                {
+                    QueueSameGeometryWgcRefresh();
+                }
+
                 return;
             }
 
@@ -850,6 +930,10 @@ public partial class MainWindow : Window
                 _replayBufferService.LastCapturePlan,
                 currentDisplay);
             await CaptureConfigurationChangedAsync(restartRequired);
+            if (forceWgcRenewal && !restartRequired)
+            {
+                QueueSameGeometryWgcRefresh();
+            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -872,6 +956,27 @@ public partial class MainWindow : Window
 
             refreshCancellation.Dispose();
         }
+    }
+
+    private void QueueSameGeometryWgcRefresh()
+    {
+        if (_isClosing ||
+            _captureRestartInProgress ||
+            !_replayStartRequested ||
+            !_replayBufferService.IsRunning ||
+            _replayBufferService.LastCapturePlan?.Strategy.CaptureBackend !=
+                DesktopCaptureBackend.WindowsGraphicsCapture ||
+            _replayBufferService.CaptureProcessId is not { } processId)
+        {
+            return;
+        }
+
+        ReplayBufferService_CaptureRecoveryRequested(
+            _replayBufferService,
+            new CaptureRecoveryRequestedEventArgs(
+                CaptureRecoveryReason.ScheduledRefresh,
+                "Windows reported a same-size display or graphics-device transition; renewing WGC prevents the old frame pool from becoming stale.",
+                processId));
     }
 
     internal static bool ShouldRestartReplayAfterDisplayChange(
@@ -1337,7 +1442,8 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                if (_automaticCaptureRecoveryCount >= 2)
+                var scheduledRefresh = !UsesAutomaticCaptureRecoveryBudget(eventArgs.Reason);
+                if (!scheduledRefresh && _automaticCaptureRecoveryCount >= 2)
                 {
                     ShowError(
                         "Capture pacing is still unstable after automatic recovery. " +
@@ -1345,31 +1451,56 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                var useSourceSafetyMode = _automaticCaptureRecoveryCount == 1;
-                _automaticCaptureRecoveryCount++;
+                var useSourceSafetyMode = !scheduledRefresh &&
+                    _automaticCaptureRecoveryCount == 1;
 
-                _captureRestartInProgress = true;
-                SetCaptureCriticalPresentationState(isActive: true);
+                var suspendPresentation = !scheduledRefresh;
+                _captureRestartInProgress = suspendPresentation;
+                if (suspendPresentation)
+                {
+                    SetCaptureCriticalPresentationState(isActive: true);
+                }
+
                 try
                 {
-                    await _replayBufferService.StopAsync();
-                    if (!_isClosing && _replayStartRequested)
+                    if (scheduledRefresh || !useSourceSafetyMode)
                     {
-                        // The first recovery deliberately reacquires the exact
-                        // verified path. The second changes geometry to Source,
-                        // so it must probe that native geometry instead of
-                        // reusing a strategy proven only for the fixed preset.
-                        await StartReplayCoreAsync(
-                            useSourceSafetyMode,
-                            useSourceSafetyMode ? null : strategy);
-                        _automaticCaptureSourceFallback = useSourceSafetyMode;
+                        // A routine renewal and the first health recovery keep
+                        // every completed segment, discard at most the in-flight
+                        // two-second tail, and re-verify the WGC executable before
+                        // launching the replacement process.
+                        var refreshed = await _replayBufferService.RefreshCaptureAsync(
+                            eventArgs.ProcessId,
+                            _lifetimeCancellation.Token);
+                        if (refreshed && !scheduledRefresh)
+                        {
+                            _automaticCaptureRecoveryCount++;
+                        }
+                    }
+                    else
+                    {
+                        await _replayBufferService.StopAsync();
+                        if (!_isClosing && _replayStartRequested)
+                        {
+                            // The second health recovery changes geometry to
+                            // Source, so it must probe native geometry instead
+                            // of reusing a strategy proven for a fixed preset.
+                            await StartReplayCoreAsync(
+                                sourceSafetyMode: true,
+                                sessionStrategyOverride: null);
+                            _automaticCaptureSourceFallback = true;
+                            _automaticCaptureRecoveryCount++;
+                        }
                     }
                 }
                 finally
                 {
                     _captureRestartInProgress = false;
-                    SetCaptureCriticalPresentationState(
-                        IsCapturePresentationSuspendedState(_latestState));
+                    if (suspendPresentation)
+                    {
+                        SetCaptureCriticalPresentationState(
+                            IsCapturePresentationSuspendedState(_latestState));
+                    }
                 }
             });
         }
@@ -1388,6 +1519,9 @@ public partial class MainWindow : Window
         _automaticCaptureRecoveryCount = 0;
         _automaticCaptureSourceFallback = false;
     }
+
+    internal static bool UsesAutomaticCaptureRecoveryBudget(CaptureRecoveryReason reason) =>
+        reason != CaptureRecoveryReason.ScheduledRefresh;
 
     private void ReplayBufferService_StateChanged(object? sender, ReplayStateSnapshot snapshot)
     {
@@ -3428,6 +3562,7 @@ public partial class MainWindow : Window
             _trayIconService.ExitRequested -= TrayIconService_ExitRequested;
             System.Windows.Application.Current.SessionEnding -= Application_SessionEnding;
             SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
+            SystemEvents.PowerModeChanged -= SystemEvents_PowerModeChanged;
             PreviewKeyDown -= MainWindow_PreviewKeyDown;
             Activated -= MainWindow_Activated;
             Deactivated -= MainWindow_Deactivated;

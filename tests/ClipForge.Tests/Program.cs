@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipes;
+using System.Security.Cryptography;
 using ClipForge.Controls;
 using ClipForge.Models;
 using ClipForge.Services;
@@ -744,6 +745,44 @@ internal static class Program
             arguments[^1].EndsWith("segment-%09d.mkv", StringComparison.Ordinal),
             "Capture output must be a numbered Matroska segment pattern.");
 
+        var resumedArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration,
+            audioInputs,
+            VideoEncodingStrategy.SoftwareGdi,
+            @"C:\Buffer",
+            segmentStartNumber: 1_234);
+        Assert.ContainsSequence(
+            resumedArguments,
+            "-segment_start_number",
+            "1234");
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => FfmpegArgumentBuilder.BuildCaptureArguments(
+                configuration,
+                audioInputs,
+                VideoEncodingStrategy.SoftwareGdi,
+                @"C:\Buffer",
+                segmentStartNumber: -1),
+            "A capture renewal must never reuse a negative segment number.");
+        Assert.Equal(
+            TimeSpan.FromMinutes(30),
+            ReplayBufferService.CaptureProcessMaximumAge,
+            "Long-running WGC processes must have a bounded lifetime.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleCaptureRefresh(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                ReplayBufferService.CaptureProcessMaximumAge - TimeSpan.FromMilliseconds(1)),
+            "WGC renewal must not run before the bounded process age.");
+        Assert.True(
+            ReplayBufferService.ShouldScheduleCaptureRefresh(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                ReplayBufferService.CaptureProcessMaximumAge),
+            "WGC renewal must run at the bounded process age.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleCaptureRefresh(
+                DesktopCaptureBackend.Gdi,
+                TimeSpan.FromHours(24)),
+            "The compatibility GDI backend must not enter the WGC renewal path.");
+
         var sourceArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration with
             {
@@ -1185,6 +1224,209 @@ internal static class Program
                 CreateProgressSample(21, frame: 1_260, duplicatedFrames: 1_218),
                 fullscreenRecent) is not null,
             "A fresh sustained fullscreen starvation window should still trigger recovery.");
+
+        var youngModerate = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 24; second++)
+        {
+            Assert.True(
+                youngModerate.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 44L * second),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromMinutes(4) + TimeSpan.FromSeconds(second)) is null,
+                "Moderate CFR duplication must not trigger before the long-session guard becomes eligible.");
+        }
+
+        var alwaysSixteenFramesPerSecond = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 40; second++)
+        {
+            Assert.True(
+                alwaysSixteenFramesPerSecond.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 44L * second),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                "A capture that has produced 16 meaningful FPS since process start must not establish " +
+                "a healthy baseline or trigger moderate recovery.");
+        }
+
+        var agedModerate = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? moderateAssessment = null;
+        for (var second = 0; second <= 12; second++)
+        {
+            Assert.True(
+                agedModerate.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromMinutes(6) + TimeSpan.FromSeconds(second)) is null,
+                "Healthy active capture must only arm, never trigger, the moderate-degradation path.");
+        }
+
+        for (var second = 13; second <= 33; second++)
+        {
+            var duplicatedFrames = 44L * (second - 12);
+            moderateAssessment ??= agedModerate.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromMinutes(6) + TimeSpan.FromSeconds(second));
+        }
+
+        Assert.True(
+            moderateAssessment is not null,
+            "An aged 60 FPS session degraded to about 16 meaningful FPS must trigger recovery.");
+        Assert.True(
+            moderateAssessment!.DuplicateRatio >= 0.73,
+            "The moderate starvation assessment reported an unexpectedly low duplicate ratio.");
+        Assert.True(
+            moderateAssessment.UniqueFramesPerSecond <= 16.1,
+            "The moderate starvation assessment reported too many meaningful frames.");
+
+        var counterRollback = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            _ = counterRollback.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromMinutes(6) + TimeSpan.FromSeconds(second));
+        }
+
+        // A restarted/replaced FFmpeg process resets its cumulative counters.
+        // That rollback must also clear the healthy latch from the old process.
+        Assert.True(
+            counterRollback.Observe(
+                CreateProgressSample(13, frame: 0, duplicatedFrames: 0),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromMinutes(6)) is null,
+            "A progress-counter rollback must not trigger recovery.");
+        for (var second = 14; second <= 40; second++)
+        {
+            var elapsedSinceRollback = second - 13;
+            Assert.True(
+                counterRollback.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * elapsedSinceRollback,
+                        duplicatedFrames: 44L * elapsedSinceRollback),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromMinutes(6) + TimeSpan.FromSeconds(elapsedSinceRollback)) is null,
+                "A counter rollback must clear the prior process's healthy-cadence latch.");
+        }
+
+        var healthyThenAltTabThenLowCadence = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            _ = healthyThenAltTabThenLowCadence.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second));
+        }
+
+        for (var second = 13; second <= 17; second++)
+        {
+            Assert.True(
+                healthyThenAltTabThenLowCadence.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
+                    windowedRecent,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                "Leaving fullscreen must not trigger capture recovery.");
+        }
+
+        for (var second = 18; second <= 45; second++)
+        {
+            var lowCadenceSeconds = second - 17;
+            Assert.True(
+                healthyThenAltTabThenLowCadence.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 44L * lowCadenceSeconds),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                "A sustained alt-tab must clear the old content's healthy-cadence latch.");
+        }
+
+        var healthyThenSeventeenFramesPerSecond = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            _ = healthyThenSeventeenFramesPerSecond.Observe(
+                CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second));
+        }
+
+        for (var second = 13; second <= 38; second++)
+        {
+            Assert.True(
+                healthyThenSeventeenFramesPerSecond.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 43L * (second - 12)),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                "Seventeen meaningful FPS must remain just above the 60 FPS moderate-recovery boundary.");
+        }
+
+        var targetThirtyHealthyThenEight = new CaptureStarvationWatchdog(30);
+        CaptureStarvationAssessment? targetThirtyAssessment = null;
+        for (var second = 0; second <= 12; second++)
+        {
+            _ = targetThirtyHealthyThenEight.Observe(
+                CreateProgressSample(second, frame: 30L * second, duplicatedFrames: 0),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second));
+        }
+
+        for (var second = 13; second <= 33; second++)
+        {
+            targetThirtyAssessment ??= targetThirtyHealthyThenEight.Observe(
+                CreateProgressSample(
+                    second,
+                    frame: 30L * second,
+                    duplicatedFrames: 22L * (second - 12)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second));
+        }
+
+        Assert.True(
+            targetThirtyAssessment is not null &&
+            targetThirtyAssessment.UniqueFramesPerSecond <= 8.1,
+            "A healthy 30 FPS process that degrades to eight meaningful FPS must trigger moderate recovery.");
+
+        foreach (var uniqueFramesPerSecond in new[] { 24, 30 })
+        {
+            var legitimateLowerCadence = new CaptureStarvationWatchdog(60);
+            for (var second = 0; second <= 24; second++)
+            {
+                var duplicatedFrames = (60L - uniqueFramesPerSecond) * second;
+                Assert.True(
+                    legitimateLowerCadence.Observe(
+                        CreateProgressSample(second, frame: 60L * second, duplicatedFrames),
+                        fullscreenRecent,
+                        captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                    $"Legitimate {uniqueFramesPerSecond} FPS content must not be treated as an aged WGC failure.");
+            }
+        }
+
+        var agedModerateIdle = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 24; second++)
+        {
+            Assert.True(
+                agedModerateIdle.Observe(
+                    CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 44L * second),
+                    fullscreenIdle,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                "An aged but idle fullscreen scene must not trigger moderate recovery.");
+        }
+
+        Assert.True(
+            !MainWindow.UsesAutomaticCaptureRecoveryBudget(
+                CaptureRecoveryReason.ScheduledRefresh),
+            "Routine WGC process renewal must remain unlimited for an indefinite replay session.");
+        Assert.True(
+            MainWindow.UsesAutomaticCaptureRecoveryBudget(
+                CaptureRecoveryReason.SourceStarvation) &&
+            MainWindow.UsesAutomaticCaptureRecoveryBudget(
+                CaptureRecoveryReason.CaptureHang),
+            "Fault recovery must remain bounded independently from scheduled WGC renewal.");
 
         return Task.CompletedTask;
     }
@@ -2121,6 +2363,65 @@ internal static class Program
                 null,
                 service.FindExecutable(),
                 "Production discovery must reject an unverified private or environment-provided FFmpeg binary.");
+
+            var trustedBytes = new byte[] { 0x4D, 0x5A, 10, 20, 30, 40, 50, 60 };
+            var expectedHash = Convert.ToHexStringLower(SHA256.HashData(trustedBytes));
+            File.WriteAllBytes(fakePrivateTool, trustedBytes);
+            var originalTimestamp = DateTime.UtcNow.AddMinutes(-5);
+            File.SetLastWriteTimeUtc(fakePrivateTool, originalTimestamp);
+            originalTimestamp = File.GetLastWriteTimeUtc(fakePrivateTool);
+
+            var cachedService = new FfmpegSetupService(testDirectory, expectedHash);
+            Assert.Equal(
+                Path.GetFullPath(fakePrivateTool),
+                cachedService.FindExecutable(),
+                "A private FFmpeg binary with the configured pinned hash should be discovered.");
+
+            using (var verifiedLease = cachedService.OpenVerifiedExecutableLease(fakePrivateTool))
+            {
+                Assert.True(
+                    verifiedLease is not null,
+                    "The exact pinned FFmpeg file should produce a launch lease.");
+                var replacementBlocked = false;
+                try
+                {
+                    File.WriteAllBytes(fakePrivateTool, trustedBytes);
+                }
+                catch (IOException)
+                {
+                    replacementBlocked = true;
+                }
+
+                Assert.True(
+                    replacementBlocked,
+                    "The verified launch lease must deny executable replacement until Process.Start.");
+            }
+
+            var tamperedBytes = trustedBytes.ToArray();
+            tamperedBytes[^1] ^= 0xFF;
+            File.WriteAllBytes(fakePrivateTool, tamperedBytes);
+            File.SetLastWriteTimeUtc(fakePrivateTool, originalTimestamp);
+            Assert.Equal(
+                Path.GetFullPath(fakePrivateTool),
+                cachedService.FindExecutable(),
+                "The test setup must preserve the cached length and timestamp stamp.");
+            Assert.Equal<string?>(
+                null,
+                cachedService.FindExecutable(forceVerification: true),
+                "Forced FFmpeg discovery must recompute SHA-256 and reject same-stamp tampering.");
+            Assert.Equal<string?>(
+                null,
+                cachedService.FindExecutable(),
+                "A failed forced verification must evict the stale trusted cache entry.");
+            Assert.True(
+                cachedService.OpenVerifiedExecutableLease(fakePrivateTool) is null,
+                "A launch lease must reject same-stamp executable tampering.");
+
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", "1");
+            using var developerLease = cachedService.OpenVerifiedExecutableLease(fakePrivateTool);
+            Assert.True(
+                developerLease is not null,
+                "Explicit developer mode must still pin the selected external file handle without requiring the production hash.");
         }
         finally
         {

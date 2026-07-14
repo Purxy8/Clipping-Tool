@@ -3,7 +3,8 @@ namespace ClipForge.Capture;
 internal enum CaptureRecoveryReason
 {
     SourceStarvation,
-    CaptureHang
+    CaptureHang,
+    ScheduledRefresh
 }
 
 internal sealed class CaptureRecoveryRequestedEventArgs(
