@@ -4,6 +4,31 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.8.0-beta.1] - 2026-07-14
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and must remain a GitHub pre-release rather than the latest stable download.
+
+### Added
+
+- An opt-in **Start ClipForge and replay with Windows** setting lets an installed ClipForge build launch quietly after Windows sign-in and start the rolling replay only after settings, devices, and the local FFmpeg engine have initialized. The setting is off by default, and a normal manual launch remains interactive.
+
+### Reliability
+
+- Login startup waits briefly for Windows display and audio devices, makes only one bounded retry after a temporary capture failure, and reports a persistent failure through the tray instead of opening a blocking window.
+- A stale autostart launch honors the saved opt-out, removes its owned shortcut when possible, and exits without starting capture. Duplicate login launches also leave an existing ClipForge window in the background.
+
+### Security
+
+- Windows autostart uses a per-user Startup shortcut owned by the installed package, targets only `ClipForge.exe`, and passes only the fixed private `--autostart` argument. Portable/development builds fail closed, no service or scheduled task is installed, and disabling the setting or uninstalling removes the shortcut.
+
+### Verification note
+
+- The Release solution builds with zero warnings and errors, formatting is clean, and the deterministic suite passes 40/40 tests, including launch parsing, fixed shortcut registration, default-off persistence, duplicate-instance behavior, and every automatic replay safety precondition.
+- The actual sign-in/restart path still requires confirmation with the installed package because the automated build session cannot reboot the interactive Windows desktop.
+
 ## [1.7.0-beta.2] - 2026-07-13
 
 ### Release status

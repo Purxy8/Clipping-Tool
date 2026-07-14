@@ -37,9 +37,11 @@ public partial class MainWindow : Window
     private readonly ClipLibraryService _clipLibraryService;
     private readonly ClipTrimService _clipTrimService;
     private readonly GlobalHotkeyService _hotkeyService = new();
+    private readonly StartupRegistrationService _startupRegistrationService = new();
     private readonly TrayIconService _trayIconService;
     private readonly NativeWindowThemeService _nativeWindowThemeService;
     private readonly ClipSavedSoundService _clipSavedSoundService = new();
+    private readonly AppLaunchOptions _launchOptions;
     private readonly DispatcherTimer _playerTimer;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _captureCommandGate = new(1, 1);
@@ -79,7 +81,13 @@ public partial class MainWindow : Window
     private bool? _lastTrayCanSave;
 
     public MainWindow()
+        : this(AppLaunchOptions.Interactive)
     {
+    }
+
+    internal MainWindow(AppLaunchOptions launchOptions)
+    {
+        _launchOptions = launchOptions ?? throw new ArgumentNullException(nameof(launchOptions));
         _replayBufferService = new ReplayBufferService(_ffmpegSetupService);
         _clipLibraryService = new ClipLibraryService(_ffmpegSetupService);
         _clipTrimService = new ClipTrimService(_ffmpegSetupService);
@@ -110,7 +118,11 @@ public partial class MainWindow : Window
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
         Loaded -= MainWindow_Loaded;
-        RunStartupMotion();
+        var initializationCompleted = false;
+        if (!_launchOptions.StartInBackground)
+        {
+            RunStartupMotion();
+        }
 
         try
         {
@@ -138,6 +150,8 @@ public partial class MainWindow : Window
             {
                 ShowError($"The global shortcuts could not be registered. {exception.Message}");
             }
+
+            initializationCompleted = true;
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
@@ -151,8 +165,54 @@ public partial class MainWindow : Window
         {
             _isInitializing = false;
             UpdateControlsForState(_latestState);
-            _ = RunAutomaticUpdateCheckAsync();
-            _ = RefreshClipLibraryAsync();
+
+            var staleAutoStartLaunch =
+                _launchOptions.IsAutoStart &&
+                initializationCompleted &&
+                !_settings.StartReplayWithWindows;
+            if (staleAutoStartLaunch)
+            {
+                try
+                {
+                    _startupRegistrationService.SetEnabled(false);
+                }
+                catch (Exception exception) when (
+                    exception is IOException or UnauthorizedAccessException or InvalidOperationException or
+                    ArgumentException or NotSupportedException or Win32Exception or
+                    System.Runtime.InteropServices.COMException)
+                {
+                    // The saved opt-out still wins even if a stale shortcut cannot be removed.
+                }
+
+                _exitRequested = true;
+                Close();
+            }
+            else if (!_isClosing)
+            {
+                if (_launchOptions.IsAutoStart && !initializationCompleted)
+                {
+                    _trayIconService.ShowReplayStartupFailure(
+                        "ClipForge could not finish initialization. Open it from the tray to review the error.");
+                }
+                else if (_launchOptions.IsAutoStart && _settings.StartReplayWithWindows && !_engineReady)
+                {
+                    _trayIconService.ShowReplayStartupFailure(
+                        "Install the ClipForge capture engine, then start replay once from the app.");
+                }
+                else if (ShouldAutoStartReplay(
+                             _launchOptions.IsAutoStart,
+                             _settings.StartReplayWithWindows,
+                             initializationCompleted,
+                             _engineReady,
+                             _replayBufferService.IsRunning,
+                             _isClosing))
+                {
+                    await StartReplayAfterWindowsLoginAsync();
+                }
+
+                _ = RunAutomaticUpdateCheckAsync();
+                _ = RefreshClipLibraryAsync();
+            }
         }
     }
 
@@ -199,6 +259,13 @@ public partial class MainWindow : Window
             : _settings.SaveDirectory;
         AutoUpdateCheckBox.IsChecked = _settings.CheckForUpdatesAutomatically;
         ClipSavedSoundCheckBox.IsChecked = _settings.PlayClipSavedSound;
+        StartReplayWithWindowsCheckBox.IsChecked = _settings.StartReplayWithWindows;
+        StartReplayWithWindowsCheckBox.IsEnabled = _startupRegistrationService.IsSupported;
+        StartupHintText.Text = !StartReplayWithWindowsCheckBox.IsEnabled
+            ? "Install ClipForge Setup to enable automatic Windows startup."
+            : _settings.StartReplayWithWindows
+                ? "Enabled. ClipForge will start hidden and begin replay after you sign in."
+                : "ClipForge starts hidden in the tray and uses your saved capture settings.";
         RecentClipCountComboBox.ItemsSource = RecentClipCountOptions;
         RecentClipCountComboBox.SelectedItem = _settings.RecentClipCount;
         AppearanceTargetComboBox.ItemsSource = AppearanceTargetOptions;
@@ -457,10 +524,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunCaptureCommandAsync(Func<Task> command)
+    private async Task<Exception?> RunCaptureCommandAsync(Func<Task> command, bool showError = true)
     {
         await _captureCommandGate.WaitAsync();
         BufferToggleButton.IsEnabled = false;
+        Exception? commandError = null;
 
         try
         {
@@ -473,12 +541,60 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
-            ShowError(exception.Message);
+            commandError = exception;
+            if (showError)
+            {
+                ShowError(exception.Message);
+            }
         }
         finally
         {
             _captureCommandGate.Release();
             UpdateControlsForState(_latestState);
+        }
+
+        return commandError;
+    }
+
+    internal static bool ShouldAutoStartReplay(
+        bool isAutoStartLaunch,
+        bool preferenceEnabled,
+        bool initializationCompleted,
+        bool engineReady,
+        bool replayRunning,
+        bool isClosing) =>
+        isAutoStartLaunch &&
+        preferenceEnabled &&
+        initializationCompleted &&
+        engineReady &&
+        !replayRunning &&
+        !isClosing;
+
+    private async Task StartReplayAfterWindowsLoginAsync()
+    {
+        try
+        {
+            // Windows can report the signed-in desktop before GPU and audio
+            // endpoints are fully ready. Give them a short bounded window.
+            await Task.Delay(TimeSpan.FromSeconds(3), _lifetimeCancellation.Token);
+
+            var error = await RunCaptureCommandAsync(StartReplayCoreAsync, showError: false);
+            if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(4), _lifetimeCancellation.Token);
+                error = await RunCaptureCommandAsync(StartReplayCoreAsync, showError: false);
+            }
+
+            if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
+            {
+                var message = $"Automatic replay could not start. {error.Message}";
+                ShowError(message);
+                _trayIconService.ShowReplayStartupFailure(error.Message);
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Windows is signing out or ClipForge is exiting.
         }
     }
 
@@ -582,6 +698,7 @@ public partial class MainWindow : Window
         _settings.OutputAudioDeviceId = (OutputDeviceComboBox.SelectedItem as AudioDeviceOption)?.Id;
         _settings.CaptureMicrophone = MicrophoneCheckBox.IsChecked == true;
         _settings.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceOption)?.Id;
+        _settings.StartReplayWithWindows = StartReplayWithWindowsCheckBox.IsChecked == true;
         _settings.CheckForUpdatesAutomatically = AutoUpdateCheckBox.IsChecked == true;
         _settings.PlayClipSavedSound = ClipSavedSoundCheckBox.IsChecked == true;
         _settings.BackgroundColor = AppSettings.NormalizeBackgroundColor(_settings.BackgroundColor);
@@ -1410,6 +1527,55 @@ public partial class MainWindow : Window
         await PersistSettingsAsync();
     }
 
+    private async void StartReplayWithWindowsCheckBox_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isClosing)
+        {
+            return;
+        }
+
+        var previous = _settings.StartReplayWithWindows;
+        var requested = StartReplayWithWindowsCheckBox.IsChecked == true;
+
+        try
+        {
+            _startupRegistrationService.SetEnabled(requested);
+            SyncSettingsFromControls();
+            _settings.StartReplayWithWindows = requested;
+            await _settingsService.SaveAsync(_settings, _lifetimeCancellation.Token);
+            StartupHintText.Text = requested
+                ? "Enabled. ClipForge will start hidden and begin replay after you sign in."
+                : "ClipForge starts hidden in the tray and uses your saved capture settings.";
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            RestoreStartupPreference(previous);
+        }
+        catch (Exception exception)
+        {
+            RestoreStartupPreference(previous);
+            ShowError($"Windows startup could not be changed. {exception.Message}");
+        }
+    }
+
+    private void RestoreStartupPreference(bool enabled)
+    {
+        _settings.StartReplayWithWindows = enabled;
+        StartReplayWithWindowsCheckBox.IsChecked = enabled;
+
+        try
+        {
+            _startupRegistrationService.SetEnabled(enabled);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException or
+            ArgumentException or NotSupportedException or Win32Exception or
+            System.Runtime.InteropServices.COMException)
+        {
+            // Preserve the previous in-app preference and surface the original failure.
+        }
+    }
+
     private void AppUpdateService_StateChanged(object? sender, AppUpdateSnapshot snapshot)
     {
         if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
@@ -1673,6 +1839,26 @@ public partial class MainWindow : Window
             _backgroundHintShown = true;
             _trayIconService.ShowBackgroundHint();
         }
+    }
+
+    internal void ShowForLaunch()
+    {
+        if (!_launchOptions.StartInBackground)
+        {
+            Show();
+            return;
+        }
+
+        // Build the HWND once so tray, hotkeys, and device initialization can
+        // complete without painting or activating a login-time window.
+        ShowActivated = false;
+        ShowInTaskbar = false;
+        Opacity = 0;
+        Show();
+        Hide();
+        Opacity = 1;
+        ShowInTaskbar = true;
+        ShowActivated = true;
     }
 
     private void ShowMainWindow()

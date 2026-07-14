@@ -29,6 +29,7 @@ ClipForge does not attempt a game-process hook, HDR pipeline, multi-track/effect
 | Clip library and trim export | `ClipLibraryService`, the trim-export service, `ClipMediaProcessRunner`, `ThumbnailPathConverter` | Discover and classify top-level ClipForge-generated normal/trimmed MP4 files, validate local MOV/MP4 media, coalesce/cache identity-bound metadata probes, create/reuse bounded thumbnail decodes, supply the latest clip, selected 4/8/10/15-item gallery, and up-to-100-item Library, and transactionally create a separate validated trim. |
 | Application updates | `AppUpdateService`, `ReleaseInfo`, Velopack | Check the configured release feed, download an update without interrupting capture, then explicitly apply it after the window shuts down cleanly. |
 | Settings | `SettingsService` | Load JSON with safe defaults and atomically replace the settings file after changes. |
+| Windows autostart | `AppLaunchOptions`, `StartupRegistrationService` | Parse the fixed private launch mode and own an opt-in per-user Startup shortcut for the installed package without introducing a service, scheduled task, or elevated process. |
 | Shortcuts | `GlobalHotkeyService`, `HotkeyGesture` | Atomically register configurable Save Clip and Toggle Overlay combinations through the Win32 hotkey API and preserve working bindings on conflicts. |
 | Tray lifecycle | `TrayIconService` | Keep window visibility separate from application/capture lifetime and expose Show, Save Clip, and Exit actions. |
 | Process hardening | `ProcessSecurityService`, assembly DllImport policy | Restrict DLL lookup to trusted Windows/application/user search locations before native components are loaded. |
@@ -122,6 +123,8 @@ Closing `MainWindow` hides it to the notification area. `TrayIconService` can re
 
 `SingleInstanceService` scopes a named mutex and activation event to the current Windows user and logon session. A second launch sends only an activation signal and exits; the primary process restores its main window. This prevents two recorders from competing for the same hotkeys and devices. A legacy pre-v1.1 process is detected and must be exited once before the upgraded build starts.
 
+`StartupRegistrationService` exposes the installed package's per-user Windows Startup shortcut as the **Start ClipForge and replay with Windows** preference. Registration is supported only when Velopack identifies the current non-portable package and its relative executable as `ClipForge.exe`; the shortcut receives only the fixed `--autostart` argument. `AppLaunchOptions` keeps manual launches interactive, starts an autostart launch in the background, and suppresses an accidental window raise when Windows invokes that argument while the primary instance is already alive. Replay is requested only after initialization has completed, the preference is still enabled, the local engine is ready, no replay is running, and shutdown has not begun. Disabling the preference deletes the shortcut, and the uninstall callback performs the same cleanup on a best-effort basis.
+
 ### Stopping and failure handling
 
 Stopping cancels segment monitoring, asks FFmpeg to exit, terminates it if necessary, disposes audio capture and named-pipe resources, and removes the session directory. The UI consumes `ReplayStateSnapshot` values (`Stopped`, `Starting`, `Buffering`, `Ready`, `Saving`, `Faulted`, and `Stopping`) rather than inferring engine state from individual controls.
@@ -130,7 +133,7 @@ Unexpected device removal, a full disk, FFmpeg exit, or pipe failure transitions
 
 ## Configuration and local state
 
-`AppSettings` is a tolerant serialization model. Missing, unsupported, malformed, or oversized JSON falls back to product defaults; settings input is capped at 1 MiB. `SettingsService` writes a uniquely named temporary file and atomically replaces the previous file, reducing the chance of partial JSON after a crash. Background, accent, and surface colors are stored as validated `#RRGGBB`. Invalid values use safe defaults; background and surface choices are proportionally darkened when necessary, and the derived palette supplies readable primary-button text and bounded interaction states.
+`AppSettings` is a tolerant serialization model. Missing, unsupported, malformed, or oversized JSON falls back to product defaults; settings input is capped at 1 MiB. `SettingsService` writes a uniquely named temporary file and atomically replaces the previous file, reducing the chance of partial JSON after a crash. The Windows autostart replay preference is off by default and is persisted locally alongside the other settings. Background, accent, and surface colors are stored as validated `#RRGGBB`. Invalid values use safe defaults; background and surface choices are proportionally darkened when necessary, and the derived palette supplies readable primary-button text and bounded interaction states.
 
 | Item | Default location / source |
 | --- | --- |
@@ -166,6 +169,8 @@ The current beta remains unsigned and the installed client does not pin a ClipFo
 ## Process and input hardening
 
 ClipForge runs as the signed-in user with `asInvoker` and does not request elevation. Startup calls the restricted Windows DLL directory policy before native capture or updater components load; assembly-level DllImport policy limits native resolution to the application directory, Windows system directory, and explicitly added user directories.
+
+The optional Windows autostart path is a per-user installed-package Startup shortcut rather than a service, Run-key entry, or scheduled task. Its executable name and argument are fixed in code; unsupported portable/development contexts cannot enable it. An autostart command line cannot inject an arbitrary target or argument through persisted settings.
 
 FFmpeg and FFprobe are launched by fully resolved executable path with `UseShellExecute=false`, no command shell, and individual argument-list entries. Normal builds accept only the pinned private/bundled executable hashes. Media probe, thumbnail, and trim processes accept only ClipForge-generated top-level candidates, revalidate file identity immediately before use, force MOV/MP4 demuxing with the local `file` protocol, cap helper runtime and diagnostic output, honor cancellation, and terminate their child process on timeout. Trim export additionally pins the source and destination root, writes an undiscoverable unique partial, validates it before an atomic non-overwriting commit, and revalidates the original before any optional deletion. WASAPI named pipes are restricted to the current user. Replay roots are separated by Windows logon-session ID; cleanup rejects a root when it or an existing ancestor is a reparse point, accepts only a regular direct `session-*` child, and purges abandoned sessions in the current logon scope after single-instance ownership is established on the next launch. User-facing Open actions accept only fully qualified existing local paths. The optional FFmpeg installer uses bounded download/extraction, a pinned HTTPS archive digest, and pinned hashes for both extracted executables.
 
@@ -210,11 +215,11 @@ These rules prevent overlapping capture processes, use-after-delete races during
 - Hardware encoders depend on current drivers and runtime support. If every hardware probe fails, `libx264` is CPU-based and 1440p/2160p or 60 FPS may be too expensive on some systems.
 - There is one selected display and one mixed stereo audio track. Region/window capture, per-app audio, separate tracks, and independent gain controls are not part of the current release.
 - Audio device removal or format changes during a session may require replay to be restarted.
-- The overlay is a desktop WPF window, not a game-injected overlay. There is no startup task, multi-track/effects editor, or automatic upload; editing is limited to a start/end Library trim.
+- The overlay is a desktop WPF window, not a game-injected overlay. Windows autostart is an optional per-user installed-app shortcut, not a service; replay therefore still requires the signed-in user's ClipForge and FFmpeg processes to remain running. There is no multi-track/effects editor or automatic upload, and editing is limited to a start/end Library trim.
 - Trim export requires replay to be stopped and re-encodes the selected interval. Below-normal process priority and single-flight scheduling reduce foreground contention but cannot make a long or high-resolution trim instantaneous or resource-free.
 - The performance smoke test validates real segment rollover, a saved MP4, duration, encoder/process priority, and sampled resource use on the test machine. It cannot certify zero input delay for every game/GPU/driver combination; target-game testing remains a release check.
 - The current beta is unsigned, and the installed updater does not yet enforce a pinned publisher identity. Signing and a client-side update trust policy remain release/security work rather than completed protection.
 
 ## Extension points
 
-The next high-value engine changes are explicit free-space enforcement, separate-track audio, per-application audio, an optional startup task, and a game-aware capture mode. They can be introduced behind the replay-engine boundary while preserving the option models, settings service, clip library, global shortcuts, and most of the WPF flow.
+The next high-value engine changes are explicit free-space enforcement, separate-track audio, per-application audio, and a game-aware capture mode. They can be introduced behind the replay-engine boundary while preserving the option models, settings service, clip library, global shortcuts, Windows autostart boundary, and most of the WPF flow.

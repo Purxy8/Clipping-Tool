@@ -15,6 +15,7 @@ Copyright (C) 2026 Purxy8. ClipForge is free and open-source software licensed u
 - Save from the app or anywhere in Windows with a configurable global shortcut (**Ctrl+Shift+F10** by default).
 - Toggle a compact, always-on-top replay overlay with a second configurable shortcut (**Ctrl+Shift+F9** by default).
 - Close the main window to the notification area while replay continues; use the tray menu to reopen ClipForge, save a clip, or exit.
+- Optionally start ClipForge and its rolling replay automatically after Windows sign-in. This installed-build setting is off by default.
 - A second launch reopens the existing ClipForge instance instead of competing for capture devices or global shortcuts.
 - Play, pause, restart, seek, skip backward/forward 10 seconds, mute, and adjust the volume of the latest saved clip without opening another application.
 - Browse 4, 8, 10, or 15 recent ClipForge-generated clips in an adaptive gallery that fills the available width, shows each file size, and scrolls larger sets horizontally.
@@ -80,6 +81,8 @@ For a managed or offline installation, place the exact pinned `ffmpeg.exe` and `
 5. Select **Start replay**. ClipForge begins building the rolling buffer on local disk.
 6. Select **Save last clip** or use the configured Save Clip shortcut after the buffer has content.
 
+To make replay available automatically after restarting or signing back into Windows, enable **Start ClipForge and replay with Windows** in the settings sidebar. This explicit opt-in is available in the installed app and is off by default. It creates a per-user Windows Startup shortcut; at the next sign-in ClipForge launches in the background, finishes loading the saved capture configuration and local FFmpeg engine, and then starts replay. If initialization or the engine is not ready, ClipForge does not force a capture start. A normal manual launch still opens the main window, and disabling the setting removes the Startup shortcut.
+
 The saved MP4 goes to the selected folder and becomes available in the player and recent-clips gallery. After the save succeeds, ClipForge can play a short confirmation sound and show a compact in-app confirmation; disable the sound at any time from **Feedback**. The player includes a timeline, elapsed/total time, play/pause, restart, 10-second skip controls, mute, and volume. Saving does not stop the rolling buffer, so another clip can be saved later. Stopping replay clears the temporary buffer. Changing the display, resolution, frame rate, or audio configuration while replay is active automatically restarts capture and clears the old buffer; changing only replay length adjusts retention in place.
 
 The gallery automatically loads only top-level files using ClipForge's generated normal `Clip_YYYY-MM-DD_HH-mm-ss[_N].mp4` and trimmed `Clip_YYYY-MM-DD_HH-mm-ss[_N]_trimmed[_N].mp4` forms. Other MP4 files in the save folder are left untouched and are not automatically decoded by the embedded player. Use the selector above the gallery to show 4, 8, 10, or 15 recent clips; the available clips fill the row, every card shows its size, and larger sets scroll horizontally. Select **Library** to browse up to the newest 100 validated recordings in a recycling list and filter the view to All, Normal, or Trimmed clips. Clicking any Library entry loads it into a large local player with play/pause, restart, timeline seeking, 10-second skips, mute, and volume. Right-clicking a Recent or Library item can reveal the revalidated file in Explorer or permanently delete that exact ClipForge recording after confirmation.
@@ -118,6 +121,7 @@ Local data is kept in these locations:
 | --- | --- |
 | Saved normal and trimmed clips | The folder selected in the app; `%USERPROFILE%\Videos\ClipForge` by default |
 | Settings | `%LOCALAPPDATA%\ClipForge\settings.json` |
+| Optional Windows autostart entry | The signed-in user's Windows Startup folder; present only while **Start ClipForge and replay with Windows** is enabled |
 | Private FFmpeg install | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
 | Rolling replay segments | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture folder removed when replay stops normally |
 
@@ -144,7 +148,7 @@ Leave additional room for segment overhead and the MP4 being saved. Higher frame
 
 ## Uninstalling and removing local data
 
-1. Choose **Exit ClipForge** from the notification-area menu so ClipForge and its FFmpeg process have stopped.
+1. Choose **Exit ClipForge** from the notification-area menu so ClipForge and its FFmpeg process have stopped. You can first disable **Start ClipForge and replay with Windows** to remove its per-user Startup shortcut immediately; the installed app also requests this cleanup during uninstall.
 2. Open **Windows Settings > Apps > Installed apps**, find **ClipForge**, open its menu, and select **Uninstall**. A portable development build has no registered uninstaller; delete the folder into which it was extracted instead.
 3. Uninstalling the application does not intentionally delete personal normal or trimmed clips or the separate ClipForge data folder. To remove settings, the optional FFmpeg install, thumbnails, and any leftover replay buffer, delete `%LOCALAPPDATA%\ClipForge` after ClipForge has exited.
 4. To remove saved recordings, trimmed exports, or a partial left by an abnormal machine shutdown, inspect and then delete the clips folder selected in ClipForge. Its default is `%USERPROFILE%\Videos\ClipForge`. Check that folder before deleting it because it contains the user's recordings, not disposable application files.

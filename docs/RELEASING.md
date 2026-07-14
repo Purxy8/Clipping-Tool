@@ -202,7 +202,9 @@ For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the p
 3. FFmpeg setup, replay capture, clip saving, Library filtering, local playback, and frame-accurate trimming work.
 4. Trim export remains disabled while replay is active, keeps both files by default, and deletes only an explicitly confirmed, identity-revalidated original.
 5. The displayed application version matches the release.
-6. After publishing a newer version, **Check for updates**, download, and **Restart to update** complete successfully. Verify that a staged package is not applied merely by launching the app without that explicit action.
+6. **Start ClipForge and replay with Windows** is off on a fresh profile. Enable it, sign out or restart, and confirm one hidden ClipForge process reaches **Replay ready** without opening the main window. Confirm the Startup shortcut contains only `ClipForge.exe --autostart`, then disable the setting and verify the shortcut is removed and the next sign-in does not launch ClipForge.
+7. Apply an update while Windows startup is enabled and repeat the sign-in check so the shortcut is proven to survive the stable Velopack launcher update. Uninstall once and verify the owned Startup shortcut is removed.
+8. After publishing a newer version, **Check for updates**, download, and **Restart to update** complete successfully. Verify that a staged package is not applied merely by launching the app without that explicit action.
 
 Raw `dotnet run`, IDE, and portable publish builds are intentionally excluded from updater installation tests. Velopack updates only apply to a Velopack-installed copy.
 

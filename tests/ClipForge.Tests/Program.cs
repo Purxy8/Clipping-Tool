@@ -19,6 +19,9 @@ internal static class Program
         [
             ("Replay length preset catalog", TestReplayLengthPresetsAsync),
             ("Resolution preset catalog", TestResolutionPresetsAsync),
+            ("Windows autostart launch options", TestLaunchOptionsAsync),
+            ("Windows autostart registration policy", TestStartupRegistrationAsync),
+            ("Windows autostart replay decision", TestAutoStartReplayPolicyAsync),
             ("Hotkey gesture validation", TestHotkeyGesturesAsync),
             ("Storage estimate helpers", TestStorageEstimatorAsync),
             ("FFmpeg capture arguments", TestCaptureArgumentsAsync),
@@ -124,6 +127,9 @@ internal static class Program
             !new AppSettings().CheckForUpdatesAutomatically,
             "Automatic update checks should require explicit opt-in.");
         var defaults = new AppSettings();
+        Assert.True(
+            !defaults.StartReplayWithWindows,
+            "Starting replay with Windows must require explicit opt-in.");
         Assert.Equal(
             AppSettings.DefaultBackgroundColor,
             defaults.BackgroundColor,
@@ -146,6 +152,117 @@ internal static class Program
             HotkeyGesture.DefaultToggleOverlay,
             defaults.ToggleOverlayHotkey,
             "The Toggle Overlay hotkey default is incorrect.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestLaunchOptionsAsync()
+    {
+        var interactive = AppLaunchOptions.Parse([]);
+        Assert.True(!interactive.IsAutoStart, "A normal launch must remain interactive.");
+        Assert.True(!interactive.StartInBackground, "A normal launch must not be hidden automatically.");
+        Assert.True(
+            interactive.ShouldActivateExistingInstance,
+            "A normal second launch should activate the existing ClipForge window.");
+
+        var autoStart = AppLaunchOptions.Parse(["--AUTOSTART"]);
+        Assert.True(autoStart.IsAutoStart, "The fixed Windows Startup argument was not recognized.");
+        Assert.True(autoStart.StartInBackground, "A Windows autostart launch should stay in the background.");
+        Assert.True(
+            !autoStart.ShouldActivateExistingInstance,
+            "A duplicate Windows autostart launch must not unexpectedly raise the existing window.");
+        Assert.True(
+            !AppLaunchOptions.Parse(["--unrelated", "autostart"]).IsAutoStart,
+            "Only the complete private autostart argument should change launch behavior.");
+        Assert.Equal(
+            AppLaunchOptions.Interactive,
+            AppLaunchOptions.Parse(Array.Empty<string>()),
+            "The explicit interactive options and an empty command line should agree.");
+        Assert.Throws<ArgumentNullException>(
+            () => AppLaunchOptions.Parse(null!),
+            "A null argument collection must be rejected.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestStartupRegistrationAsync()
+    {
+        var backend = new FakeStartupShortcutBackend { IsSupported = true };
+        var service = new StartupRegistrationService(backend);
+
+        Assert.True(service.IsSupported, "An installed backend should expose Windows startup support.");
+        Assert.True(!service.IsEnabled, "A missing Startup shortcut must report the preference as disabled.");
+        Assert.Equal(
+            StartupRegistrationService.ApplicationExecutableName,
+            backend.LastInspectedExecutable,
+            "Startup lookup must be scoped to the packaged ClipForge executable.");
+
+        service.SetEnabled(true);
+        Assert.True(service.IsEnabled, "Creating the Startup shortcut should enable the feature.");
+        Assert.Equal(
+            StartupRegistrationService.ApplicationExecutableName,
+            backend.LastCreatedExecutable,
+            "The Startup shortcut must target only the packaged ClipForge executable name.");
+        Assert.Equal(
+            AppLaunchOptions.AutoStartArgument,
+            backend.LastCreatedArguments,
+            "The Startup shortcut must receive only ClipForge's fixed private argument.");
+
+        service.SetEnabled(false);
+        Assert.True(!service.IsEnabled, "Deleting the Startup shortcut should disable the feature.");
+        Assert.Equal(
+            StartupRegistrationService.ApplicationExecutableName,
+            backend.LastDeletedExecutable,
+            "Startup cleanup must remain scoped to the packaged ClipForge executable.");
+
+        var unsupportedBackend = new FakeStartupShortcutBackend { IsSupported = false };
+        var unsupportedService = new StartupRegistrationService(unsupportedBackend);
+        Assert.True(!unsupportedService.IsSupported, "A portable/development backend must remain unsupported.");
+        Assert.True(!unsupportedService.IsEnabled, "Unsupported builds must never report startup as enabled.");
+        unsupportedService.SetEnabled(false);
+        Assert.Equal(0, unsupportedBackend.DeleteCount, "Disabling unsupported startup should be a no-op.");
+        Assert.Throws<InvalidOperationException>(
+            () => unsupportedService.SetEnabled(true),
+            "Portable/development builds must fail closed instead of creating an ambiguous startup entry.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestAutoStartReplayPolicyAsync()
+    {
+        Assert.True(
+            MainWindow.ShouldAutoStartReplay(
+                isAutoStartLaunch: true,
+                preferenceEnabled: true,
+                initializationCompleted: true,
+                engineReady: true,
+                replayRunning: false,
+                isClosing: false),
+            "A ready opted-in Windows launch should start replay exactly once.");
+
+        (bool IsAutoStart, bool Preference, bool Initialized, bool EngineReady, bool Running, bool Closing)[]
+            blockedCases =
+            [
+                (false, true, true, true, false, false),
+                (true, false, true, true, false, false),
+                (true, true, false, true, false, false),
+                (true, true, true, false, false, false),
+                (true, true, true, true, true, false),
+                (true, true, true, true, false, true)
+            ];
+
+        foreach (var item in blockedCases)
+        {
+            Assert.True(
+                !MainWindow.ShouldAutoStartReplay(
+                    item.IsAutoStart,
+                    item.Preference,
+                    item.Initialized,
+                    item.EngineReady,
+                    item.Running,
+                    item.Closing),
+                "Autostart replay must wait for every safety precondition and must not restart an active session.");
+        }
+
         return Task.CompletedTask;
     }
 
@@ -1321,6 +1438,7 @@ internal static class Program
                 OutputAudioDeviceId = "output-device",
                 CaptureMicrophone = true,
                 MicrophoneDeviceId = "microphone-device",
+                StartReplayWithWindows = true,
                 CheckForUpdatesAutomatically = false,
                 PlayClipSavedSound = false,
                 BackgroundColor = "#161321",
@@ -1344,6 +1462,10 @@ internal static class Program
             Assert.Equal(expected.OutputAudioDeviceId, actual.OutputAudioDeviceId, "Output device did not roundtrip.");
             Assert.Equal(expected.CaptureMicrophone, actual.CaptureMicrophone, "Microphone setting did not roundtrip.");
             Assert.Equal(expected.MicrophoneDeviceId, actual.MicrophoneDeviceId, "Microphone device did not roundtrip.");
+            Assert.Equal(
+                expected.StartReplayWithWindows,
+                actual.StartReplayWithWindows,
+                "Windows autostart replay preference did not roundtrip.");
             Assert.Equal(
                 expected.CheckForUpdatesAutomatically,
                 actual.CheckForUpdatesAutomatically,
@@ -2605,6 +2727,43 @@ internal static class Program
 
     private static string CreateTestDirectory() =>
         Path.Combine(Path.GetTempPath(), "ClipForge.Tests", Guid.NewGuid().ToString("N"));
+
+    private sealed class FakeStartupShortcutBackend : IStartupShortcutBackend
+    {
+        public bool IsSupported { get; init; }
+
+        public bool Registered { get; private set; }
+
+        public string? LastInspectedExecutable { get; private set; }
+
+        public string? LastCreatedExecutable { get; private set; }
+
+        public string? LastCreatedArguments { get; private set; }
+
+        public string? LastDeletedExecutable { get; private set; }
+
+        public int DeleteCount { get; private set; }
+
+        public bool IsRegistered(string relativeExecutablePath)
+        {
+            LastInspectedExecutable = relativeExecutablePath;
+            return Registered;
+        }
+
+        public void Create(string relativeExecutablePath, string arguments)
+        {
+            LastCreatedExecutable = relativeExecutablePath;
+            LastCreatedArguments = arguments;
+            Registered = true;
+        }
+
+        public void Delete(string relativeExecutablePath)
+        {
+            LastDeletedExecutable = relativeExecutablePath;
+            DeleteCount++;
+            Registered = false;
+        }
+    }
 
     private static void DeleteTestDirectory(string path)
     {
