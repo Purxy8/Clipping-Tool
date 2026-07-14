@@ -37,15 +37,48 @@ try
         return 0;
     }
 
+    if (args.Contains("--resolution-matrix", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunResolutionMatrixAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            args.Contains("--matrix-exhaustive", StringComparer.OrdinalIgnoreCase),
+            GetOption(args, "--matrix-fps"),
+            timeout.Token);
+        return 0;
+    }
+
+    if (args.Contains("--wgc-matrix", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunInteractiveCaptureMatrixAsync(args, artifactRoot, timeout.Token);
+        return 0;
+    }
+
+    if (args.Contains("--replay-trim-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunReplayConcurrentTrimSmokeAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            args,
+            timeout.Token);
+        return 0;
+    }
+
     if (args.Contains("--trim-smoke", StringComparer.OrdinalIgnoreCase))
     {
         var includeTrimAudio = args.Contains("--audio", StringComparer.OrdinalIgnoreCase);
+        var trimExecutionMode = args.Contains("--replay-coexisting", StringComparer.OrdinalIgnoreCase)
+            ? ClipTrimExecutionMode.ReplayCoexisting
+            : ClipTrimExecutionMode.Standard;
         await RunTrimSmokeAsync(
             setup,
             ffmpeg,
             artifactRoot,
             includeTrimAudio,
             GetOption(args, "--trim-source"),
+            trimExecutionMode,
             timeout.Token);
         return 0;
     }
@@ -152,14 +185,32 @@ try
     string clipPath;
     try
     {
+        if (int.TryParse(
+                GetOption(args, "--countdown"),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var countdownSeconds) && countdownSeconds > 0)
+        {
+            Console.WriteLine(
+                $"Capture begins in {countdownSeconds}s. Switch to the fullscreen application now.");
+            await Task.Delay(TimeSpan.FromSeconds(countdownSeconds), timeout.Token);
+        }
+
         await replay.StartAsync(configuration, timeout.Token);
         Console.WriteLine($"Capture strategy: {replay.ActiveEncoderDescription ?? "unknown"}");
         var performance = await ReadPerformanceSampleAsync(replay, timeout.Token)
             ?? throw new InvalidDataException("Capture process metrics were unavailable during the smoke test.");
-        if (performance.Priority != ProcessPriorityClass.BelowNormal)
+        if (performance.Priority is not (ProcessPriorityClass.BelowNormal or ProcessPriorityClass.Normal))
         {
             throw new InvalidDataException(
-                $"Capture priority was {performance.Priority}; expected BelowNormal.");
+                $"Capture priority was {performance.Priority}; expected Normal for direct hardware capture " +
+                "or BelowNormal for a fallback path.");
+        }
+
+        if (forceGdi && performance.Priority != ProcessPriorityClass.BelowNormal)
+        {
+            throw new InvalidDataException(
+                $"Forced GDI capture priority was {performance.Priority}; expected BelowNormal.");
         }
 
         if (performance.NormalizedCpuPercent > 75)
@@ -220,8 +271,9 @@ try
     }
 
     var mediaInfo = await ReadMediaInfoAsync(ffprobe, clipPath, timeout.Token);
-    var expectedWidth = resolution.Width ?? display.Width - display.Width % 2;
-    var expectedHeight = resolution.Height ?? display.Height - display.Height % 2;
+    var expectedOutput = CaptureGeometry.ResolveOutputSize(display, resolution);
+    var expectedWidth = expectedOutput.Width;
+    var expectedHeight = expectedOutput.Height;
     if (mediaInfo.Width != expectedWidth || mediaInfo.Height != expectedHeight)
     {
         throw new InvalidDataException(
@@ -254,6 +306,17 @@ try
         throw new InvalidDataException(
             $"Saved video contained a {maxVideoFrameDelta * 1000:0.###} ms frame gap; " +
             $"expected at most {maximumAllowedFrameDelta * 1000:0.###} ms at {framesPerSecond} FPS.");
+    }
+
+    FrameMotionStats? motionStats = null;
+    if (args.Contains("--motion-validation", StringComparer.OrdinalIgnoreCase))
+    {
+        motionStats = await ReadFrameMotionStatsAsync(
+            ffmpeg,
+            clipPath,
+            framesPerSecond,
+            timeout.Token);
+        AssertMovingSurfaceCadence(motionStats, framesPerSecond, "live capture");
     }
 
     var expectedAudioStreams = includeSystemAudio || includeMicrophone ? 1 : 0;
@@ -291,6 +354,10 @@ try
         $"video: {mediaInfo.Width}x{mediaInfo.Height} at {mediaInfo.AverageFrameRate:0.###} FPS, " +
         $"frames: {mediaInfo.FrameCount.ToString(CultureInfo.InvariantCulture)}; " +
         $"max frame delta: {maxVideoFrameDelta * 1000:0.###} ms; " +
+        (motionStats is null
+            ? string.Empty
+            : $"identical-frame ratio: {motionStats.DuplicateRatio:P1}; " +
+              $"longest identical run: {motionStats.MaximumIdenticalDurationMilliseconds:0.###} ms; ") +
         $"audio streams: {mediaInfo.AudioStreamCount}; " +
         $"system audio requested: {includeSystemAudio}; microphone requested: {includeMicrophone}");
     return 0;
@@ -306,6 +373,617 @@ static string? GetOption(string[] arguments, string name)
     var index = Array.FindIndex(arguments, argument =>
         string.Equals(argument, name, StringComparison.OrdinalIgnoreCase));
     return index >= 0 && index + 1 < arguments.Length ? arguments[index + 1] : null;
+}
+
+static async Task RunResolutionMatrixAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    bool exhaustive,
+    string? framesPerSecondOption,
+    CancellationToken cancellationToken)
+{
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException("The verified FFprobe tool is unavailable for resolution matrix smoke.");
+    var framesPerSecondValues = ParseMatrixFrameRates(framesPerSecondOption);
+    MatrixSource[] sources =
+    [
+        new("hd", 1280, 720),
+        new("laptop", 1366, 768),
+        new("hd-plus", 1600, 900),
+        new("full-hd", 1920, 1080),
+        new("sixteen-ten", 1920, 1200),
+        new("ultrawide-small", 2560, 1080),
+        new("qhd", 2560, 1440),
+        new("ultrawide", 3440, 1440),
+        new("four-k", 3840, 2160),
+        new("super-ultrawide", 5120, 1440),
+        new("four-three", 1024, 768),
+        new("square-custom", 1080, 1080),
+        new("portrait", 1080, 1920),
+        new("odd-full-hd", 1919, 1079),
+        new("odd-laptop", 1365, 767)
+    ];
+
+    var geometryCases = new List<ResolutionMatrixCase>();
+    foreach (var source in sources)
+    {
+        var display = new DisplayOption(
+            $"synthetic-{source.Id}",
+            source.Id,
+            0,
+            0,
+            source.Width,
+            source.Height,
+            IsPrimary: true);
+        foreach (var resolution in ResolutionOption.All)
+        {
+            var output = CaptureGeometry.ResolveOutputSize(display, resolution);
+            AssertBoundedAspectGeometry(source, resolution, output);
+            geometryCases.Add(new ResolutionMatrixCase(source, resolution, output));
+        }
+    }
+
+    Console.WriteLine(
+        $"Geometry matrix: {geometryCases.Count} source/preset combinations passed " +
+        "(standard, 16:10, 4:3, ultrawide, super-ultrawide, square, portrait, and odd inputs).");
+
+    IReadOnlyList<ResolutionMatrixCase> encodedCases = exhaustive
+        ? geometryCases
+        : geometryCases.Where(IsCuratedEncodedMatrixCase).ToArray();
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"resolution-matrix-{(exhaustive ? "exhaustive" : "curated")}-" +
+        $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(runDirectory);
+    var runner = new ClipMediaProcessRunner();
+    var passed = 0;
+    foreach (var matrixCase in encodedCases)
+    {
+        foreach (var framesPerSecond in framesPerSecondValues)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var outputPath = Path.Combine(
+                runDirectory,
+                $"{matrixCase.Source.Id}-{matrixCase.Resolution.Id}-{framesPerSecond}fps.mp4");
+            var arguments = BuildSyntheticResolutionArguments(matrixCase, framesPerSecond, outputPath);
+            var result = await runner.RunAsync(
+                    ffmpeg,
+                    arguments,
+                    TimeSpan.FromMinutes(3),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!result.Succeeded || !File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
+            {
+                throw new InvalidDataException(
+                    $"Resolution matrix encode failed for {matrixCase.Source.Width}x{matrixCase.Source.Height} " +
+                    $"to {matrixCase.Resolution.Id} at {framesPerSecond} FPS: {result.StandardError.Trim()}");
+            }
+
+            var media = await ReadMediaInfoAsync(ffprobe, outputPath, cancellationToken).ConfigureAwait(false);
+            var duration = await ReadDurationAsync(ffprobe, outputPath, cancellationToken).ConfigureAwait(false);
+            var packetTimes = await ReadPacketTimestampsAsync(
+                    ffprobe,
+                    outputPath,
+                    "v:0",
+                    "pts_time",
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var maximumFrameDelta = ReadMaximumPositiveDelta(packetTimes);
+            var motion = await ReadFrameMotionStatsAsync(
+                    ffmpeg,
+                    outputPath,
+                    framesPerSecond,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var expectedFrames = framesPerSecond;
+            if (media.Width != matrixCase.Output.Width ||
+                media.Height != matrixCase.Output.Height ||
+                Math.Abs(media.AverageFrameRate - framesPerSecond) > 0.05 ||
+                Math.Abs(media.FrameCount - expectedFrames) > 1 ||
+                Math.Abs(motion.TotalFrames - media.FrameCount) > 1 ||
+                duration is < 0.95 or > 1.10 ||
+                maximumFrameDelta > 1.1 / framesPerSecond ||
+                motion.DuplicateRatio > 0.05 ||
+                motion.MaximumIdenticalDurationMilliseconds > 1.1 * 1000 / framesPerSecond)
+            {
+                throw new InvalidDataException(
+                    $"Resolution/cadence regression for {matrixCase.Source.Width}x{matrixCase.Source.Height} " +
+                    $"to {matrixCase.Resolution.Id} at {framesPerSecond} FPS: got " +
+                    $"{media.Width}x{media.Height}, {media.AverageFrameRate:0.###} FPS, " +
+                    $"{media.FrameCount} frames, {duration:0.###}s, maximum gap " +
+                    $"{maximumFrameDelta * 1000:0.###}ms, identical ratio " +
+                    $"{motion.DuplicateRatio:P1}, longest identical run " +
+                    $"{motion.MaximumIdenticalDurationMilliseconds:0.###}ms.");
+            }
+
+            passed++;
+            Console.WriteLine(
+                $"PASS matrix {passed}: {matrixCase.Source.Width}x{matrixCase.Source.Height} -> " +
+                $"{matrixCase.Output.Width}x{matrixCase.Output.Height} ({matrixCase.Resolution.Id}), " +
+                $"{framesPerSecond} FPS, {media.FrameCount} frames, max gap " +
+                $"{maximumFrameDelta * 1000:0.###}ms, duplicate ratio {motion.DuplicateRatio:P1}");
+        }
+    }
+
+    Console.WriteLine(
+        $"PASS resolution matrix: {geometryCases.Count} geometry checks and {passed} real FFmpeg encodes. " +
+        $"Artifacts: {runDirectory}");
+    if (!exhaustive)
+    {
+        Console.WriteLine(
+            "The default encoded matrix is curated for release speed. Add --matrix-exhaustive to encode " +
+            "every source/preset pair; geometry is exhaustive in both modes.");
+    }
+}
+
+static IReadOnlyList<int> ParseMatrixFrameRates(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value) ||
+        value.Equals("both", StringComparison.OrdinalIgnoreCase))
+    {
+        return [30, 60];
+    }
+
+    var parsed = value
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(item => int.TryParse(item, NumberStyles.None, CultureInfo.InvariantCulture, out var fps)
+            ? fps
+            : 0)
+        .Distinct()
+        .ToArray();
+    if (parsed.Length == 0 || parsed.Any(fps => fps is not (30 or 60)))
+    {
+        throw new ArgumentException("--matrix-fps must be 30, 60, 30,60, or both.");
+    }
+
+    return parsed;
+}
+
+static void AssertBoundedAspectGeometry(
+    MatrixSource source,
+    ResolutionOption resolution,
+    CaptureOutputSize output)
+{
+    var evenSourceWidth = source.Width - source.Width % 2;
+    var evenSourceHeight = source.Height - source.Height % 2;
+    if (output.Width < 2 || output.Height < 2 || output.Width % 2 != 0 || output.Height % 2 != 0)
+    {
+        throw new InvalidDataException(
+            $"Geometry {source.Width}x{source.Height}/{resolution.Id} produced invalid " +
+            $"{output.Width}x{output.Height}.");
+    }
+
+    if (output.Width > evenSourceWidth || output.Height > evenSourceHeight)
+    {
+        throw new InvalidDataException(
+            $"Geometry {source.Width}x{source.Height}/{resolution.Id} upscaled to " +
+            $"{output.Width}x{output.Height}.");
+    }
+
+    if (resolution.Width is { } maximumWidth && resolution.Height is { } maximumHeight &&
+        (output.Width > maximumWidth || output.Height > maximumHeight))
+    {
+        throw new InvalidDataException(
+            $"Geometry {source.Width}x{source.Height}/{resolution.Id} exceeded its " +
+            $"{maximumWidth}x{maximumHeight} bounds.");
+    }
+
+    var sourceAspect = source.Width / (double)source.Height;
+    var outputAspect = output.Width / (double)output.Height;
+    var relativeAspectError = Math.Abs(outputAspect - sourceAspect) / sourceAspect;
+    var aspectTolerance = Math.Max(0.005, 2d / Math.Min(output.Width, output.Height));
+    if (relativeAspectError > aspectTolerance)
+    {
+        throw new InvalidDataException(
+            $"Geometry {source.Width}x{source.Height}/{resolution.Id} changed aspect ratio by " +
+            $"{relativeAspectError:P3}: {output.Width}x{output.Height}.");
+    }
+
+    var presetNeedsDownscale = resolution.Width is { } width && resolution.Height is { } height &&
+                               (source.Width > width || source.Height > height);
+    if (presetNeedsDownscale != output.RequiresScaling)
+    {
+        throw new InvalidDataException(
+            $"Geometry {source.Width}x{source.Height}/{resolution.Id} reported scaling=" +
+            $"{output.RequiresScaling}, expected {presetNeedsDownscale}.");
+    }
+}
+
+static bool IsCuratedEncodedMatrixCase(ResolutionMatrixCase matrixCase) =>
+    matrixCase.Source.Id switch
+    {
+        "full-hd" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
+        "sixteen-ten" => matrixCase.Resolution.Id is "1080p",
+        "ultrawide" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
+        "super-ultrawide" => matrixCase.Resolution.Id is "1080p",
+        "four-three" => matrixCase.Resolution.Id is "720p" or "1080p",
+        "square-custom" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
+        "portrait" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
+        "odd-full-hd" => matrixCase.Resolution.Id is "source" or "720p",
+        _ => false
+    };
+
+static IReadOnlyList<string> BuildSyntheticResolutionArguments(
+    ResolutionMatrixCase matrixCase,
+    int framesPerSecond,
+    string outputPath)
+{
+    List<string> arguments =
+    [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "lavfi",
+        "-i", $"testsrc2=duration=1:size={matrixCase.Source.Width}x{matrixCase.Source.Height}:rate={framesPerSecond}"
+    ];
+    if (matrixCase.Source.Width != matrixCase.Output.Width ||
+        matrixCase.Source.Height != matrixCase.Output.Height)
+    {
+        arguments.AddRange(
+        [
+            "-vf",
+            $"scale={matrixCase.Output.Width}:{matrixCase.Output.Height}:flags=fast_bilinear"
+        ]);
+    }
+
+    arguments.AddRange(
+    [
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-r", framesPerSecond.ToString(CultureInfo.InvariantCulture),
+        "-fps_mode", "cfr",
+        "-g", (framesPerSecond * 2).ToString(CultureInfo.InvariantCulture),
+        "-keyint_min", (framesPerSecond * 2).ToString(CultureInfo.InvariantCulture),
+        "-sc_threshold", "0",
+        "-bf", "0",
+        "-threads", "2",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        "-y",
+        outputPath
+    ]);
+    return arguments;
+}
+
+static async Task RunInteractiveCaptureMatrixAsync(
+    string[] arguments,
+    string artifactRoot,
+    CancellationToken cancellationToken)
+{
+    var requestedIds = (GetOption(arguments, "--matrix-resolutions") ??
+                        string.Join(',', ResolutionOption.All.Select(option => option.Id)))
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    if (requestedIds.Length == 0)
+    {
+        throw new ArgumentException("--matrix-resolutions did not contain a resolution ID.");
+    }
+
+    var resolutions = requestedIds
+        .Select(id => ResolutionOption.All.FirstOrDefault(option =>
+            option.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
+            ?? throw new ArgumentException($"Unsupported WGC matrix resolution '{id}'."))
+        .DistinctBy(option => option.Id, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    var executable = Environment.ProcessPath
+        ?? throw new InvalidOperationException("Could not locate the current capture smoke executable.");
+    var entryAssembly = System.Reflection.Assembly.GetEntryAssembly()?.Location;
+    var hostedByDotnet = Path.GetFileNameWithoutExtension(executable)
+        .Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+    if (hostedByDotnet && string.IsNullOrWhiteSpace(entryAssembly))
+    {
+        throw new InvalidOperationException("Could not locate the capture smoke assembly for child runs.");
+    }
+
+    Console.WriteLine(
+        "LIVE WGC MATRIX: this validates the currently selected display and active fullscreen surface. " +
+        "It cannot change a game's internal/custom resolution; repeat it after changing that resolution.");
+    if (arguments.Contains("--motion-validation", StringComparer.OrdinalIgnoreCase))
+    {
+        Console.WriteLine(
+            "MOTION VALIDATION IS ENABLED: keep a continuously moving game, video, or test pattern visible " +
+            "through every case. A static/paused surface intentionally fails duplicate-frame validation.");
+    }
+    foreach (var resolution in resolutions)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = false
+        };
+        if (hostedByDotnet)
+        {
+            startInfo.ArgumentList.Add(entryAssembly!);
+        }
+
+        foreach (var value in new[]
+                 {
+                     "--resolution", resolution.Id,
+                     "--fps", GetOption(arguments, "--fps") ?? "60",
+                     "--artifacts", artifactRoot
+                 })
+        {
+            startInfo.ArgumentList.Add(value);
+        }
+
+        foreach (var switchName in new[]
+                 {
+                     "--audio", "--microphone", "--force-gdi", "--prune", "--motion-validation"
+                 })
+        {
+            if (arguments.Contains(switchName, StringComparer.OrdinalIgnoreCase))
+            {
+                startInfo.ArgumentList.Add(switchName);
+            }
+        }
+
+        if (GetOption(arguments, "--countdown") is { } countdown)
+        {
+            startInfo.ArgumentList.Add("--countdown");
+            startInfo.ArgumentList.Add(countdown);
+        }
+
+        Console.WriteLine($"Starting live capture case {resolution.Id}...");
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"Could not start WGC matrix case {resolution.Id}.");
+        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidDataException(
+                $"Live WGC matrix case {resolution.Id} failed with exit code {process.ExitCode}.");
+        }
+    }
+
+    Console.WriteLine(
+        $"PASS live WGC matrix: {resolutions.Length} preset(s). " +
+        "An exclusive-fullscreen game, its custom mode, driver, and affected GPU must still be tested on the target PC.");
+}
+
+static async Task RunReplayConcurrentTrimSmokeAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    string[] arguments,
+    CancellationToken cancellationToken)
+{
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException("The verified FFprobe tool is unavailable for replay/trim smoke.");
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"replay-trim-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    var clipDirectory = Path.Combine(runDirectory, "clips");
+    var bufferDirectory = Path.Combine(runDirectory, "buffer");
+    Directory.CreateDirectory(clipDirectory);
+    var includeSystemAudio = arguments.Contains("--audio", StringComparer.OrdinalIgnoreCase);
+    var includeMicrophone = arguments.Contains("--microphone", StringComparer.OrdinalIgnoreCase);
+    var seedPath = Path.Combine(runDirectory, "Clip_2026-07-13_15-45-00.mp4");
+    await GenerateSyntheticTrimSourceAsync(
+            ffmpeg,
+            seedPath,
+            includeAudio: true,
+            cancellationToken)
+        .ConfigureAwait(false);
+
+    var discovery = new DeviceDiscoveryService();
+    var displays = discovery.GetDisplays();
+    var outputs = discovery.GetOutputDevices();
+    var microphones = discovery.GetMicrophones();
+    var display = displays.FirstOrDefault(candidate => candidate.IsPrimary) ?? displays.FirstOrDefault()
+        ?? throw new InvalidOperationException("No display was available for replay/trim smoke.");
+    if (includeSystemAudio && outputs.Count == 0)
+    {
+        throw new InvalidOperationException("Replay/trim smoke requested system audio but found no output device.");
+    }
+
+    if (includeMicrophone && microphones.Count == 0)
+    {
+        throw new InvalidOperationException("Replay/trim smoke requested a microphone but found no capture device.");
+    }
+
+    var resolutionId = GetOption(arguments, "--resolution") ?? "1080p";
+    var resolution = ResolutionOption.All.FirstOrDefault(option =>
+        option.Id.Equals(resolutionId, StringComparison.OrdinalIgnoreCase))
+        ?? throw new ArgumentException($"Unsupported replay/trim resolution '{resolutionId}'.");
+    var framesPerSecond = int.TryParse(
+        GetOption(arguments, "--fps"),
+        NumberStyles.None,
+        CultureInfo.InvariantCulture,
+        out var requestedFramesPerSecond)
+        ? requestedFramesPerSecond
+        : 60;
+    if (framesPerSecond is not (30 or 60))
+    {
+        throw new ArgumentOutOfRangeException(nameof(framesPerSecond), "Replay/trim FPS must be 30 or 60.");
+    }
+
+    var configuration = new CaptureConfiguration(
+        display,
+        resolution,
+        framesPerSecond,
+        TimeSpan.FromSeconds(30),
+        includeSystemAudio,
+        includeSystemAudio ? outputs.FirstOrDefault(device => device.IsDefault) ?? outputs[0] : null,
+        includeMicrophone,
+        includeMicrophone ? microphones.FirstOrDefault(device => device.IsDefault) ?? microphones[0] : null,
+        clipDirectory);
+    VideoEncodingStrategy? strategyOverride = null;
+    if (arguments.Contains("--force-gdi", StringComparer.OrdinalIgnoreCase))
+    {
+        var verifiedSelection = await new FfmpegCapabilityProbe()
+            .SelectAsync(ffmpeg, configuration, cancellationToken)
+            .ConfigureAwait(false);
+        strategyOverride = verifiedSelection.Strategy with
+        {
+            CaptureBackend = DesktopCaptureBackend.Gdi,
+            RequiresSystemMemoryTransfer = false
+        };
+    }
+
+    await using var replay = strategyOverride is null
+        ? new ReplayBufferService(setup, bufferDirectory)
+        : new ReplayBufferService(setup, bufferDirectory, strategyOverride);
+    var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    long availableTicks = 0;
+    var faulted = 0;
+    string? faultMessage = null;
+    replay.StateChanged += (_, state) =>
+    {
+        Interlocked.Exchange(ref availableTicks, state.AvailableDuration.Ticks);
+        Console.WriteLine(
+            $"Replay/trim: {state.State}, available {state.AvailableDuration.TotalSeconds:0.###}s");
+        if (state.State == ReplayState.Faulted)
+        {
+            Interlocked.Exchange(ref faulted, 1);
+            faultMessage = state.Message;
+            ready.TrySetException(new InvalidOperationException(state.Message ?? "Capture faulted."));
+        }
+        else if (state.AvailableDuration >= TimeSpan.FromSeconds(4))
+        {
+            ready.TrySetResult();
+        }
+    };
+
+    string replayClipPath;
+    try
+    {
+        await replay.StartAsync(configuration, cancellationToken).ConfigureAwait(false);
+        await ready.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
+        var beforeTrimTicks = Interlocked.Read(ref availableTicks);
+        Console.WriteLine(
+            $"Replay ready via {replay.ActiveEncoderDescription ?? "unknown"}; starting replay-safe trim.");
+        await RunTrimSmokeAsync(
+                setup,
+                ffmpeg,
+                runDirectory,
+                includeAudio: true,
+                seedPath,
+                ClipTrimExecutionMode.ReplayCoexisting,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!replay.IsRunning || Volatile.Read(ref faulted) != 0)
+        {
+            throw new InvalidDataException(
+                $"Replay stopped or faulted during replay-safe trim: {faultMessage ?? "no diagnostic"}");
+        }
+
+        var afterTrimTicks = Interlocked.Read(ref availableTicks);
+        if (afterTrimTicks <= beforeTrimTicks)
+        {
+            throw new InvalidDataException(
+                "Replay availability did not advance while the replay-safe trim was running.");
+        }
+
+        replayClipPath = await replay.SaveClipAsync(
+                TimeSpan.FromSeconds(4),
+                clipDirectory,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+    finally
+    {
+        if (replay.IsRunning)
+        {
+            await replay.StopAsync().ConfigureAwait(false);
+        }
+    }
+
+    var duration = await ReadDurationAsync(ffprobe, replayClipPath, cancellationToken).ConfigureAwait(false);
+    var media = await ReadMediaInfoAsync(ffprobe, replayClipPath, cancellationToken).ConfigureAwait(false);
+    var packetTimes = await ReadPacketTimestampsAsync(
+            ffprobe,
+            replayClipPath,
+            "v:0",
+            "pts_time",
+            cancellationToken)
+        .ConfigureAwait(false);
+    var maximumFrameDelta = ReadMaximumPositiveDelta(packetTimes);
+    var expectedOutput = CaptureGeometry.ResolveOutputSize(display, resolution);
+    var expectedAudioStreams = includeSystemAudio || includeMicrophone ? 1 : 0;
+    if (duration is < 3 or > 6 ||
+        media.Width != expectedOutput.Width ||
+        media.Height != expectedOutput.Height ||
+        Math.Abs(media.AverageFrameRate - framesPerSecond) > framesPerSecond * 0.15 ||
+        maximumFrameDelta > 1.6 / framesPerSecond ||
+        media.AudioStreamCount != expectedAudioStreams)
+    {
+        throw new InvalidDataException(
+            $"Replay output after concurrent trim was invalid: {duration:0.###}s, " +
+            $"{media.Width}x{media.Height}, {media.AverageFrameRate:0.###} FPS, " +
+            $"max gap {maximumFrameDelta * 1000:0.###}ms, audio streams {media.AudioStreamCount}.");
+    }
+
+    Console.WriteLine(
+        $"PASS replay + concurrent trim: replay advanced during a paced one-thread trim, then saved " +
+        $"{duration:0.###}s at {media.Width}x{media.Height}/{media.AverageFrameRate:0.###} FPS " +
+        $"with maximum frame gap {maximumFrameDelta * 1000:0.###}ms. Artifacts: {runDirectory}");
+}
+
+static async Task GenerateSyntheticTrimSourceAsync(
+    string ffmpeg,
+    string sourcePath,
+    bool includeAudio,
+    CancellationToken cancellationToken)
+{
+    List<string> sourceArguments =
+    [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "lavfi",
+        "-i", "testsrc2=duration=8:size=640x360:rate=30"
+    ];
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(
+        [
+            "-f", "lavfi",
+            "-i", "sine=frequency=880:sample_rate=48000:duration=8"
+        ]);
+    }
+
+    sourceArguments.AddRange(["-map", "0:v:0"]);
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(["-map", "1:a:0"]);
+    }
+
+    sourceArguments.AddRange(
+    [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0"
+    ]);
+    if (includeAudio)
+    {
+        sourceArguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+    }
+    else
+    {
+        sourceArguments.Add("-an");
+    }
+
+    sourceArguments.AddRange(["-movflags", "+faststart", "-f", "mp4", "-n", sourcePath]);
+    var generation = await new ClipMediaProcessRunner().RunAsync(
+            ffmpeg,
+            sourceArguments,
+            TimeSpan.FromMinutes(5),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!generation.Succeeded || !File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
+    {
+        throw new InvalidDataException(
+            $"Synthetic trim source generation failed: {generation.StandardError.Trim()}");
+    }
 }
 
 static async Task RunConcatTimingSmokeAsync(
@@ -449,13 +1127,15 @@ static async Task RunTrimSmokeAsync(
     string artifactRoot,
     bool includeAudio,
     string? existingSourcePath,
+    ClipTrimExecutionMode executionMode,
     CancellationToken cancellationToken)
 {
     var ffprobe = setup.FindProbeExecutable()
         ?? throw new InvalidOperationException("The verified FFprobe tool is unavailable for trim smoke.");
     var runDirectory = Path.Combine(
         artifactRoot,
-        $"trim-smoke-{(includeAudio ? "audio" : "silent")}-" +
+        $"trim-smoke-{executionMode.ToString().ToLowerInvariant()}-" +
+        $"{(includeAudio ? "audio" : "silent")}-" +
         $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
     Directory.CreateDirectory(runDirectory);
     var sourcePath = Path.Combine(runDirectory, "Clip_2026-07-13_16-00-00.mp4");
@@ -471,61 +1151,12 @@ static async Task RunTrimSmokeAsync(
     }
     else
     {
-        List<string> sourceArguments =
-        [
-            "-hide_banner",
-            "-loglevel", "error",
-            "-nostdin",
-            "-f", "lavfi",
-            "-i", "testsrc2=duration=8:size=640x360:rate=30"
-        ];
-        if (includeAudio)
-        {
-            sourceArguments.AddRange(
-            [
-                "-f", "lavfi",
-                "-i", "sine=frequency=880:sample_rate=48000:duration=8"
-            ]);
-        }
-
-        sourceArguments.AddRange(["-map", "0:v:0"]);
-        if (includeAudio)
-        {
-            sourceArguments.AddRange(["-map", "1:a:0"]);
-        }
-
-        sourceArguments.AddRange(
-        [
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-g", "60",
-            "-keyint_min", "60",
-            "-sc_threshold", "0"
-        ]);
-        if (includeAudio)
-        {
-            sourceArguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
-        }
-        else
-        {
-            sourceArguments.Add("-an");
-        }
-
-        sourceArguments.AddRange(["-movflags", "+faststart", "-f", "mp4", "-n", sourcePath]);
-        var processRunner = new ClipMediaProcessRunner();
-        var generation = await processRunner.RunAsync(
+        await GenerateSyntheticTrimSourceAsync(
                 ffmpeg,
-                sourceArguments,
-                TimeSpan.FromMinutes(5),
+                sourcePath,
+                includeAudio,
                 cancellationToken)
             .ConfigureAwait(false);
-        if (!generation.Succeeded || !File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
-        {
-            throw new InvalidDataException(
-                $"Synthetic trim source generation failed: {generation.StandardError.Trim()}");
-        }
     }
 
     var sourceHash = ComputeSha256(sourcePath);
@@ -572,6 +1203,7 @@ static async Task RunTrimSmokeAsync(
             source,
             TimeSpan.FromMilliseconds(1113),
             TimeSpan.FromMilliseconds(6287),
+            executionMode,
             cancellationToken)
         .ConfigureAwait(false);
     if (!trim.Succeeded || trim.OutputPath is null || !File.Exists(trim.OutputPath))
@@ -830,6 +1462,142 @@ static async Task<MediaInfo> ReadMediaInfoAsync(
         audioStream is { } audio ? ReadOptionalDuration(audio) : double.NaN);
 }
 
+static async Task<FrameMotionStats> ReadFrameMotionStatsAsync(
+    string ffmpeg,
+    string mediaPath,
+    int framesPerSecond,
+    CancellationToken cancellationToken)
+{
+    const int analysisWidth = 64;
+    const int analysisHeight = 36;
+    const int frameBytes = analysisWidth * analysisHeight;
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = ffmpeg,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true
+    };
+    foreach (var argument in new[]
+             {
+                 "-hide_banner",
+                 "-loglevel", "error",
+                 "-nostdin",
+                 "-f", "mov",
+                 "-protocol_whitelist", "file",
+                 "-i", mediaPath,
+                 "-map", "0:v:0",
+                 "-vf", $"scale={analysisWidth}:{analysisHeight}:flags=fast_bilinear,format=gray",
+                 "-an",
+                 "-c:v", "rawvideo",
+                 "-threads", "1",
+                 "-fps_mode", "passthrough",
+                 "-pix_fmt", "gray",
+                 "-f", "rawvideo",
+                 "pipe:1"
+             })
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+
+    using var process = Process.Start(startInfo)
+        ?? throw new InvalidOperationException("Could not start FFmpeg for decoded-frame hash validation.");
+    var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+    var frame = new byte[frameBytes];
+    byte[]? previousHash = null;
+    var totalFrames = 0;
+    var duplicateTransitions = 0;
+    var currentIdenticalRunFrames = 0;
+    var maximumIdenticalRunFrames = 0;
+    while (true)
+    {
+        var offset = 0;
+        while (offset < frame.Length)
+        {
+            var read = await process.StandardOutput.BaseStream.ReadAsync(
+                    frame.AsMemory(offset, frame.Length - offset),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            offset += read;
+        }
+
+        if (offset == 0)
+        {
+            break;
+        }
+
+        if (offset != frame.Length)
+        {
+            throw new InvalidDataException(
+                $"Decoded-frame validation ended with a partial {offset}/{frame.Length}-byte frame.");
+        }
+
+        var hash = SHA256.HashData(frame);
+        totalFrames++;
+        if (previousHash is not null &&
+            CryptographicOperations.FixedTimeEquals(previousHash, hash))
+        {
+            duplicateTransitions++;
+            currentIdenticalRunFrames++;
+        }
+        else
+        {
+            currentIdenticalRunFrames = 1;
+        }
+
+        maximumIdenticalRunFrames = Math.Max(maximumIdenticalRunFrames, currentIdenticalRunFrames);
+        previousHash = hash;
+    }
+
+    var error = await errorTask.ConfigureAwait(false);
+    await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+    if (process.ExitCode != 0)
+    {
+        throw new InvalidDataException($"Decoded-frame hash validation failed: {error.Trim()}");
+    }
+
+    if (totalFrames < 2)
+    {
+        throw new InvalidDataException(
+            $"Decoded-frame hash validation returned only {totalFrames} frame(s).");
+    }
+
+    var duplicateRatio = duplicateTransitions / (double)(totalFrames - 1);
+    var maximumIdenticalDurationMilliseconds =
+        Math.Max(0, maximumIdenticalRunFrames - 1) * 1000d / framesPerSecond;
+    return new FrameMotionStats(
+        totalFrames,
+        duplicateTransitions,
+        maximumIdenticalRunFrames,
+        duplicateRatio,
+        maximumIdenticalDurationMilliseconds);
+}
+
+static void AssertMovingSurfaceCadence(
+    FrameMotionStats motion,
+    int framesPerSecond,
+    string label)
+{
+    const double maximumFreezeMilliseconds = 150;
+    const double maximumDuplicateRatio = 0.70;
+    if (motion.MaximumIdenticalDurationMilliseconds > maximumFreezeMilliseconds ||
+        motion.DuplicateRatio > maximumDuplicateRatio)
+    {
+        throw new InvalidDataException(
+            $"{label} decoded-frame hashes indicate duplicate/frozen output: " +
+            $"{motion.DuplicateTransitions}/{motion.TotalFrames - 1} adjacent transitions were identical " +
+            $"({motion.DuplicateRatio:P1}), and the longest identical run spanned " +
+            $"{motion.MaximumIdenticalDurationMilliseconds:0.###}ms at {framesPerSecond} FPS. " +
+            "This check is valid only while a continuously moving surface is visible.");
+    }
+}
+
 static double ReadOptionalDuration(JsonElement stream) =>
     stream.TryGetProperty("duration", out var durationElement) &&
     double.TryParse(
@@ -979,6 +1747,20 @@ internal sealed record CapturePerformanceSample(
     double NormalizedCpuPercent,
     long WorkingSetBytes,
     ProcessPriorityClass Priority);
+
+internal sealed record MatrixSource(string Id, int Width, int Height);
+
+internal sealed record ResolutionMatrixCase(
+    MatrixSource Source,
+    ResolutionOption Resolution,
+    CaptureOutputSize Output);
+
+internal sealed record FrameMotionStats(
+    int TotalFrames,
+    int DuplicateTransitions,
+    int MaximumIdenticalRunFrames,
+    double DuplicateRatio,
+    double MaximumIdenticalDurationMilliseconds);
 
 internal sealed record MediaInfo(
     int Width,

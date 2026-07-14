@@ -159,13 +159,20 @@ $smokeProject = '.\tests\ClipForge.CaptureSmoke\ClipForge.CaptureSmoke.csproj'
 $smokeRoot = '.\artifacts\capture-release-smoke'
 dotnet build $smokeProject -c Release --no-restore
 dotnet run --project $smokeProject -c Release --no-build -- --concat-smoke --artifacts $smokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --resolution-matrix --matrix-fps both --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 1080p --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution source --fps 60 --audio --microphone --artifacts $smokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --resolution 720p --fps 60 --audio --microphone --force-gdi --artifacts $smokeRoot
+# Run from the interactive target-PC desktop, with the intended game/mode visible:
+dotnet run --project $smokeProject -c Release --no-build -- --wgc-matrix --matrix-resolutions source,720p,1080p,1440p,2160p --fps 60 --audio --microphone --motion-validation --countdown 5 --artifacts $smokeRoot
 ```
 
-The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. It also inspects packet timestamps: video frame spacing must stay within the configured FPS budget, audio DTS must remain monotonic, and audio/video stream durations must stay aligned across two-second replay-buffer joins. The desktop-independent `--concat-smoke` case builds three real 1920x1080 60 FPS AAC-backed segments and must complete with no join gap larger than 25 ms. Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A successful fallback run on one PC still does not replace validation on the affected or equivalent fallback/hybrid hardware before claiming that hardware-specific lag is resolved.
+The smoke harness fails on an unexpected duration, resolution, average frame rate, frame-count floor, audio-stream count, capture priority, excessive normalized CPU, or excessive working set. It also inspects packet timestamps: video frame spacing must stay within the configured FPS budget, audio DTS must remain monotonic, and audio/video stream durations must stay aligned across two-second replay-buffer joins. Direct hardware Windows Graphics Capture is expected at Normal priority; compatibility, GDI, and software fallbacks are expected below normal. The desktop-independent `--concat-smoke` case builds three real 1920x1080 60 FPS AAC-backed segments and must complete with no join gap larger than 25 ms.
+
+`--resolution-matrix` first checks every Source/preset geometry combination for standard, 16:10, 4:3, ultrawide, super-ultrawide, square, portrait, and odd-sized inputs, then performs a curated set of real 30/60 FPS FFmpeg encodes. Add `--matrix-exhaustive` to encode every source/preset pair. Fixed presets are **up to** bounds: expected outputs stay even, keep the source aspect ratio, never upscale, and never use a padded fixed canvas. `--wgc-matrix` runs the chosen presets sequentially against the selected live Windows display. It must be repeated after switching the target game among borderless/fullscreen modes and any custom internal resolution because the harness cannot change those modes itself.
+
+Record the selected capture strategy and measured results. `--force-gdi` is an internal smoke-only override that keeps the runtime-verified encoder but exercises the GDI fallback command end to end; it is not available in the production application. A synthetic or successful WGC/fallback matrix on one PC does not reproduce an affected GPU, driver, exclusive-fullscreen composition path, game's internal resolution, or input-latency conditions. Do not claim that every resolution or game is lag-free without validation on the affected or equivalent target hardware.
 
 ### Library trim smoke checklist
 
@@ -177,30 +184,32 @@ $trimSmokeRoot = '.\artifacts\trim-release-smoke'
 dotnet build $smokeProject -c Release --no-restore
 dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --artifacts $trimSmokeRoot
 dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --audio --artifacts $trimSmokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --replay-coexisting --audio --artifacts $trimSmokeRoot
+dotnet run --project $smokeProject -c Release --no-build -- --replay-trim-smoke --resolution 1080p --fps 60 --audio --microphone --artifacts $trimSmokeRoot
 # Optional regression against a copied real ClipForge recording:
 dotnet run --project $smokeProject -c Release --no-build -- --trim-smoke --audio --trim-source C:\path\to\Clip_yyyy-MM-dd_HH-mm-ss.mp4 --artifacts $trimSmokeRoot
 ```
 
-The two automated trim runs create a synthetic ClipForge source with non-keyframe-aligned boundaries and validate duration, frame count, resolution, frame rate, audio-stream count, strict trimmed naming, original-file retention, partial cleanup, and helper-process termination. They complement rather than replace the following interactive player, filter, prompt, cancellation, and target-hardware checks.
+The trim-only runs create a synthetic ClipForge source with non-keyframe-aligned boundaries and validate duration, frame count, resolution, frame rate, audio-stream count, strict trimmed naming, original-file retention, partial cleanup, and helper-process termination. `--replay-coexisting` exercises the real-time one-thread software export even in a non-interactive build session. `--replay-trim-smoke` additionally keeps a real replay capture running while it performs that coexistence export and checks that capture remains alive, the trim commits, the original is retained, and helpers terminate. Deterministic service/argument coverage separately verifies that replay-coexisting trim skips hardware probes and selects the constrained software command. These checks complement rather than replace the following interactive player, filter, prompt, cancellation, and target-hardware checks.
 
 1. Save a normal clip containing motion and audio, open it in Library, and confirm the **All**, **Normal**, and **Trimmed** filters classify it correctly.
-2. While replay is running, verify the trim export action is disabled. Stop replay before continuing; capture FFmpeg and trim FFmpeg must not intentionally run together.
-3. Move both trim handles to a non-keyframe-aligned interval, including a short selection of approximately five seconds. Confirm the preview labels and selected range match the requested start/end frames.
+2. Keep replay steadily Buffering/Ready. Confirm Library remains browsable, missing thumbnails are not regenerated, selecting a clip opens one foreground decoder, playback and seeking work, and playback starts muted. If desktop-audio capture is enabled, explicitly unmute once and confirm the UI warns that playback sound can enter the rolling buffer.
+3. During the same replay, move both trim handles to a non-keyframe-aligned interval, including a short selection of approximately five seconds. Confirm the preview labels and selected range match the requested start/end frames and export remains available.
 4. Export the range and use FFprobe to verify the trimmed MP4 is playable, has the expected video dimensions and audio-stream count, starts/ends within the accepted frame-duration tolerance, and appears under **Trimmed** without hiding the normal clip.
 5. At the post-export prompt, choose the default keep-both path and confirm both files remain. Repeat with another source, explicitly choose deletion, and confirm only the identity-revalidated original is removed after the trimmed output is safely present.
 6. Repeat a trim that would produce the same friendly base name and confirm a unique suffix is used instead of overwriting either earlier file.
 7. Start a longer trim and cancel it, then test an induced helper failure if practical. Confirm the original remains, no completed trimmed entry appears, no owned trim partial remains in the clips folder, and no FFmpeg/FFprobe child process is orphaned.
-8. Confirm the trim helper runs at below-normal priority and that the app remains responsive. Record duration and resource observations for 720p, 1080p, and Source/high-resolution inputs; these measurements describe only the test hardware and are not proof of zero latency everywhere.
-9. Start replay again after trimming and rerun the applicable capture smoke. Confirm save, playback, gallery refresh, and trim-filter state do not leave a decoder or export helper running in the background.
+8. Confirm the replay-coexisting trim uses `libx264`, one decoder/encoder thread, real-time input pacing, and Idle process priority, without a hardware-encoder probe. Record duration and resource observations for 720p, 1080p, square/custom, and Source/high-resolution inputs; these measurements describe only the test hardware and are not proof of zero latency everywhere.
+9. Exercise replay start, save, and stop while Library is open. Confirm each transient operation suspends presentation and releases its decoder, then restores the selected clip afterward without leaving a decoder or export helper in the background.
 
-Do not publish a frame-accuracy claim from UI observation alone. Record the input, selected timestamps, output duration/stream details, and FFprobe result in the release verification notes. Do not claim zero lag: trimming performs a separate re-encode and can use noticeable CPU, GPU, disk bandwidth, and temporary space even though capture must be stopped and helper priority is reduced.
+Do not publish a frame-accuracy claim from UI observation alone. Record the input, selected timestamps, output duration/stream details, and FFprobe result in the release verification notes. Do not claim zero lag: trimming performs a separate re-encode and can use noticeable CPU, disk bandwidth, and temporary space. Replay-time trim avoids the GPU encoder and is deliberately paced at real time, but that is a contention reduction rather than a zero-impact guarantee.
 
 For a signed release, `Get-AuthenticodeSignature` must report `Valid`, and the publisher should match the intended ClipForge publisher identity. Also verify on a clean Windows user account or VM:
 
 1. The installer starts without an unexpected publisher warning.
 2. ClipForge launches from the Start menu and Desktop shortcut.
-3. FFmpeg setup, replay capture, clip saving, Library filtering, local playback, and frame-accurate trimming work.
-4. Trim export remains disabled while replay is active, keeps both files by default, and deletes only an explicitly confirmed, identity-revalidated original.
+3. FFmpeg setup, replay capture, clip saving, Library filtering, local playback, and frame-accurate trimming work both with replay stopped and during steady replay.
+4. Replay-time trim uses the constrained coexistence path, keeps both files by default, and deletes only an explicitly confirmed, identity-revalidated original. Start/save/stop transitions suspend presentation safely and restore it afterward.
 5. The displayed application version matches the release.
 6. **Start ClipForge and replay with Windows** is off on a fresh profile. Enable it, sign out or restart, and confirm one hidden ClipForge process reaches **Replay ready** without opening the main window. Confirm the Startup shortcut contains only `ClipForge.exe --autostart`, then disable the setting and verify the shortcut is removed and the next sign-in does not launch ClipForge.
 7. Apply an update while Windows startup is enabled and repeat the sign-in check so the shortcut is proven to survive the stable Velopack launcher update. Uninstall once and verify the owned Startup shortcut is removed.

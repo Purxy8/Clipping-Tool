@@ -43,6 +43,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         0);
     private string? _lastSavedPath;
     private string? _activeEncoderDescription;
+    private CaptureSessionPlan? _lastCapturePlan;
     private long _bufferBytes;
     private long _reportedDroppedAudioBlocks;
     private int _nextSegmentNumber;
@@ -89,6 +90,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     public bool IsRunning => Volatile.Read(ref _isRunning) != 0;
 
     public string? ActiveEncoderDescription => _activeEncoderDescription;
+
+    internal CaptureSessionPlan? LastCapturePlan => Volatile.Read(ref _lastCapturePlan);
 
     public int? CaptureProcessId
     {
@@ -187,6 +190,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         _captureStrategyOverride,
                         $"Capture smoke override selected {_captureStrategyOverride.Description}.");
                 _activeEncoderDescription = capabilitySelection.Strategy.Description;
+                Volatile.Write(
+                    ref _lastCapturePlan,
+                    new CaptureSessionPlan(
+                        configuration.Display,
+                        configuration.Resolution,
+                        capabilitySelection.Strategy));
                 EnqueueDiagnostic(capabilitySelection.Diagnostics);
 
                 CreateAudioPipes(configuration);
@@ -211,9 +220,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 _captureProcess = captureProcess;
-                if (!ProcessTuning.TryApplyLowImpactPriority(captureProcess))
+                if (!ProcessTuning.TryApplyCapturePriority(
+                        captureProcess,
+                        capabilitySelection.Strategy))
                 {
-                    EnqueueDiagnostic("Windows did not allow ClipForge to lower FFmpeg's process priority.");
+                    EnqueueDiagnostic(
+                        "Windows did not allow ClipForge to apply the capture process priority policy.");
                 }
 
                 captureProcess.StandardInput.AutoFlush = true;

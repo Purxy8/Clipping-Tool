@@ -28,6 +28,7 @@ internal interface IClipMediaProcessRunner
 internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
 {
     private const int MaximumCapturedCharacters = 64 * 1024;
+    private static readonly SemaphoreSlim AuxiliaryProcessGate = new(1, 1);
 
     public async Task<ClipMediaProcessResult> RunAsync(
         string executablePath,
@@ -41,6 +42,28 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        await AuxiliaryProcessGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await RunCoreAsync(
+                    executablePath,
+                    arguments,
+                    timeout,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            AuxiliaryProcessGate.Release();
+        }
+    }
+
+    private static async Task<ClipMediaProcessResult> RunCoreAsync(
+        string executablePath,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
         using var process = new Process
         {
             StartInfo = CreateStartInfo(executablePath, arguments),
@@ -52,10 +75,9 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
             throw new Win32Exception("The media helper process could not be started.");
         }
 
-        // Thumbnail decoding and metadata probes are presentation work. Keep
-        // them below the foreground game's CPU priority just like the capture
-        // and export processes.
-        _ = ProcessTuning.TryApplyLowImpactPriority(process);
+        // Only one auxiliary helper runs at once and it stays at Idle priority,
+        // below both the foreground game and ClipForge's live capture process.
+        _ = ProcessTuning.TryApplyAuxiliaryMediaPriority(process);
 
         var outputTask = ReadBoundedAsync(process.StandardOutput);
         var errorTask = ReadBoundedAsync(process.StandardError);

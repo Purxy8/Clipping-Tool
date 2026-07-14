@@ -38,7 +38,7 @@ internal static class FfmpegArgumentBuilder
         }
 
         var display = configuration.Display;
-        if (display.Width <= 0 || display.Height <= 0)
+        if (display.Width < 2 || display.Height < 2)
         {
             throw new ArgumentException("The selected display has invalid dimensions.", nameof(configuration));
         }
@@ -71,7 +71,7 @@ internal static class FfmpegArgumentBuilder
                 : "nv12";
             arguments.AddRange([
                 "-vf",
-                $"{BuildVideoFilter(configuration.Resolution)},format={encoderPixelFormat}"
+                $"{BuildVideoFilter(configuration)},format={encoderPixelFormat}"
             ]);
         }
 
@@ -261,7 +261,8 @@ internal static class FfmpegArgumentBuilder
         TimeSpan duration,
         bool includeAudio,
         int framesPerSecond,
-        VideoEncodingStrategy encodingStrategy)
+        VideoEncodingStrategy encodingStrategy,
+        bool replayCoexisting = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
@@ -286,13 +287,28 @@ internal static class FfmpegArgumentBuilder
             "-hide_banner",
             "-loglevel", "warning",
             "-nostdin",
+        };
+
+        if (replayCoexisting)
+        {
+            // A replay-time trim intentionally progresses at real-time speed on
+            // one decoder thread. This prevents a bursty second media workload
+            // from starving the live capture graph or claiming its GPU encoder.
+            arguments.AddRange([
+                "-filter_threads", "1",
+                "-threads", "1",
+                "-readrate", "1"
+            ]);
+        }
+
+        arguments.AddRange([
             "-protocol_whitelist", "file",
             "-f", "mov",
             "-ss", FormatPreciseTimestamp(start),
             "-i", inputPath,
             "-t", FormatPreciseTimestamp(duration),
             "-map", "0:v:0"
-        };
+        ]);
 
         if (includeAudio)
         {
@@ -314,7 +330,7 @@ internal static class FfmpegArgumentBuilder
         AddEncoderArguments(
             arguments,
             encodingStrategy,
-            softwareThreadLimit: 2);
+            softwareThreadLimit: replayCoexisting ? 1 : 2);
         arguments.AddRange(
         [
             "-pix_fmt", "yuv420p",
@@ -338,26 +354,22 @@ internal static class FfmpegArgumentBuilder
         return arguments;
     }
 
-    private static string BuildVideoFilter(ResolutionOption resolution)
+    private static string BuildVideoFilter(CaptureConfiguration configuration)
     {
-        if (resolution.Width is null || resolution.Height is null)
+        var output = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution);
+        if (!output.RequiresScaling)
         {
-            return "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+            return configuration.Display.Width % 2 == 0 && configuration.Display.Height % 2 == 0
+                ? "null"
+                : "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear";
         }
 
-        var width = resolution.Width.Value;
-        var height = resolution.Height.Value;
-        if (width <= 0 || height <= 0)
-        {
-            throw new ArgumentException("The selected resolution has invalid dimensions.", nameof(resolution));
-        }
-
-        // GDI supplies native-size BGRA frames in system memory. Fixed output
-        // presets therefore need a CPU resize before pixel-format conversion.
-        // Fast bilinear materially reduces that fallback cost while retaining
-        // smooth interpolation; source/native mode above remains a no-resize path.
-        return $"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear," +
-               $"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black";
+        // GDI supplies native-size BGRA frames in system memory. Downscale only
+        // when the preset is genuinely smaller. The geometry is already
+        // aspect-correct and even, so no per-frame padding canvas is needed.
+        return $"scale={output.Width}:{output.Height}:flags=fast_bilinear";
     }
 
     private static void AddVideoInput(
@@ -394,15 +406,20 @@ internal static class FfmpegArgumentBuilder
         CaptureConfiguration configuration,
         VideoEncodingStrategy encodingStrategy)
     {
+        var output = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution);
         var filter = $"gfxcapture=monitor_idx={configuration.Display.MonitorIndex}" +
                      $":capture_cursor=1:max_framerate={Invariant(configuration.FramesPerSecond)}" +
                      ":output_fmt=bgra";
 
-        if (configuration.Resolution.Width is { } width &&
-            configuration.Resolution.Height is { } height &&
-            (width != configuration.Display.Width || height != configuration.Display.Height))
+        if (output.RequiresScaling)
         {
-            filter += $":width={width}:height={height}:resize_mode=scale_aspect";
+            // Resolve the aspect-preserving dimensions before FFmpeg starts.
+            // resize_mode=scale can then use the smaller direct destination and
+            // avoids clearing/drawing a padded scale_aspect texture every frame.
+            filter += $":width={output.Width}:height={output.Height}" +
+                      ":resize_mode=scale:scale_mode=bilinear";
         }
         else
         {
@@ -411,7 +428,7 @@ internal static class FfmpegArgumentBuilder
             // size avoids needless GPU copy/scaling work over a foreground game.
             // H.264 encoders require even dimensions. Negative gfxcapture sizes
             // round the native monitor size down to the requested multiple.
-            filter += ":width=-2:height=-2:resize_mode=scale_aspect";
+            filter += ":width=-2:height=-2:resize_mode=crop:scale_mode=point";
         }
 
         filter += $",fps={Invariant(configuration.FramesPerSecond)}";

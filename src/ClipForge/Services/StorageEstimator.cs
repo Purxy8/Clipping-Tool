@@ -1,3 +1,4 @@
+using ClipForge.Capture;
 using ClipForge.Models;
 
 namespace ClipForge.Services;
@@ -11,9 +12,8 @@ public static class StorageEstimator
         TimeSpan duration,
         bool hasAudio)
     {
-        var width = resolution.Width ?? display.Width;
-        var height = resolution.Height ?? display.Height;
-        var pixelsPerSecond = (double)width * height * framesPerSecond;
+        var output = CaptureGeometry.ResolveOutputSize(display, resolution);
+        var pixelsPerSecond = (double)output.Width * output.Height * framesPerSecond;
 
         // A conservative H.264 target for screen/game content. The capture engine uses
         // quality-based encoding, so this is intentionally an estimate rather than a quota.

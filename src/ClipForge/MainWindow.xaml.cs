@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Threading;
+using ClipForge.Capture;
 using ClipForge.Models;
 using ClipForge.Services;
 using Microsoft.Win32;
@@ -62,6 +63,7 @@ public partial class MainWindow : Window
     private bool _libraryRefreshPending;
     private bool _captureCriticalPresentationActive;
     private bool _captureRestartInProgress;
+    private bool _replayStartRequested;
     private bool _playerSourceReleasedForBackground;
     private bool _isPlayerPlaying;
     private bool _playWhenOpened;
@@ -69,6 +71,7 @@ public partial class MainWindow : Window
     private bool _resumePlayerAfterSeek;
     private bool _isUpdatingPlayerControls;
     private bool _isPlayerMuted;
+    private bool _replayPlaybackAudioOptIn;
     private double _playerVolumeBeforeMute = 0.8;
     private string? _pendingLibraryPreferredPath;
     private string? _lastSavedPath;
@@ -77,6 +80,8 @@ public partial class MainWindow : Window
     private OverlayWindow? _overlayWindow;
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
+    private CancellationTokenSource? _displayModeChangeCancellation;
+    private bool _refreshingDisplaySelection;
     private string? _lastTrayStatus;
     private bool? _lastTrayCanSave;
 
@@ -113,6 +118,7 @@ public partial class MainWindow : Window
         Closing += MainWindow_Closing;
         PreviewKeyDown += MainWindow_PreviewKeyDown;
         System.Windows.Application.Current.SessionEnding += Application_SessionEnding;
+        SystemEvents.DisplaySettingsChanged += SystemEvents_DisplaySettingsChanged;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -312,6 +318,7 @@ public partial class MainWindow : Window
         {
             if (_replayBufferService.IsRunning)
             {
+                _replayStartRequested = false;
                 await _replayBufferService.StopAsync();
             }
             else
@@ -415,8 +422,15 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void DisplayComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+    private async void DisplayComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_refreshingDisplaySelection)
+        {
+            return;
+        }
+
         await CaptureConfigurationChangedAsync(restartRequired: true);
+    }
 
     private async void ReplayLengthComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
@@ -504,21 +518,33 @@ public partial class MainWindow : Window
         UpdateStorageText();
         await PersistSettingsAsync();
 
-        if (restartRequired && _replayBufferService.IsRunning)
+        if (restartRequired &&
+            (_replayBufferService.IsRunning ||
+             _captureRestartInProgress ||
+             _replayStartRequested))
         {
             await RunCaptureCommandAsync(async () =>
             {
+                if (_isClosing)
+                {
+                    return;
+                }
+
                 _captureRestartInProgress = true;
                 SetCaptureCriticalPresentationState(isActive: true);
                 try
                 {
                     await _replayBufferService.StopAsync();
-                    await StartReplayCoreAsync();
+                    if (!_isClosing && _replayStartRequested)
+                    {
+                        await StartReplayCoreAsync();
+                    }
                 }
                 finally
                 {
                     _captureRestartInProgress = false;
-                    SetCaptureCriticalPresentationState(IsCaptureCriticalState(_latestState));
+                    SetCaptureCriticalPresentationState(
+                        IsCapturePresentationSuspendedState(_latestState));
                 }
             });
         }
@@ -526,12 +552,19 @@ public partial class MainWindow : Window
 
     private async Task<Exception?> RunCaptureCommandAsync(Func<Task> command, bool showError = true)
     {
-        await _captureCommandGate.WaitAsync();
-        BufferToggleButton.IsEnabled = false;
+        var gateEntered = false;
         Exception? commandError = null;
 
         try
         {
+            await _captureCommandGate.WaitAsync(_lifetimeCancellation.Token);
+            gateEntered = true;
+            if (_isClosing)
+            {
+                return null;
+            }
+
+            BufferToggleButton.IsEnabled = false;
             HideError();
             await command();
         }
@@ -549,8 +582,11 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _captureCommandGate.Release();
-            UpdateControlsForState(_latestState);
+            if (gateEntered)
+            {
+                _captureCommandGate.Release();
+                UpdateControlsForState(_latestState);
+            }
         }
 
         return commandError;
@@ -600,7 +636,7 @@ public partial class MainWindow : Window
 
     private async Task StartReplayCoreAsync()
     {
-        if (_libraryWindow?.IsTrimInProgress == true)
+        if (_clipTrimService.HasReplayBlockingTrimWork)
         {
             throw new InvalidOperationException(
                 "Wait for the trim export to finish or cancel it before starting Instant Replay.");
@@ -615,6 +651,12 @@ public partial class MainWindow : Window
         SyncSettingsFromControls();
         EnsureSaveDirectory();
         await PersistSettingsAsync();
+        if (_clipTrimService.HasReplayBlockingTrimWork)
+        {
+            throw new InvalidOperationException(
+                "Wait for the trim export to finish or cancel it before starting Instant Replay.");
+        }
+
         var configuration = BuildCaptureConfiguration();
 
         // Decoder graphs, media helpers, and thumbnail refreshes are presentation
@@ -623,6 +665,7 @@ public partial class MainWindow : Window
         SetCaptureCriticalPresentationState(isActive: true);
         try
         {
+            _replayStartRequested = true;
             await _replayBufferService.StartAsync(
                 configuration,
                 _lifetimeCancellation.Token);
@@ -640,8 +683,13 @@ public partial class MainWindow : Window
 
     private CaptureConfiguration BuildCaptureConfiguration()
     {
-        var display = DisplayComboBox.SelectedItem as DisplayOption
+        var selectedDisplay = DisplayComboBox.SelectedItem as DisplayOption
             ?? throw new InvalidOperationException("No display is available to capture.");
+        var display = FindDisplayByDeviceName(
+                          _deviceDiscoveryService.GetDisplays(),
+                          selectedDisplay.DeviceName)
+                      ?? throw new InvalidOperationException(
+                          "The selected display is no longer available. Choose another display and try again.");
         var resolution = ResolutionComboBox.SelectedItem as ResolutionOption
             ?? throw new InvalidOperationException("Choose a recording resolution.");
         var replayLength = ReplayLengthComboBox.SelectedItem as ReplayLengthOption
@@ -674,6 +722,144 @@ public partial class MainWindow : Window
             captureMicrophone,
             microphone,
             _settings.SaveDirectory);
+    }
+
+    internal static DisplayOption? FindDisplayByDeviceName(
+        IReadOnlyList<DisplayOption> displays,
+        string? deviceName)
+    {
+        ArgumentNullException.ThrowIfNull(displays);
+        return displays.FirstOrDefault(display => string.Equals(
+            display.DeviceName,
+            deviceName,
+            StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void SystemEvents_DisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        _ = Dispatcher.BeginInvoke(QueueDisplayModeRefresh);
+    }
+
+    private void QueueDisplayModeRefresh()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        var previous = Interlocked.Exchange(
+            ref _displayModeChangeCancellation,
+            cancellation);
+        previous?.Cancel();
+        _ = RefreshDisplayModeAfterDelayAsync(cancellation);
+    }
+
+    private async Task RefreshDisplayModeAfterDelayAsync(
+        CancellationTokenSource refreshCancellation)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(900), refreshCancellation.Token);
+            if (_isClosing ||
+                DisplayComboBox.SelectedItem is not DisplayOption selectedDisplay)
+            {
+                return;
+            }
+
+            var displays = _deviceDiscoveryService.GetDisplays();
+            var currentDisplay = FindDisplayByDeviceName(displays, selectedDisplay.DeviceName);
+            if (currentDisplay is null)
+            {
+                return;
+            }
+
+            var geometryChanged = currentDisplay.Left != selectedDisplay.Left ||
+                                  currentDisplay.Top != selectedDisplay.Top ||
+                                  currentDisplay.Width != selectedDisplay.Width ||
+                                  currentDisplay.Height != selectedDisplay.Height ||
+                                  currentDisplay.MonitorIndex != selectedDisplay.MonitorIndex;
+            if (!geometryChanged)
+            {
+                return;
+            }
+
+            _refreshingDisplaySelection = true;
+            try
+            {
+                DisplayComboBox.ItemsSource = displays;
+                DisplayComboBox.SelectedItem = currentDisplay;
+            }
+            finally
+            {
+                _refreshingDisplaySelection = false;
+            }
+
+            // Preserve the rolling buffer when direct WGC can keep the same
+            // encoded size. Source/output-size changes and GDI's baked desktop
+            // geometry still require a restart; a mode-change fault is also
+            // recovered while the user's replay intent remains active.
+            var restartRequired = ShouldRestartReplayAfterDisplayChange(
+                _replayStartRequested,
+                _replayBufferService.IsRunning,
+                _captureRestartInProgress,
+                _replayBufferService.LastCapturePlan,
+                currentDisplay);
+            await CaptureConfigurationChangedAsync(restartRequired);
+        }
+        catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
+        {
+            // A newer display transition superseded this debounce.
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or ArgumentException or Win32Exception)
+        {
+            if (!_isClosing)
+            {
+                ShowError($"ClipForge could not adapt to the new display mode. {exception.Message}");
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_displayModeChangeCancellation, refreshCancellation))
+            {
+                _displayModeChangeCancellation = null;
+            }
+
+            refreshCancellation.Dispose();
+        }
+    }
+
+    internal static bool ShouldRestartReplayAfterDisplayChange(
+        bool replayStartRequested,
+        bool replayRunning,
+        bool captureRestartInProgress,
+        CaptureSessionPlan? capturePlan,
+        DisplayOption currentDisplay)
+    {
+        ArgumentNullException.ThrowIfNull(currentDisplay);
+        if (!replayStartRequested)
+        {
+            return false;
+        }
+
+        // A mode transition may fault WGC before the debounce completes. The
+        // user's explicit replay intent survives that transient failure.
+        if (!replayRunning && !captureRestartInProgress)
+        {
+            return true;
+        }
+
+        return capturePlan is null ||
+               CaptureGeometry.RequiresRestartForDisplayChange(
+                   capturePlan,
+                   currentDisplay);
     }
 
     private void SyncSettingsFromControls()
@@ -1064,9 +1250,35 @@ public partial class MainWindow : Window
             return;
         }
 
+        var wasReplaySession = IsReplaySessionState(_latestState);
+        var isReplaySession = IsReplaySessionState(snapshot);
         _latestState = snapshot;
-        SetCaptureCriticalPresentationState(
-            _captureRestartInProgress || IsCaptureCriticalState(snapshot));
+        if (isReplaySession && !wasReplaySession)
+        {
+            // Desktop loopback would otherwise record ClipForge's own preview
+            // audio into the rolling buffer. A deliberate volume/unmute action
+            // opts back in for the remainder of this replay session.
+            _replayPlaybackAudioOptIn = false;
+            ApplyPlayerVolume(0);
+        }
+
+        var suspendPresentation =
+            _captureRestartInProgress || IsCapturePresentationSuspendedState(snapshot);
+        if (suspendPresentation)
+        {
+            // Suspend first so entering Starting/Saving/Stopping cannot launch
+            // even a short-lived Library helper before the cancellation arrives.
+            SetCaptureCriticalPresentationState(isActive: true);
+        }
+
+        _libraryWindow?.UpdateReplayRunningState(isReplaySession);
+        if (!suspendPresentation)
+        {
+            // On the way back to Ready/Stopped, update the replay policy first;
+            // the resumed refresh then immediately selects the correct cached
+            // or full thumbnail mode instead of starting twice.
+            SetCaptureCriticalPresentationState(isActive: false);
+        }
         if (IsVisible && IsActive)
         {
             UpdateControlsForState(snapshot);
@@ -1087,9 +1299,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool IsCaptureCriticalState(ReplayStateSnapshot snapshot) =>
+    internal static bool IsReplaySessionState(ReplayStateSnapshot snapshot) =>
         snapshot.State is ReplayState.Starting or ReplayState.Buffering or ReplayState.Ready or
             ReplayState.Saving or ReplayState.Stopping;
+
+    internal static bool IsCapturePresentationSuspendedState(ReplayStateSnapshot snapshot) =>
+        snapshot.State is ReplayState.Starting or ReplayState.Saving or ReplayState.Stopping;
 
     private void SetCaptureCriticalPresentationState(bool isActive)
     {
@@ -1099,7 +1314,7 @@ public partial class MainWindow : Window
         }
 
         _captureCriticalPresentationActive = isActive;
-        _libraryWindow?.UpdateReplayRunningState(isActive);
+        _libraryWindow?.UpdatePresentationSuspended(isActive);
 
         if (isActive)
         {
@@ -2014,6 +2229,15 @@ public partial class MainWindow : Window
 
         if (_libraryWindow is { } openLibrary)
         {
+            // Moving focus back to Library must never leave both WPF media
+            // graphs alive. Apply replay policy before Show/Activate so the
+            // window cannot briefly reopen with stale capture assumptions.
+            ReleasePlayerForBackground();
+            _libraryRefreshPending = true;
+            openLibrary.UpdateReplayRunningState(
+                IsReplaySessionState(_latestState) || _replayBufferService.IsRunning);
+            openLibrary.UpdatePresentationSuspended(_captureCriticalPresentationActive);
+
             if (!openLibrary.IsVisible)
             {
                 openLibrary.Show();
@@ -2025,8 +2249,6 @@ public partial class MainWindow : Window
             }
 
             _ = openLibrary.Activate();
-            openLibrary.UpdateReplayRunningState(
-                _captureCriticalPresentationActive || _replayBufferService.IsRunning);
             if (beginTrim && preferredClip is not null)
             {
                 openLibrary.SelectClipAndBeginTrim(preferredClip);
@@ -2043,9 +2265,10 @@ public partial class MainWindow : Window
             _clipLibraryService,
             _clipTrimService,
             _settings.SaveDirectory,
-            _captureCriticalPresentationActive || _replayBufferService.IsRunning,
+            IsReplaySessionState(_latestState) || _replayBufferService.IsRunning,
             preferredClip,
-            beginTrim)
+            beginTrim,
+            presentationSuspended: _captureCriticalPresentationActive)
         {
             Owner = this
         };
@@ -2223,6 +2446,9 @@ public partial class MainWindow : Window
                 _settings.SaveDirectory,
                 count: requestedCount,
                 includeThumbnails: true,
+                thumbnailPolicy: IsReplaySessionState(_latestState)
+                    ? ClipThumbnailPolicy.CachedOnly
+                    : ClipThumbnailPolicy.GenerateMissing,
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
@@ -2319,11 +2545,10 @@ public partial class MainWindow : Window
             return;
         }
 
+        ReplaceClipPlayerElement();
+
         if (_captureCriticalPresentationActive)
         {
-            ClipPlayer.Stop();
-            ClipPlayer.Close();
-            ClipPlayer.Source = null;
             _currentClip = clip;
             _playerSourceReleasedForBackground = true;
             _playWhenOpened = false;
@@ -2341,12 +2566,37 @@ public partial class MainWindow : Window
             return;
         }
 
-        ClipPlayer.Stop();
+        if (IsReplaySessionState(_latestState) && !autoplay)
+        {
+            // A gallery refresh during replay updates presentation state without
+            // opening a decoder. The user's Play/clip click is the explicit
+            // opt-in that creates the one foreground media graph.
+            _currentClip = clip;
+            _playerSourceReleasedForBackground = true;
+            _playWhenOpened = false;
+            SetPlayerPlaying(false);
+            LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
+            PlayerEmptyState.Visibility = Visibility.Collapsed;
+            OpenCurrentClipButton.IsEnabled = true;
+            TrimCurrentClipButton.IsEnabled = true;
+            SetPlayerControlsEnabled(false);
+            PlayerSurfacePlayButton.IsEnabled = true;
+            PlayerSurfacePlayButton.Visibility = Visibility.Visible;
+            SetSeekUi(TimeSpan.Zero, clip.Duration ?? TimeSpan.Zero);
+            PlayerTimeText.Text = clip.Duration is { } replayDuration
+                ? $"0:00 / {FormatDuration(replayDuration)}"
+                : "0:00 / --:--";
+            return;
+        }
+
         _currentClip = clip;
         _playerSourceReleasedForBackground = false;
         _playWhenOpened = autoplay;
         SetPlayerPlaying(false);
         ClipPlayer.Source = new Uri(clip.FullPath, UriKind.Absolute);
+        ApplyPlayerVolume(IsReplaySessionState(_latestState) && !_replayPlaybackAudioOptIn
+            ? 0
+            : null);
         LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         OpenCurrentClipButton.IsEnabled = true;
@@ -2366,9 +2616,7 @@ public partial class MainWindow : Window
 
     private void ClearPlayer()
     {
-        ClipPlayer.Stop();
-        ClipPlayer.Close();
-        ClipPlayer.Source = null;
+        ReplaceClipPlayerElement();
         _currentClip = null;
         _playerSourceReleasedForBackground = false;
         _playWhenOpened = false;
@@ -2387,6 +2635,17 @@ public partial class MainWindow : Window
     {
         if (_currentClip is null)
         {
+            return;
+        }
+
+        if (ClipPlayer.Source is null)
+        {
+            if (_captureCriticalPresentationActive)
+            {
+                return;
+            }
+
+            SelectClip(_currentClip, autoplay: true);
             return;
         }
 
@@ -2430,12 +2689,18 @@ public partial class MainWindow : Window
         if (_isPlayerMuted || PlayerVolumeSlider.Value <= 0)
         {
             _isPlayerMuted = false;
+            if (IsReplaySessionState(_latestState))
+            {
+                _replayPlaybackAudioOptIn = true;
+            }
+
             PlayerVolumeSlider.Value = Math.Max(5, _playerVolumeBeforeMute * 100);
         }
         else
         {
             _playerVolumeBeforeMute = Math.Clamp(PlayerVolumeSlider.Value / 100, 0.05, 1);
             _isPlayerMuted = true;
+            _replayPlaybackAudioOptIn = false;
             PlayerVolumeSlider.Value = 0;
         }
 
@@ -2456,6 +2721,11 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaOpened(object sender, RoutedEventArgs e)
     {
+        if (!ReferenceEquals(sender, ClipPlayer))
+        {
+            return;
+        }
+
         if (!CanHandlePlayerMediaEvent())
         {
             SuppressLatePlayerMediaEvent();
@@ -2477,6 +2747,11 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaEnded(object sender, RoutedEventArgs e)
     {
+        if (!ReferenceEquals(sender, ClipPlayer))
+        {
+            return;
+        }
+
         if (!CanHandlePlayerMediaEvent())
         {
             SuppressLatePlayerMediaEvent();
@@ -2489,8 +2764,13 @@ public partial class MainWindow : Window
         UpdatePlayerTime();
     }
 
-    private void ClipPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+    private void ClipPlayer_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
     {
+        if (!ReferenceEquals(sender, ClipPlayer))
+        {
+            return;
+        }
+
         if (!CanHandlePlayerMediaEvent())
         {
             SuppressLatePlayerMediaEvent();
@@ -2530,12 +2810,7 @@ public partial class MainWindow : Window
     {
         _playWhenOpened = false;
         ClipPlayer.Volume = 0;
-        if (ClipPlayer.Source is not null)
-        {
-            ClipPlayer.Stop();
-            ClipPlayer.Close();
-            ClipPlayer.Source = null;
-        }
+        ReplaceClipPlayerElement();
 
         _playerSourceReleasedForBackground = _currentClip is not null;
         SetPlayerPlaying(false);
@@ -2613,7 +2888,10 @@ public partial class MainWindow : Window
             var maximumSeconds = total > TimeSpan.Zero ? total.TotalSeconds : 1;
             PlayerSeekSlider.Maximum = maximumSeconds;
             PlayerSeekSlider.Value = Math.Clamp(position.TotalSeconds, 0, maximumSeconds);
-            PlayerSeekSlider.IsEnabled = _currentClip is not null && total > TimeSpan.Zero;
+            PlayerSeekSlider.IsEnabled = _currentClip is not null &&
+                                         ClipPlayer.Source is not null &&
+                                         !_captureCriticalPresentationActive &&
+                                         total > TimeSpan.Zero;
         }
         finally
         {
@@ -2718,17 +2996,27 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private void PlayerVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) =>
-        ApplyPlayerVolume();
+    private void PlayerVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (!_isInitializing &&
+            IsReplaySessionState(_latestState) &&
+            e.NewValue > 0 &&
+            e.NewValue != e.OldValue)
+        {
+            _replayPlaybackAudioOptIn = true;
+        }
 
-    private void ApplyPlayerVolume()
+        ApplyPlayerVolume();
+    }
+
+    private void ApplyPlayerVolume(double? requestedVolume = null)
     {
         if (ClipPlayer is null || MutePlayerButton is null)
         {
             return;
         }
 
-        var volume = Math.Clamp(PlayerVolumeSlider.Value / 100, 0, 1);
+        var volume = Math.Clamp(requestedVolume ?? PlayerVolumeSlider.Value / 100, 0, 1);
         ClipPlayer.Volume = volume;
         _isPlayerMuted = volume <= 0.001;
         if (!_isPlayerMuted)
@@ -2824,10 +3112,62 @@ public partial class MainWindow : Window
             return;
         }
 
-        ClipPlayer.Stop();
-        ClipPlayer.Close();
-        ClipPlayer.Source = null;
+        ReplaceClipPlayerElement();
         _playerSourceReleasedForBackground = true;
+    }
+
+    private void ReplaceClipPlayerElement()
+    {
+        var previousPlayer = ClipPlayer;
+        previousPlayer.MouseLeftButtonUp -= ClipPlayer_MouseLeftButtonUp;
+        previousPlayer.MediaOpened -= ClipPlayer_MediaOpened;
+        previousPlayer.MediaEnded -= ClipPlayer_MediaEnded;
+        previousPlayer.MediaFailed -= ClipPlayer_MediaFailed;
+        previousPlayer.Volume = 0;
+        previousPlayer.Stop();
+        previousPlayer.Close();
+        previousPlayer.Source = null;
+
+        if (_isClosing)
+        {
+            return;
+        }
+
+        // Each clip owns a fresh WPF media graph. Late events from a closed
+        // source remain attached to the detached element and cannot mutate the
+        // next clip's controls or autoplay state.
+        var replacement = new MediaElement
+        {
+            LoadedBehavior = MediaState.Manual,
+            UnloadedBehavior = MediaState.Manual,
+            Stretch = System.Windows.Media.Stretch.Uniform,
+            ScrubbingEnabled = true,
+            Volume = 0.8,
+            Cursor = System.Windows.Input.Cursors.Hand
+        };
+        replacement.MouseLeftButtonUp += ClipPlayer_MouseLeftButtonUp;
+        replacement.MediaOpened += ClipPlayer_MediaOpened;
+        replacement.MediaEnded += ClipPlayer_MediaEnded;
+        replacement.MediaFailed += ClipPlayer_MediaFailed;
+        System.Windows.Automation.AutomationProperties.SetName(
+            replacement,
+            "Clip preview player");
+        System.Windows.Automation.AutomationProperties.SetHelpText(
+            replacement,
+            "Click to play or pause the selected clip");
+
+        var index = ClipPlayerHost.Children.IndexOf(previousPlayer);
+        if (index >= 0)
+        {
+            ClipPlayerHost.Children.RemoveAt(index);
+            ClipPlayerHost.Children.Insert(index, replacement);
+        }
+        else
+        {
+            ClipPlayerHost.Children.Insert(0, replacement);
+        }
+
+        ClipPlayer = replacement;
     }
 
     private static string FormatDuration(TimeSpan duration) =>
@@ -2852,9 +3192,11 @@ public partial class MainWindow : Window
 
         e.Cancel = true;
         _isClosing = true;
+        _replayStartRequested = false;
         IsEnabled = false;
         StatusText.Text = "Closing ClipForge…";
         _lifetimeCancellation.Cancel();
+        _displayModeChangeCancellation?.Cancel();
         CancelSavedToast();
         _libraryWindow?.Close();
         _libraryWindow = null;
@@ -2891,12 +3233,13 @@ public partial class MainWindow : Window
             _trayIconService.SaveClipRequested -= TrayIconService_SaveClipRequested;
             _trayIconService.ExitRequested -= TrayIconService_ExitRequested;
             System.Windows.Application.Current.SessionEnding -= Application_SessionEnding;
+            SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
             PreviewKeyDown -= MainWindow_PreviewKeyDown;
             Activated -= MainWindow_Activated;
             Deactivated -= MainWindow_Deactivated;
             _playerTimer.Stop();
             _playerTimer.Tick -= PlayerTimer_Tick;
-            ClipPlayer.Stop();
+            ReplaceClipPlayerElement();
             if (_overlayWindow is not null)
             {
                 _overlayWindow.Close();
