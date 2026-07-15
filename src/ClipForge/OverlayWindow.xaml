@@ -9,7 +9,7 @@
         Background="{StaticResource WindowBrush}"
         ShowInTaskbar="False"
         ShowActivated="False"
-        Topmost="True"
+        Topmost="False"
         UseLayoutRounding="True"
         Loaded="OverlayWindow_Loaded"
         MouseLeftButtonDown="OverlayWindow_MouseLeftButtonDown">

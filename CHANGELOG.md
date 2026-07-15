@@ -4,6 +4,34 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.5] - 2026-07-15
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- Fixed a recovery-state race that could permanently suppress every later 30-minute WGC renewal after the bounded health-recovery budget was exhausted. Recovery requests now use an atomic, generation-tagged gate; stale dispatcher callbacks cannot release a newer request, shutdown, queued, rejected, failed, and successful paths all resolve their own request, and a one-shot display/device refresh arriving behind a health event is coalesced and dispatched after that event releases the gate.
+- Scheduled renewal now gives FFmpeg a one-second bounded graceful shutdown window so its WGC frame handler, capture session, frame pool, D3D device, COM resources, and selected WASAPI inputs can close normally. Kill-on-job-close remains the final fallback, and a replacement is never allowed to overlap uncertain old resources.
+- The desktop overlay is no longer a permanently topmost surface. It becomes topmost only while explicitly shown, hides after ten idle seconds, forcibly releases a stuck mouse capture at a 15-second hard limit, stops its timer while hidden, and reuses the same HWND when the shortcut opens it again.
+- Old pre-session-scoping `Buffer/session-*` crash residue is now removed by a fail-closed, bounded background migration instead of synchronously walking thousands of files on the WPF startup thread. Ownership is snapshotted before automatic replay can start, and capture waits asynchronously for that one-time task so deletion/antivirus work never overlaps recording. Other Windows-session roots, recent data, reparse points, nested content, unexpected files, and possible active owners are left untouched.
+- Library replay-state updates no longer rebuild unchanged trim/player state every second.
+
+### Root-cause evidence
+
+- The affected five-minute Call of Duty clip contained 18,000 nominal CFR60 frames but only 2.38 meaningful large-scene changes per second, 96.03% repeated macro frames, and a longest held scene of 8.43 seconds. Its audio decoded continuously. The immediate next clip after recorder restart reached 48.35 meaningful changes per second.
+- A second affected CS2 clip fell to 1.09 meaningful changes per second with a 36.82-second held scene, while the immediate post-restart clip reached 59.76 changes per second. This isolates the failure to long-lived WGC video delivery rather than MP4 timing, NVENC capacity, or audio capture.
+- The stale recovery gate could leave one FFmpeg/WGC generation alive indefinitely, matching that restart-sensitive failure. Fresh beta4 gameplay remained healthy after its first scheduled renewal, so this release keeps the proven low-overhead 1080 path instead of switching to a `scale_d3d11` path that failed its RTX 5080 runtime probe with a D3D texture-pool error.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors and the deterministic suite passes 48/48 tests, including a 1,000-iteration suppression race, stale-request isolation, overlay hard-limit behavior, bounded legacy cleanup, and existing capture/security coverage.
+- Two accelerated 12-renewal 1920x1080/60 WGC/NVIDIA NVENC tests passed, one video-only and one with desktop audio. All 24 replacement PIDs were distinct, retired FFmpeg processes were gone before their successor was accepted, completed ring segments survived, and no overlapping recorder remained.
+- The audio run produced a validated 6.005-second MP4 with 359 frames at 60.003 FPS, one audio stream, and no video-frame timestamp gap above 17 ms. After forced finalization the test host settled to 481 handles and 50.7 MB private memory; FFmpeg remained steady at roughly 1,103 handles and 108–109 MB per generation.
+- Accelerated renewal tests exercise lifecycle/resource accumulation equivalent to repeated process rotations, but they cannot reproduce every multi-hour game/driver/compositor combination. Affected Call of Duty validation after installation is still required before claiming universal zero-lag capture.
+
 ## [1.9.0-beta.4] - 2026-07-15
 
 ### Release status

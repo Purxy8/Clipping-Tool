@@ -966,17 +966,13 @@ public partial class MainWindow : Window
             !_replayBufferService.IsRunning ||
             _replayBufferService.LastCapturePlan?.Strategy.CaptureBackend !=
                 DesktopCaptureBackend.WindowsGraphicsCapture ||
-            _replayBufferService.CaptureProcessId is not { } processId)
+            _replayBufferService.CaptureProcessId is null)
         {
             return;
         }
 
-        ReplayBufferService_CaptureRecoveryRequested(
-            _replayBufferService,
-            new CaptureRecoveryRequestedEventArgs(
-                CaptureRecoveryReason.ScheduledRefresh,
-                "Windows reported a same-size display or graphics-device transition; renewing WGC prevents the old frame pool from becoming stale.",
-                processId));
+        _replayBufferService.RequestScheduledCaptureRefresh(
+            "Windows reported a same-size display or graphics-device transition; renewing WGC prevents the old frame pool from becoming stale.");
     }
 
     internal static bool ShouldRestartReplayAfterDisplayChange(
@@ -1386,18 +1382,34 @@ public partial class MainWindow : Window
     {
         if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
         {
+            _replayBufferService.CompleteCaptureRecoveryRequest(eventArgs);
             return;
         }
 
         if (!Dispatcher.CheckAccess())
         {
-            _ = Dispatcher.BeginInvoke(() =>
-                ReplayBufferService_CaptureRecoveryRequested(sender, eventArgs));
+            try
+            {
+                var operation = Dispatcher.BeginInvoke(() =>
+                    ReplayBufferService_CaptureRecoveryRequested(sender, eventArgs));
+                _ = operation.Task.ContinueWith(
+                    _ => _replayBufferService.CompleteCaptureRecoveryRequest(eventArgs),
+                    CancellationToken.None,
+                    TaskContinuationOptions.NotOnRanToCompletion |
+                        TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+            catch (InvalidOperationException)
+            {
+                _replayBufferService.CompleteCaptureRecoveryRequest(eventArgs);
+            }
+
             return;
         }
 
         if (_captureRecoveryQueued)
         {
+            _replayBufferService.CompleteCaptureRecoveryRequest(eventArgs);
             return;
         }
 
@@ -1445,9 +1457,12 @@ public partial class MainWindow : Window
                 var scheduledRefresh = !UsesAutomaticCaptureRecoveryBudget(eventArgs.Reason);
                 if (!scheduledRefresh && _automaticCaptureRecoveryCount >= 2)
                 {
+                    _ = _replayBufferService.SuppressCaptureFaultRecovery(
+                        eventArgs);
                     ShowError(
                         "Capture pacing is still unstable after automatic recovery. " +
-                        "ClipForge kept replay running and will not restart it repeatedly.");
+                        "ClipForge kept replay running and will not restart it repeatedly. " +
+                        "Routine capture-engine refresh remains active.");
                     return;
                 }
 
@@ -1511,6 +1526,7 @@ public partial class MainWindow : Window
         finally
         {
             _captureRecoveryQueued = false;
+            _replayBufferService.CompleteCaptureRecoveryRequest(eventArgs);
         }
     }
 
@@ -2300,12 +2316,12 @@ public partial class MainWindow : Window
         var overlay = EnsureOverlayWindow();
         if (overlay.IsVisible)
         {
-            overlay.Hide();
+            overlay.Dismiss();
             return;
         }
 
         overlay.UpdateState(_latestState, _replayBufferService.IsRunning, _settings.SaveClipHotkey.DisplayText);
-        overlay.Show();
+        overlay.ShowTransient();
     }
 
     private OverlayWindow EnsureOverlayWindow()
@@ -2323,7 +2339,7 @@ public partial class MainWindow : Window
             if (!_exitRequested)
             {
                 args.Cancel = true;
-                _overlayWindow.Hide();
+                _overlayWindow.Dismiss();
             }
         };
         return _overlayWindow;

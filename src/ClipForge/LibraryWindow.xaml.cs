@@ -147,7 +147,6 @@ public partial class LibraryWindow : Window
 
         if (_isReplayRunning == isRunning)
         {
-            UpdateTrimAvailability();
             return;
         }
 

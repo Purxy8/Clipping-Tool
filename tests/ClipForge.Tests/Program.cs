@@ -38,6 +38,7 @@ internal static class Program
             ("WGC low-overhead capture path", TestWgcLowOverheadCapturePathAsync),
             ("FFmpeg progress parser", TestCaptureProgressParserAsync),
             ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
+            ("Capture recovery request gate", TestCaptureRecoveryRequestGateAsync),
             ("Capture geometry matrix", TestCaptureGeometryMatrixAsync),
             ("Capture process job lifetime", TestCaptureProcessJobLifetimeAsync),
             ("FFmpeg encoder strategies", TestEncoderStrategiesAsync),
@@ -612,6 +613,43 @@ internal static class Program
 
     private static Task TestUiFeedbackHelpersAsync()
     {
+        Assert.Equal(
+            TimeSpan.FromSeconds(10),
+            OverlayPresentationPolicy.AutoHideDelay,
+            "The topmost overlay should have a short, bounded presentation lifetime.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(15),
+            OverlayPresentationPolicy.HardMaximumVisibleDuration,
+            "The topmost overlay must have an absolute lifetime even if mouse capture gets stuck.");
+        Assert.True(
+            OverlayPresentationPolicy.ShouldAutoHide(
+                isVisible: true,
+                hasMouseCapture: false,
+                visibleDuration: OverlayPresentationPolicy.AutoHideDelay),
+            "An idle visible overlay must dismiss itself so it cannot keep fullscreen composition active.");
+        Assert.True(
+            !OverlayPresentationPolicy.ShouldAutoHide(
+                isVisible: false,
+                hasMouseCapture: false,
+                visibleDuration: OverlayPresentationPolicy.HardMaximumVisibleDuration),
+            "A hidden overlay must not run recurring dismissal work.");
+        Assert.True(
+            !OverlayPresentationPolicy.ShouldAutoHide(
+                isVisible: true,
+                hasMouseCapture: true,
+                visibleDuration: TimeSpan.FromSeconds(12)),
+            "The overlay must not disappear in the middle of an active drag.");
+        Assert.True(
+            OverlayPresentationPolicy.ShouldAutoHide(
+                isVisible: true,
+                hasMouseCapture: true,
+                visibleDuration: OverlayPresentationPolicy.HardMaximumVisibleDuration),
+            "A stuck mouse capture must not leave the overlay topmost indefinitely.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(3),
+            OverlayPresentationPolicy.GetNextAutoHideDelay(TimeSpan.FromSeconds(12)),
+            "The retry timer must wake at the absolute overlay deadline.");
+
         Assert.Equal(
             0x00332211u,
             NativeWindowThemeService.ToColorRef(0x11, 0x22, 0x33),
@@ -1441,6 +1479,97 @@ internal static class Program
             DroppedFrames: 0,
             OutputTimeMicroseconds: checked(seconds * 1_000_000L),
             Timestamp: checked(seconds * (long)Stopwatch.Frequency));
+
+    private static Task TestCaptureRecoveryRequestGateAsync()
+    {
+        var gate = new CaptureRecoveryRequestGate();
+        Assert.True(
+            gate.TryBegin(
+                CaptureRecoveryReason.SourceStarvation,
+                out var healthRequestId,
+                out _),
+            "The first health recovery should acquire the request gate.");
+        Assert.True(gate.IsPending, "The acquired recovery request was not marked pending.");
+        Assert.True(
+            !gate.TryBegin(
+                CaptureRecoveryReason.ScheduledRefresh,
+                out _,
+                out var pendingReason),
+            "A second request must not overlap the pending health recovery.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceStarvation,
+            pendingReason,
+            "A rejected scheduled request must know that it should be coalesced behind a health request.");
+
+        Assert.True(
+            gate.SuppressFaults(healthRequestId),
+            "The active health request should accept fault suppression.");
+        Assert.True(
+            gate.IsPending,
+            "Fault suppression must keep ownership until the UI queue clears in its finally block.");
+        Assert.True(
+            gate.Complete(healthRequestId, out var scheduledRefreshQueued),
+            "The suppressed health request should complete after the UI queue clears.");
+        Assert.True(
+            scheduledRefreshQueued,
+            "A display/scheduled refresh queued behind the health request was lost.");
+        Assert.True(
+            !gate.IsPending,
+            "Rejecting an over-budget health recovery must release its pending request.");
+        Assert.True(
+            !gate.TryBegin(CaptureRecoveryReason.CaptureHang, out _, out _),
+            "Further health faults must stay suppressed for the bounded session.");
+        Assert.True(
+            gate.TryBegin(
+                CaptureRecoveryReason.ScheduledRefresh,
+                out var scheduledRequestId,
+                out _),
+            "Fault suppression must never disable routine long-session WGC renewal.");
+
+        Assert.True(
+            !gate.Complete(healthRequestId, out _),
+            "A stale request unexpectedly completed the scheduled renewal.");
+        Assert.True(
+            gate.IsPending,
+            "A stale completion from an older request released the scheduled renewal.");
+        Assert.True(
+            gate.Complete(scheduledRequestId, out var duplicateScheduledRefresh) &&
+            !duplicateScheduledRefresh,
+            "Completing the coalesced scheduled request queued an unnecessary duplicate.");
+        gate.ResetForSession();
+        Assert.True(
+            gate.TryBegin(CaptureRecoveryReason.CaptureHang, out var resetRequestId, out _),
+            "A manual replay session must reset the bounded fault suppression.");
+        Assert.True(
+            gate.Complete(resetRequestId, out _),
+            "The reset health request did not complete.");
+
+        for (var attempt = 0; attempt < 1_000; attempt++)
+        {
+            gate.ResetForSession();
+            Assert.True(
+                gate.TryBegin(
+                    CaptureRecoveryReason.SourceStarvation,
+                    out var racedRequestId,
+                    out _),
+                "The race test could not acquire its initial health request.");
+            var overlappingFaultAccepted = false;
+            Parallel.Invoke(
+                () => gate.SuppressFaults(racedRequestId),
+                () => overlappingFaultAccepted = gate.TryBegin(
+                    CaptureRecoveryReason.CaptureHang,
+                    out _,
+                    out _));
+            Assert.True(
+                !overlappingFaultAccepted,
+                "Fault suppression raced with and admitted a new health request.");
+            Assert.True(
+                gate.Complete(racedRequestId, out _),
+                "The race test failed to release its suppressed request.");
+        }
+
+        return Task.CompletedTask;
+    }
 
     private static Task TestCaptureGeometryMatrixAsync()
     {
@@ -4074,6 +4203,76 @@ internal static class Program
                     !Directory.Exists(abandonedSession),
                     "Abandoned screen/audio replay data must be purged when the service starts.");
             }
+
+            var legacyRoot = Path.Combine(testDirectory, "LegacyBuffer");
+            var staleLegacy = Path.Combine(
+                legacyRoot,
+                "session-20260712-stale-legacy");
+            var recentLegacy = Path.Combine(
+                legacyRoot,
+                "session-20260715-recent-legacy");
+            var otherWindowsSession = Path.Combine(legacyRoot, "WindowsSession-99");
+            Directory.CreateDirectory(staleLegacy);
+            Directory.CreateDirectory(recentLegacy);
+            Directory.CreateDirectory(otherWindowsSession);
+            await File.WriteAllBytesAsync(
+                    Path.Combine(staleLegacy, "segment-000000000.mkv"),
+                    [1, 2, 3])
+                .ConfigureAwait(false);
+            await File.WriteAllBytesAsync(
+                    Path.Combine(recentLegacy, "segment-000000000.mkv"),
+                    [1, 2, 3])
+                .ConfigureAwait(false);
+            var now = DateTime.UtcNow;
+            Directory.SetLastWriteTimeUtc(staleLegacy, now - TimeSpan.FromDays(2));
+
+            Assert.Equal(
+                0,
+                ReplayBufferService.CleanupLegacyStaleBufferRoot(
+                    legacyRoot,
+                    now,
+                    potentialOwnerRunning: true),
+                "Legacy cleanup must stop when another ClipForge/FFmpeg owner may be active.");
+            Assert.True(
+                Directory.Exists(staleLegacy),
+                "Active-owner protection removed a legacy replay directory.");
+
+            Assert.Equal(
+                1,
+                ReplayBufferService.CleanupLegacyStaleBufferRoot(
+                    legacyRoot,
+                    now,
+                    potentialOwnerRunning: false),
+                "One inactive, old-layout replay directory should be migrated away.");
+            Assert.True(
+                !Directory.Exists(staleLegacy),
+                "Old pre-session-scoping replay data was not removed.");
+            Assert.True(
+                Directory.Exists(recentLegacy),
+                "Recently active legacy replay data must remain untouched.");
+            Assert.True(
+                Directory.Exists(otherWindowsSession),
+                "Legacy migration must never delete another WindowsSession root.");
+
+            var unexpectedLegacy = Path.Combine(
+                legacyRoot,
+                "session-20260712-unexpected-content");
+            Directory.CreateDirectory(unexpectedLegacy);
+            await File.WriteAllTextAsync(
+                    Path.Combine(unexpectedLegacy, "keep-me.txt"),
+                    "not a replay segment")
+                .ConfigureAwait(false);
+            Directory.SetLastWriteTimeUtc(unexpectedLegacy, now - TimeSpan.FromDays(2));
+            Assert.Equal(
+                0,
+                ReplayBufferService.CleanupLegacyStaleBufferRoot(
+                    legacyRoot,
+                    now,
+                    potentialOwnerRunning: false),
+                "Unexpected legacy-folder content must fail closed.");
+            Assert.True(
+                File.Exists(Path.Combine(unexpectedLegacy, "keep-me.txt")),
+                "Fail-closed legacy cleanup removed an unexpected file.");
         }
         finally
         {

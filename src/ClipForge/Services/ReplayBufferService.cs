@@ -14,12 +14,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
 {
     private const int MaximumDiagnosticLines = 60;
     private const int MaximumDiagnosticLineCharacters = 1000;
+    private const int MaximumLegacyCleanupDirectories = 2;
+    private const int MaximumLegacyDirectoryCandidates = 64;
+    private const int MaximumLegacyCleanupFilesPerDirectory = 10_000;
     private static readonly TimeSpan CaptureHealthPollInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan BufferRefreshInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CaptureBoundaryWaitTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan CaptureRefreshGracefulStopTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CaptureCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan CaptureRecoveryRetryDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan LegacyBufferMinimumInactivity = TimeSpan.FromHours(24);
     // Windows Graphics Capture frame pools can lose delivery cadence after a
     // long, uninterrupted desktop session while FFmpeg itself remains alive.
     // Renew only the capture process at a bounded age; the disk ring survives.
@@ -37,6 +41,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly Queue<string> _diagnosticLines = new();
     private readonly List<WasapiAudioPipe> _audioPipes = [];
     private readonly List<BufferedSegment> _segments = [];
+    private readonly CaptureRecoveryRequestGate _captureRecoveryRequestGate = new();
+    private readonly Task _legacyBufferCleanupTask;
 
     private Process? _captureProcess;
     private CaptureProcessJob? _captureProcessJob;
@@ -44,6 +50,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private Task? _monitorTask;
     private Task? _diagnosticTask;
     private Task? _captureProgressTask;
+    private string? _lastCaptureCleanupFailure;
     private string? _segmentDirectory;
     private TimeSpan _retention = TimeSpan.FromMinutes(2);
     private ReplayStateSnapshot _state = new(
@@ -65,7 +72,6 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _isRunning;
     private int _isSaving;
     private int _isStopping;
-    private int _recoveryRequested;
     private long _recoveryRetryNotBefore;
     private int _recoveryRetryGeneration;
     private int _disposed;
@@ -80,6 +86,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // MainWindow creates this service only after primary single-instance
         // ownership is established, so pre-existing sessions are crash residue.
         CleanupStaleBuffers();
+        if (IsDefaultBufferRoot(_bufferRoot) && !HasPossibleLegacyBufferOwner())
+        {
+            // Snapshot ownership before automatic replay can start. Old builds
+            // could leave thousands of two-second files directly below Buffer,
+            // so perform the bounded work off the WPF thread and make StartAsync
+            // wait for it rather than overlapping disk/AV maintenance with capture.
+            _legacyBufferCleanupTask = Task.Run(() =>
+                CleanupLegacyStaleBuffers(potentialOwnerRunning: false));
+        }
+        else
+        {
+            _legacyBufferCleanupTask = Task.CompletedTask;
+        }
     }
 
     internal ReplayBufferService(
@@ -157,6 +176,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ThrowIfDisposed();
+        try
+        {
+            await _legacyBufferCleanupTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            // Cleanup is maintenance, not a condition for safe capture. Expected
+            // filesystem failures are already contained inside the worker; an
+            // unexpected fault is retained as a diagnostic and replay continues.
+            EnqueueDiagnostic(
+                $"Legacy replay maintenance did not complete: {exception.GetBaseException().Message}");
+        }
+
         await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         try
@@ -217,7 +253,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 Volatile.Write(ref _latestCaptureProgress, null);
                 _captureStarvationWatchdog = new CaptureStarvationWatchdog(
                     configuration.FramesPerSecond);
-                Volatile.Write(ref _recoveryRequested, 0);
+                _captureRecoveryRequestGate.ResetForSession();
                 Volatile.Write(ref _recoveryRetryNotBefore, 0);
                 _ = Interlocked.Increment(ref _recoveryRetryGeneration);
                 lock (_diagnosticGate)
@@ -553,8 +589,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         .ConfigureAwait(false);
                     if (!oldProcessExited)
                     {
+                        var cleanupDetail = Volatile.Read(ref _lastCaptureCleanupFailure);
                         throw new InvalidOperationException(
-                            "The previous capture resources did not finish bounded cleanup. ClipForge refused to start an overlapping recorder.");
+                            "The previous capture resources did not finish bounded cleanup. " +
+                            "ClipForge refused to start an overlapping recorder." +
+                            (string.IsNullOrWhiteSpace(cleanupDetail)
+                                ? string.Empty
+                                : $" {cleanupDetail}"));
                     }
 
                     int segmentStartNumber;
@@ -634,7 +675,6 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         throw new InvalidOperationException(BuildCaptureFailureMessage());
                     }
 
-                    Volatile.Write(ref _recoveryRequested, 0);
                     Volatile.Write(ref _recoveryRetryNotBefore, 0);
                     _ = Interlocked.Increment(ref _recoveryRetryGeneration);
                     Volatile.Write(ref _isStopping, 0);
@@ -711,6 +751,54 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         RefreshBufferState();
+    }
+
+    /// <summary>
+    /// Acknowledges that MainWindow deliberately rejected a bounded health
+    /// recovery for the current process. Further fault notifications remain
+    /// suppressed for this manual replay session, but routine WGC rotation must
+    /// stay eligible so an old frame pool cannot run indefinitely.
+    /// </summary>
+    internal bool SuppressCaptureFaultRecovery(CaptureRecoveryRequestedEventArgs request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (!IsRunning ||
+            request.ProcessId is null ||
+            CaptureProcessId != request.ProcessId)
+        {
+            return false;
+        }
+
+        if (!_captureRecoveryRequestGate.SuppressFaults(request.RequestId))
+        {
+            return false;
+        }
+
+        EnqueueDiagnostic(
+            "Automatic fault recovery reached its per-session limit; fault notifications are suppressed while scheduled WGC renewal remains enabled.");
+        return true;
+    }
+
+    internal void CompleteCaptureRecoveryRequest(CaptureRecoveryRequestedEventArgs request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (_captureRecoveryRequestGate.Complete(
+                request.RequestId,
+                out var scheduledRefreshQueued))
+        {
+            DispatchPendingScheduledRefresh(scheduledRefreshQueued);
+        }
+    }
+
+    internal void RequestScheduledCaptureRefresh(string diagnostic)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(diagnostic);
+        if (IsRunning &&
+            _activeCaptureStrategy?.CaptureBackend ==
+                DesktopCaptureBackend.WindowsGraphicsCapture)
+        {
+            RequestCaptureRecovery(CaptureRecoveryReason.ScheduledRefresh, diagnostic);
+        }
     }
 
     public async Task<string> SaveClipAsync(
@@ -881,6 +969,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         bool terminateAtCompletedBoundary = false,
         TimeSpan? gracefulStopTimeout = null)
     {
+        Volatile.Write(ref _lastCaptureCleanupFailure, null);
         var process = _captureProcess;
         var processJob = _captureProcessJob;
         var processExited = process is null;
@@ -891,19 +980,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 if (terminateAtCompletedBoundary)
                 {
                     // The previous file is finalized once the next segment is
-                    // observed. End the old WGC process immediately and discard
-                    // only that newly opened tail, avoiding an extra graceful-q
-                    // delay in the real capture handoff.
-                    TryKill(process);
-                    using var exitTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
-                    try
-                    {
-                        await process.WaitForExitAsync(exitTimeout.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // CaptureProcessJob disposal below is the final bound.
-                    }
+                    // observed. Give FFmpeg a short, bounded opportunity to run
+                    // gfxcapture's orderly WGC teardown (remove frame handlers,
+                    // close the capture session/frame pool, and release D3D/COM
+                    // resources). Local WGC/NVENC probes complete this path in
+                    // roughly 0.2 seconds. StopProcessGracefullyAsync still kills
+                    // the process after the bound, and CaptureProcessJob disposal
+                    // remains the final containment guarantee.
+                    await StopProcessGracefullyAsync(
+                            process,
+                            CaptureRefreshGracefulStopTimeout)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
@@ -956,8 +1043,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
             catch (Exception exception) when (
                 exception is InvalidOperationException or ObjectDisposedException or TimeoutException)
             {
-                EnqueueDiagnostic(
-                    "The previous capture process did not confirm exit after job containment closed.");
+                const string diagnostic =
+                    "The previous capture process did not confirm exit after job containment closed.";
+                Volatile.Write(ref _lastCaptureCleanupFailure, diagnostic);
+                EnqueueDiagnostic(diagnostic);
             }
         }
 
@@ -991,8 +1080,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
             catch (Exception exception)
             {
                 cleanupCompleted = false;
-                EnqueueDiagnostic(
-                    $"An audio input reported a cleanup error during renewal: {exception.GetBaseException().Message}");
+                var diagnostic =
+                    $"An audio input reported a cleanup error during renewal: {exception.GetBaseException().Message}";
+                Volatile.Write(ref _lastCaptureCleanupFailure, diagnostic);
+                EnqueueDiagnostic(diagnostic);
             }
         }
 
@@ -1067,8 +1158,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            EnqueueDiagnostic(
-                $"The previous capture {componentName} did not finish within the bounded cleanup window.");
+            var diagnostic =
+                $"The previous capture {componentName} did not finish within the bounded cleanup window.";
+            Volatile.Write(ref _lastCaptureCleanupFailure, diagnostic);
+            EnqueueDiagnostic(diagnostic);
             _ = task.ContinueWith(
                 completed => _ = completed.Exception,
                 CancellationToken.None,
@@ -1270,7 +1363,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 if (failedPumpTask is not null &&
                     Volatile.Read(ref _isStopping) == 0 &&
-                    Volatile.Read(ref _recoveryRequested) == 0)
+                    !_captureRecoveryRequestGate.IsPending)
                 {
                     var detail = failedPumpTask.Exception?.GetBaseException().Message ??
                         "The stream reader reached EOF unexpectedly.";
@@ -1692,8 +1785,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         var retryNotBefore = Volatile.Read(ref _recoveryRetryNotBefore);
         if (Volatile.Read(ref _isStopping) != 0 ||
-            (retryNotBefore > 0 && Stopwatch.GetTimestamp() < retryNotBefore) ||
-            Interlocked.Exchange(ref _recoveryRequested, 1) != 0)
+            retryNotBefore > 0 && Stopwatch.GetTimestamp() < retryNotBefore)
+        {
+            return;
+        }
+
+        if (!_captureRecoveryRequestGate.TryBegin(
+                reason,
+                out var requestId,
+                out _))
         {
             return;
         }
@@ -1702,13 +1802,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var handlers = CaptureRecoveryRequested;
         if (handlers is null)
         {
+            if (_captureRecoveryRequestGate.Complete(
+                    requestId,
+                    out var scheduledRefreshQueued))
+            {
+                DispatchPendingScheduledRefresh(scheduledRefreshQueued);
+            }
+
             return;
         }
 
         var args = new CaptureRecoveryRequestedEventArgs(
             reason,
             diagnostic,
-            CaptureProcessId);
+            CaptureProcessId,
+            requestId);
         foreach (EventHandler<CaptureRecoveryRequestedEventArgs> handler in handlers.GetInvocationList())
         {
             try
@@ -1718,8 +1826,26 @@ public sealed class ReplayBufferService : IAsyncDisposable
             catch
             {
                 // Recovery subscribers cannot be allowed to stop health monitoring.
+                if (_captureRecoveryRequestGate.Complete(
+                        requestId,
+                        out var scheduledRefreshQueued))
+                {
+                    DispatchPendingScheduledRefresh(scheduledRefreshQueued);
+                }
             }
         }
+    }
+
+    private void DispatchPendingScheduledRefresh(bool scheduledRefreshQueued)
+    {
+        if (!scheduledRefreshQueued)
+        {
+            return;
+        }
+
+        RequestCaptureRecovery(
+            CaptureRecoveryReason.ScheduledRefresh,
+            "Running one coalesced WGC refresh that arrived while another recovery request was active.");
     }
 
     private void DeferCaptureRecoveryRetry(int expectedProcessId)
@@ -1729,7 +1855,6 @@ public sealed class ReplayBufferService : IAsyncDisposable
         Volatile.Write(
             ref _recoveryRetryNotBefore,
             checked(Stopwatch.GetTimestamp() + delayTicks));
-        Volatile.Write(ref _recoveryRequested, 0);
         var generation = Interlocked.Increment(ref _recoveryRetryGeneration);
         var cancellationToken = _sessionCancellation?.Token ?? CancellationToken.None;
         _ = RetryCaptureRecoveryAfterDelayAsync(
@@ -2002,6 +2127,239 @@ public sealed class ReplayBufferService : IAsyncDisposable
         {
             // Stale cleanup must never prevent a new capture session.
         }
+    }
+
+    private void CleanupLegacyStaleBuffers(bool potentialOwnerRunning)
+    {
+        string expectedRoot;
+        try
+        {
+            expectedRoot = Path.GetFullPath(GetDefaultBufferRoot());
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return;
+        }
+
+        // Custom/test roots and every WindowsSession-* sibling are outside this
+        // one-time migration. Old ClipForge builds wrote session-* directly
+        // below Buffer; current builds never do.
+        if (!Path.GetFullPath(_bufferRoot).Equals(
+                expectedRoot,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var legacyRoot = Path.GetDirectoryName(expectedRoot);
+        if (string.IsNullOrWhiteSpace(legacyRoot) || potentialOwnerRunning)
+        {
+            return;
+        }
+
+        _ = CleanupLegacyStaleBufferRoot(
+            legacyRoot,
+            DateTime.UtcNow,
+            potentialOwnerRunning: false);
+    }
+
+    private static bool IsDefaultBufferRoot(string bufferRoot)
+    {
+        try
+        {
+            return Path.GetFullPath(bufferRoot).Equals(
+                Path.GetFullPath(GetDefaultBufferRoot()),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes only the obsolete pre-WindowsSession layout. Cleanup is
+    /// deliberately conservative and bounded: active-process evidence,
+    /// recently-written folders, nested content, reparse points, unexpected
+    /// filenames, and oversized trees all leave the candidate untouched.
+    /// </summary>
+    internal static int CleanupLegacyStaleBufferRoot(
+        string legacyRoot,
+        DateTime utcNow,
+        bool potentialOwnerRunning)
+    {
+        if (potentialOwnerRunning || !IsSafeBufferRootPath(legacyRoot))
+        {
+            return 0;
+        }
+
+        try
+        {
+            var candidates = Directory
+                .EnumerateDirectories(legacyRoot, "session-*", SearchOption.TopDirectoryOnly)
+                .Take(MaximumLegacyDirectoryCandidates)
+                .Select(path => new DirectoryInfo(path))
+                .Where(directory =>
+                    directory.Exists &&
+                    IsSafeBufferDirectoryPath(
+                        legacyRoot,
+                        directory.FullName,
+                        directory.Attributes) &&
+                    utcNow.ToUniversalTime() - directory.LastWriteTimeUtc >=
+                    LegacyBufferMinimumInactivity)
+                .OrderBy(directory => directory.LastWriteTimeUtc)
+                .Take(MaximumLegacyCleanupDirectories)
+                .ToArray();
+
+            var removed = 0;
+            foreach (var candidate in candidates)
+            {
+                if (TryDeleteValidatedLegacyBufferDirectory(legacyRoot, candidate))
+                {
+                    removed++;
+                }
+            }
+
+            return removed;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return 0;
+        }
+    }
+
+    private static bool TryDeleteValidatedLegacyBufferDirectory(
+        string legacyRoot,
+        DirectoryInfo candidate)
+    {
+        try
+        {
+            candidate.Refresh();
+            if (!candidate.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    legacyRoot,
+                    candidate.FullName,
+                    candidate.Attributes))
+            {
+                return false;
+            }
+
+            var entries = Directory
+                .EnumerateFileSystemEntries(
+                    candidate.FullName,
+                    "*",
+                    SearchOption.TopDirectoryOnly)
+                .Take(MaximumLegacyCleanupFilesPerDirectory + 1)
+                .ToArray();
+            if (entries.Length > MaximumLegacyCleanupFilesPerDirectory)
+            {
+                return false;
+            }
+
+            var normalizedCandidate = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(candidate.FullName));
+            foreach (var entry in entries)
+            {
+                var normalizedEntry = Path.GetFullPath(entry);
+                var attributes = File.GetAttributes(normalizedEntry);
+                var name = Path.GetFileName(normalizedEntry);
+                if (!normalizedCandidate.Equals(
+                        Path.GetDirectoryName(normalizedEntry),
+                        StringComparison.OrdinalIgnoreCase) ||
+                    (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    !IsLegacyBufferFileName(name))
+                {
+                    return false;
+                }
+            }
+
+            foreach (var entry in entries)
+            {
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+
+                File.Delete(entry);
+            }
+
+            candidate.Refresh();
+            if (!candidate.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    legacyRoot,
+                    candidate.FullName,
+                    candidate.Attributes))
+            {
+                return false;
+            }
+
+            Directory.Delete(candidate.FullName, recursive: false);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsLegacyBufferFileName(string name) =>
+        name.StartsWith("segment-", StringComparison.OrdinalIgnoreCase) &&
+        name.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase) ||
+        name.StartsWith("export-", StringComparison.OrdinalIgnoreCase) &&
+        name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasPossibleLegacyBufferOwner()
+    {
+        using var current = Process.GetCurrentProcess();
+        foreach (var processName in new[] { "ClipForge", "ffmpeg" })
+        {
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcessesByName(processName);
+            }
+            catch (Exception exception) when (
+                exception is InvalidOperationException or System.ComponentModel.Win32Exception or
+                    NotSupportedException)
+            {
+                // Fail closed: if process ownership cannot be established, leave
+                // legacy buffers untouched for a later startup.
+                return true;
+            }
+
+            foreach (var process in processes)
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (process.Id != current.Id)
+                        {
+                            return true;
+                        }
+                    }
+                    catch (Exception exception) when (
+                        exception is InvalidOperationException or System.ComponentModel.Win32Exception or
+                            NotSupportedException)
+                    {
+                        // Fail closed. A racing or inaccessible process may still
+                        // own a buffer written by an older ClipForge build.
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
     private void TryDeleteBufferDirectory(string? path)

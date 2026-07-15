@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using ClipForge.Models;
 using ClipForge.Services;
 using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
@@ -19,23 +21,73 @@ public partial class OverlayWindow : Window
     private const int DwmwaWindowCornerPreference = 33;
     private const int DwmwcpRound = 2;
 
+    private readonly DispatcherTimer _autoHideTimer;
     private HwndSource? _windowSource;
+    private OverlayViewState? _lastRenderedState;
+    private long _visibleSinceTimestamp;
 
     public OverlayWindow()
     {
         InitializeComponent();
+        _autoHideTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = OverlayPresentationPolicy.AutoHideDelay
+        };
+        _autoHideTimer.Tick += AutoHideTimer_Tick;
         SourceInitialized += OverlayWindow_SourceInitialized;
+        IsVisibleChanged += OverlayWindow_IsVisibleChanged;
+        PreviewMouseDown += OverlayWindow_PreviewMouseDown;
     }
 
     public event EventHandler? SaveRequested;
 
     public event EventHandler? ShowAppRequested;
 
+    /// <summary>
+    /// Shows the existing overlay instance for one bounded interaction window.
+    /// It deliberately does not activate, close, or recreate the HWND.
+    /// </summary>
+    public void ShowTransient()
+    {
+        if (!IsVisible)
+        {
+            Topmost = true;
+            Show();
+        }
+
+        RestartAutoHideCountdown();
+    }
+
+    public void Dismiss()
+    {
+        _autoHideTimer.Stop();
+        if (IsVisible)
+        {
+            Hide();
+        }
+
+        Topmost = false;
+    }
+
     public void UpdateState(ReplayStateSnapshot snapshot, bool isRunning, string saveHotkeyText)
     {
         var canSave = isRunning &&
                       snapshot.State is not ReplayState.Starting and not ReplayState.Stopping and not ReplayState.Saving &&
                       snapshot.AvailableDuration >= TimeSpan.FromSeconds(1);
+
+        var viewState = new OverlayViewState(
+            snapshot.State,
+            isRunning,
+            canSave,
+            snapshot.AvailableDuration,
+            snapshot.Retention,
+            saveHotkeyText);
+        if (_lastRenderedState == viewState)
+        {
+            return;
+        }
+
+        _lastRenderedState = viewState;
 
         OverlayStatusText.Text = snapshot.State switch
         {
@@ -68,6 +120,71 @@ public partial class OverlayWindow : Window
         Left = Math.Max(workArea.Left + 16, workArea.Right - ActualWidth - 22);
         Top = workArea.Top + 22;
         UiMotionService.RevealStartup(OverlayRoot);
+    }
+
+    private void OverlayWindow_IsVisibleChanged(
+        object sender,
+        DependencyPropertyChangedEventArgs e)
+    {
+        if (e.NewValue is true)
+        {
+            _visibleSinceTimestamp = Stopwatch.GetTimestamp();
+            Topmost = true;
+            RestartAutoHideCountdown();
+            return;
+        }
+
+        _autoHideTimer.Stop();
+        Topmost = false;
+        _visibleSinceTimestamp = 0;
+        _lastRenderedState = null;
+        if (IsMouseCaptureWithin)
+        {
+            Mouse.Capture(null);
+        }
+    }
+
+    private void OverlayWindow_PreviewMouseDown(object sender, MouseButtonEventArgs e) =>
+        RestartAutoHideCountdown();
+
+    private void AutoHideTimer_Tick(object? sender, EventArgs e)
+    {
+        _autoHideTimer.Stop();
+        var visibleDuration = _visibleSinceTimestamp == 0
+            ? TimeSpan.Zero
+            : Stopwatch.GetElapsedTime(_visibleSinceTimestamp);
+        if (OverlayPresentationPolicy.ShouldAutoHide(
+                IsVisible,
+                IsMouseCaptureWithin,
+                visibleDuration))
+        {
+            if (IsMouseCaptureWithin)
+            {
+                Mouse.Capture(null);
+            }
+
+            Dismiss();
+            return;
+        }
+
+        if (IsVisible)
+        {
+            RestartAutoHideCountdown();
+        }
+    }
+
+    private void RestartAutoHideCountdown()
+    {
+        _autoHideTimer.Stop();
+        if (IsVisible)
+        {
+            var visibleDuration = _visibleSinceTimestamp == 0
+                ? TimeSpan.Zero
+                : Stopwatch.GetElapsedTime(_visibleSinceTimestamp);
+            _autoHideTimer.Interval = OverlayPresentationPolicy.GetNextAutoHideDelay(
+                visibleDuration);
+            _autoHideTimer.Start();
+        }
     }
 
     private void OverlayWindow_SourceInitialized(object? sender, EventArgs e)
@@ -136,6 +253,10 @@ public partial class OverlayWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _autoHideTimer.Stop();
+        _autoHideTimer.Tick -= AutoHideTimer_Tick;
+        IsVisibleChanged -= OverlayWindow_IsVisibleChanged;
+        PreviewMouseDown -= OverlayWindow_PreviewMouseDown;
         if (_windowSource is not null)
         {
             try
@@ -154,13 +275,19 @@ public partial class OverlayWindow : Window
         base.OnClosed(e);
     }
 
-    private void SaveButton_Click(object sender, RoutedEventArgs e) =>
+    private void SaveButton_Click(object sender, RoutedEventArgs e)
+    {
+        Dismiss();
         SaveRequested?.Invoke(this, EventArgs.Empty);
+    }
 
-    private void OpenAppButton_Click(object sender, RoutedEventArgs e) =>
+    private void OpenAppButton_Click(object sender, RoutedEventArgs e)
+    {
+        Dismiss();
         ShowAppRequested?.Invoke(this, EventArgs.Empty);
+    }
 
-    private void HideButton_Click(object sender, RoutedEventArgs e) => Hide();
+    private void HideButton_Click(object sender, RoutedEventArgs e) => Dismiss();
 
     private static bool HasButtonAncestor(DependencyObject source)
     {
@@ -218,4 +345,12 @@ public partial class OverlayWindow : Window
         int attribute,
         ref int attributeValue,
         int attributeSize);
+
+    private sealed record OverlayViewState(
+        ReplayState State,
+        bool IsRunning,
+        bool CanSave,
+        TimeSpan AvailableDuration,
+        TimeSpan Retention,
+        string SaveHotkeyText);
 }
