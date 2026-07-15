@@ -155,7 +155,11 @@ try
         display,
         resolution,
         framesPerSecond,
-        TimeSpan.FromSeconds(verifyPruning ? 6 : 30),
+        verifyPruning
+            ? TimeSpan.FromSeconds(6)
+            : verifyRenewal
+                ? TimeSpan.FromMinutes(5)
+                : TimeSpan.FromSeconds(30),
         includeSystemAudio,
         includeSystemAudio ? outputs.FirstOrDefault(device => device.IsDefault) ?? outputs[0] : null,
         includeMicrophone,
@@ -336,9 +340,19 @@ try
                         $"Replay stopped after WGC process renewal {renewalIndex}.");
                 }
 
+                if (IsFfmpegProcessAlive(previousProcessId))
+                {
+                    throw new InvalidDataException(
+                        $"The retired FFmpeg process {previousProcessId} remained alive after WGC renewal {renewalIndex}.");
+                }
+
                 var successorSegmentId = rollover.Segments
                     .Where(segment => segment.Id > replacementFirstSegmentId)
                     .Min(segment => segment.Id);
+                using var hostMetrics = Process.GetCurrentProcess();
+                hostMetrics.Refresh();
+                using var replacementMetrics = Process.GetProcessById(replacementProcessId);
+                replacementMetrics.Refresh();
                 var report = new RenewalSmokeReport(
                     renewalIndex,
                     previousProcessId,
@@ -355,7 +369,11 @@ try
                     completedReplacement.Length,
                     completedReplacement.LastWriteTimeUtc,
                     successorSegmentId,
-                    rollover.ObservedUtc);
+                    rollover.ObservedUtc,
+                    hostMetrics.HandleCount,
+                    hostMetrics.PrivateMemorySize64,
+                    replacementMetrics.HandleCount,
+                    replacementMetrics.WorkingSet64);
                 renewalReports.Add(report);
                 await WriteRenewalReportAsync(
                     renewalReportPath,
@@ -369,7 +387,8 @@ try
                     $"{refreshRequestedUtc:O} .. {refreshCompletedUtc:O} " +
                     $"({refreshTimer.Elapsed.TotalMilliseconds:0.0} ms); retained " +
                     $"{retainedBeforeRenewal.Length} completed segment(s); replacement segment " +
-                    $"{replacementFirstSegmentId} completed before segment {successorSegmentId} appeared.");
+                    $"{replacementFirstSegmentId} completed before segment {successorSegmentId} appeared; " +
+                    $"host handles {hostMetrics.HandleCount}, FFmpeg handles {replacementMetrics.HandleCount}.");
             }
 
             if (renewalReports.Select(report => report.ReplacementProcessId).Distinct().Count() != renewalCount)
@@ -377,6 +396,39 @@ try
                 throw new InvalidDataException(
                     "Consecutive WGC renewals reused a replacement FFmpeg process id.");
             }
+
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            await Task.Delay(TimeSpan.FromMilliseconds(500), timeout.Token);
+            using var settledHost = Process.GetCurrentProcess();
+            settledHost.Refresh();
+            var settledHostResources = new HostResourceSample(
+                settledHost.HandleCount,
+                settledHost.PrivateMemorySize64);
+            var firstHostResources = renewalReports[0];
+            if (settledHostResources.HandleCount > firstHostResources.HostHandleCount + 64)
+            {
+                throw new InvalidDataException(
+                    "Host handle usage remained materially elevated after renewal finalization.");
+            }
+
+            if (settledHostResources.PrivateMemoryBytes >
+                firstHostResources.HostPrivateMemoryBytes + (96L * 1024 * 1024))
+            {
+                throw new InvalidDataException(
+                    "Host private memory remained materially elevated after renewal finalization.");
+            }
+
+            await WriteRenewalReportAsync(
+                renewalReportPath,
+                runLabel,
+                renewalReports,
+                timeout.Token,
+                settledHostResources);
+            Console.WriteLine(
+                $"Settled host after forced finalization: {settledHostResources.HandleCount} handles, " +
+                $"{settledHostResources.PrivateMemoryBytes / 1024d / 1024d:0.0} MB private memory.");
         }
 
         if (verifyPruning)
@@ -567,11 +619,11 @@ static int ParseRenewalCount(string? value)
     }
 
     if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var count) ||
-        count is < 1 or > 5)
+        count is < 1 or > 12)
     {
         throw new ArgumentOutOfRangeException(
             nameof(value),
-            "--renew-count must be an integer between 1 and 5.");
+            "--renew-count must be an integer between 1 and 12.");
     }
 
     return count;
@@ -656,20 +708,40 @@ static Task WriteRenewalReportAsync(
     string reportPath,
     string runLabel,
     IReadOnlyList<RenewalSmokeReport> renewals,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken,
+    HostResourceSample? settledHostResources = null)
 {
     var artifact = new RenewalSmokeArtifact(
-        SchemaVersion: 1,
+        SchemaVersion: 3,
         GeneratedUtc: DateTimeOffset.UtcNow,
         RunLabel: runLabel,
         RenewalCount: renewals.Count,
-        Renewals: renewals.ToArray());
+        Renewals: renewals.ToArray(),
+        SettledHostResources: settledHostResources);
     return File.WriteAllTextAsync(
         reportPath,
         JsonSerializer.Serialize(
             artifact,
             new JsonSerializerOptions { WriteIndented = true }),
         cancellationToken);
+}
+
+static bool IsFfmpegProcessAlive(int processId)
+{
+    try
+    {
+        using var process = Process.GetProcessById(processId);
+        return !process.HasExited &&
+               process.ProcessName.Equals("ffmpeg", StringComparison.OrdinalIgnoreCase);
+    }
+    catch (ArgumentException)
+    {
+        return false;
+    }
+    catch (InvalidOperationException)
+    {
+        return false;
+    }
 }
 
 static async Task RunResolutionMatrixAsync(
@@ -2071,14 +2143,23 @@ internal sealed record RenewalSmokeReport(
     long ReplacementCompletedSegmentBytes,
     DateTimeOffset ReplacementCompletedSegmentLastWriteTimeUtc,
     int SuccessorSegmentId,
-    DateTimeOffset SuccessorObservedUtc);
+    DateTimeOffset SuccessorObservedUtc,
+    int HostHandleCount,
+    long HostPrivateMemoryBytes,
+    int ReplacementHandleCount,
+    long ReplacementWorkingSetBytes);
 
 internal sealed record RenewalSmokeArtifact(
     int SchemaVersion,
     DateTimeOffset GeneratedUtc,
     string RunLabel,
     int RenewalCount,
-    IReadOnlyList<RenewalSmokeReport> Renewals);
+    IReadOnlyList<RenewalSmokeReport> Renewals,
+    HostResourceSample? SettledHostResources);
+
+internal sealed record HostResourceSample(
+    int HandleCount,
+    long PrivateMemoryBytes);
 
 internal sealed record MatrixSource(string Id, int Width, int Height);
 
