@@ -39,6 +39,9 @@ internal static class Program
             ("FFmpeg progress parser", TestCaptureProgressParserAsync),
             ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
             ("Capture recovery request gate", TestCaptureRecoveryRequestGateAsync),
+            ("Scheduled capture refresh coordinator", TestScheduledCaptureRefreshCoordinatorAsync),
+            ("Replay service concurrent disposal", TestReplayServiceConcurrentDisposalAsync),
+            ("Capture runtime journal", TestCaptureRuntimeJournalAsync),
             ("Capture geometry matrix", TestCaptureGeometryMatrixAsync),
             ("Capture process job lifetime", TestCaptureProcessJobLifetimeAsync),
             ("FFmpeg encoder strategies", TestEncoderStrategiesAsync),
@@ -751,6 +754,7 @@ internal static class Program
             60,
             TimeSpan.FromMinutes(2),
             true,
+            true,
             new AudioDeviceOption("output", "Speakers"),
             true,
             new AudioDeviceOption("microphone", "Microphone"),
@@ -769,6 +773,12 @@ internal static class Program
         Assert.ContainsSequence(arguments, "-offset_x", "-1920", "-offset_y", "40");
         Assert.ContainsSequence(arguments, "-video_size", "1920x1080", "-i", "desktop");
         Assert.ContainsSequence(arguments, "-thread_queue_size", "8", "-f", "gdigrab");
+        Assert.ContainsSequence(arguments, "-draw_mouse", "1");
+        var cursorlessGdiArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration with { CaptureCursor = false },
+            audioInputs,
+            @"C:\Buffer");
+        Assert.ContainsSequence(cursorlessGdiArguments, "-draw_mouse", "0");
         Assert.ContainsSequence(arguments, "-c:v", "libx264", "-preset", "ultrafast");
         Assert.ContainsSequence(arguments, "-g", "120", "-keyint_min", "120");
         Assert.ContainsSequence(arguments, "-f", "segment", "-segment_time", "2");
@@ -844,6 +854,7 @@ internal static class Program
             60,
             TimeSpan.FromMinutes(2),
             false,
+            false,
             null,
             false,
             null,
@@ -874,7 +885,60 @@ internal static class Program
         Assert.True(
             captureFilter.Contains(":max_framerate=60", StringComparison.Ordinal),
             "WGC should still request the configured maximum capture rate at the source.");
+        Assert.True(
+            captureFilter.Contains(":capture_cursor=0", StringComparison.Ordinal),
+            "Cursor-free WGC capture must disable WinRT cursor composition exactly.");
+        Assert.ContainsSequence(
+            arguments,
+            "-filter_threads", "1",
+            "-filter_complex_threads", "1",
+            "-thread_queue_size", "2",
+            "-f", "lavfi");
+        Assert.Equal(
+            1,
+            arguments.Count(argument => argument == "-filter_threads"),
+            "Direct WGC hardware capture must create one bounded simple-filter pool.");
+        Assert.Equal(
+            1,
+            arguments.Count(argument => argument == "-filter_complex_threads"),
+            "Direct WGC hardware capture must create one bounded complex-filter pool.");
         Assert.ContainsSequence(arguments, "-fps_mode", "cfr", "-r", "60");
+
+        var cursorArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration with { CaptureCursor = true },
+            [],
+            strategy,
+            @"C:\Buffer");
+        Assert.True(
+            (GetArgumentAfter(cursorArguments, "-i") ?? string.Empty)
+                .Contains(":capture_cursor=1", StringComparison.Ordinal),
+            "Cursor-enabled WGC capture must opt in to WinRT cursor composition exactly.");
+
+        var transferArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration,
+            [],
+            strategy with { RequiresSystemMemoryTransfer = true },
+            @"C:\Buffer");
+        Assert.ContainsSequence(
+            transferArguments,
+            "-thread_queue_size", "2",
+            "-f", "lavfi");
+        Assert.True(
+            !transferArguments.Contains("-filter_threads", StringComparer.Ordinal) &&
+            !transferArguments.Contains("-filter_complex_threads", StringComparer.Ordinal),
+            "Compatibility-transfer WGC must not inherit the direct hardware filter-pool policy.");
+
+        var hardwareGdiArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration,
+            [],
+            new VideoEncodingStrategy(
+                VideoEncoderKind.NvidiaNvenc,
+                DesktopCaptureBackend.Gdi),
+            @"C:\Buffer");
+        Assert.True(
+            !hardwareGdiArguments.Contains("-filter_threads", StringComparer.Ordinal) &&
+            !hardwareGdiArguments.Contains("-filter_complex_threads", StringComparer.Ordinal),
+            "Hardware-encoded GDI capture must not inherit the direct WGC filter-pool policy.");
 
         return Task.CompletedTask;
     }
@@ -1571,6 +1635,191 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static async Task TestScheduledCaptureRefreshCoordinatorAsync()
+    {
+        var entered = new TaskCompletionSource<int>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var processIds = new List<int>();
+        var concurrentWorkers = 0;
+        var maximumConcurrentWorkers = 0;
+
+        await using (var coordinator = new ScheduledCaptureRefreshCoordinator(
+            async (expectedProcessId, _, cancellationToken) =>
+            {
+                lock (processIds)
+                {
+                    processIds.Add(expectedProcessId);
+                }
+
+                var concurrent = Interlocked.Increment(ref concurrentWorkers);
+                maximumConcurrentWorkers = Math.Max(maximumConcurrentWorkers, concurrent);
+                entered.TrySetResult(expectedProcessId);
+                try
+                {
+                    await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref concurrentWorkers);
+                }
+            }))
+        {
+            Assert.True(
+                coordinator.TrySchedule(101, "aged WGC generation"),
+                "The first scheduled refresh did not acquire the background coordinator.");
+            Assert.Equal(
+                101,
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false),
+                "The background coordinator lost the expected capture PID.");
+            Assert.True(
+                coordinator.IsActive,
+                "The coordinator did not report its blocked background worker.");
+            Assert.True(
+                !coordinator.TrySchedule(102, "overlapping request"),
+                "The coordinator admitted an overlapping capture refresh.");
+
+            release.TrySetResult();
+            await coordinator.WaitForIdleAsync()
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            Assert.Equal(
+                1,
+                maximumConcurrentWorkers,
+                "Scheduled capture refreshes were not serialized.");
+
+            Assert.True(
+                coordinator.TrySchedule(202, "next WGC generation"),
+                "A completed background refresh did not release the coordinator gate.");
+            await coordinator.WaitForIdleAsync()
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            lock (processIds)
+            {
+                Assert.SequenceEqual(
+                    new[] { 101, 202 },
+                    processIds,
+                    "The coordinator did not preserve generation-specific PID ordering.");
+            }
+        }
+
+        var failureCount = 0;
+        await using (var faultingCoordinator = new ScheduledCaptureRefreshCoordinator(
+            (_, _, _) => Task.FromException(new InvalidOperationException("synthetic refresh failure")),
+            (_, _, _) => _ = Interlocked.Increment(ref failureCount)))
+        {
+            Assert.True(
+                faultingCoordinator.TrySchedule(303, "fault containment"),
+                "The fault-containment coordinator rejected its first request.");
+            await faultingCoordinator.WaitForIdleAsync()
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            Assert.Equal(1, failureCount, "A background refresh failure escaped its handler.");
+            Assert.True(
+                faultingCoordinator.TrySchedule(304, "post-fault retry"),
+                "A contained refresh failure permanently latched the coordinator gate.");
+            await faultingCoordinator.WaitForIdleAsync()
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+        }
+
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposalEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposableCoordinator = new ScheduledCaptureRefreshCoordinator(
+            async (_, _, cancellationToken) =>
+            {
+                disposalEntered.TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    cancellationObserved.TrySetResult();
+                }
+            });
+        Assert.True(
+            disposableCoordinator.TrySchedule(404, "disposal cancellation"),
+            "The disposal test could not queue its refresh.");
+        await disposalEntered.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        await disposableCoordinator.DisposeAsync().ConfigureAwait(false);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        Assert.True(
+            !disposableCoordinator.TrySchedule(405, "after disposal"),
+            "A disposed coordinator accepted another refresh.");
+    }
+
+    private static async Task TestCaptureRuntimeJournalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var journal = new CaptureRuntimeJournal(testDirectory);
+            journal.Record(
+                "capture_started",
+                backend: DesktopCaptureBackend.WindowsGraphicsCapture.ToString(),
+                width: 1920,
+                height: 1080,
+                framesPerSecond: 60,
+                captureCursor: false,
+                detail: "Deterministic lifecycle test.");
+            var journalPath = journal.JournalPath;
+            await journal.DisposeAsync().ConfigureAwait(false);
+
+            Assert.True(File.Exists(journalPath), "The local capture journal was not flushed on disposal.");
+            var content = await File.ReadAllTextAsync(journalPath).ConfigureAwait(false);
+            Assert.True(
+                content.Contains("\"event\":\"capture_started\"", StringComparison.Ordinal) &&
+                content.Contains("\"captureCursor\":false", StringComparison.Ordinal) &&
+                content.Contains("\"framesPerSecond\":60", StringComparison.Ordinal),
+                "The capture journal omitted required lifecycle metadata.");
+            Assert.True(
+                !content.Contains(Environment.UserName, StringComparison.OrdinalIgnoreCase),
+                "The capture journal must not contain the Windows account name.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestReplayServiceConcurrentDisposalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var service = new ReplayBufferService(
+                new FfmpegSetupService(Path.Combine(testDirectory, "ffmpeg")),
+                Path.Combine(testDirectory, "buffer"));
+            var disposals = Enumerable.Range(0, 8)
+                .Select(_ => service.DisposeAsync().AsTask())
+                .ToArray();
+            await Task.WhenAll(disposals).ConfigureAwait(false);
+
+            var rejectedAfterDispose = false;
+            try
+            {
+                await service.StopAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                rejectedAfterDispose = true;
+            }
+
+            Assert.True(
+                rejectedAfterDispose,
+                "A fully disposed replay service accepted new lifecycle work.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
     private static Task TestCaptureGeometryMatrixAsync()
     {
         (int Width, int Height)[] displaySizes =
@@ -1612,6 +1861,7 @@ internal static class Program
                     resolution,
                     60,
                     TimeSpan.FromMinutes(2),
+                    false,
                     false,
                     null,
                     false,
@@ -1850,7 +2100,7 @@ internal static class Program
             @"C:\Buffer");
         Assert.True(
             graphicsNvenc.Any(argument => argument.Contains(
-                "gfxcapture=monitor_idx=3:capture_cursor=1:max_framerate=60",
+                "gfxcapture=monitor_idx=3:capture_cursor=0:max_framerate=60",
                 StringComparison.Ordinal)),
             "Windows Graphics Capture must retain the selected zero-based monitor index.");
         Assert.True(
@@ -2146,6 +2396,7 @@ internal static class Program
         ResolutionOption.All.Single(option => option.Id == "1080p"),
         60,
         TimeSpan.FromMinutes(2),
+        false,
         false,
         null,
         false,
@@ -2660,6 +2911,7 @@ internal static class Program
                 ResolutionId = "1440p",
                 FramesPerSecond = 60,
                 DisplayDeviceName = @"\\.\DISPLAY2",
+                CaptureCursor = true,
                 CaptureSystemAudio = false,
                 OutputAudioDeviceId = "output-device",
                 CaptureMicrophone = true,
@@ -2684,6 +2936,7 @@ internal static class Program
             Assert.Equal(expected.ResolutionId, actual.ResolutionId, "Resolution did not roundtrip.");
             Assert.Equal(expected.FramesPerSecond, actual.FramesPerSecond, "Frame rate did not roundtrip.");
             Assert.Equal(expected.DisplayDeviceName, actual.DisplayDeviceName, "Display did not roundtrip.");
+            Assert.Equal(expected.CaptureCursor, actual.CaptureCursor, "Cursor capture did not roundtrip.");
             Assert.Equal(expected.CaptureSystemAudio, actual.CaptureSystemAudio, "System audio setting did not roundtrip.");
             Assert.Equal(expected.OutputAudioDeviceId, actual.OutputAudioDeviceId, "Output device did not roundtrip.");
             Assert.Equal(expected.CaptureMicrophone, actual.CaptureMicrophone, "Microphone setting did not roundtrip.");

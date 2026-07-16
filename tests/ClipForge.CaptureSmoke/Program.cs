@@ -116,6 +116,9 @@ try
     }
     var verifyPruning = args.Contains("--prune", StringComparer.OrdinalIgnoreCase);
     var verifyRenewal = args.Contains("--renew", StringComparer.OrdinalIgnoreCase);
+    var verifyServiceOwnedRenewal = args.Contains(
+        "--scheduled-renew",
+        StringComparer.OrdinalIgnoreCase);
     var renewalCount = verifyRenewal
         ? ParseRenewalCount(GetOption(args, "--renew-count"))
         : 0;
@@ -123,6 +126,10 @@ try
     if (verifyRenewal && forceGdi)
     {
         throw new ArgumentException("--renew requires the Windows Graphics Capture path.");
+    }
+    if (verifyServiceOwnedRenewal && !verifyRenewal)
+    {
+        throw new ArgumentException("--scheduled-renew also requires --renew.");
     }
     var resolutionId = GetOption(args, "--resolution") ?? "720p";
     var resolution = ResolutionOption.All.FirstOrDefault(option =>
@@ -160,6 +167,7 @@ try
             : verifyRenewal
                 ? TimeSpan.FromMinutes(5)
                 : TimeSpan.FromSeconds(30),
+        false,
         includeSystemAudio,
         includeSystemAudio ? outputs.FirstOrDefault(device => device.IsDefault) ?? outputs[0] : null,
         includeMicrophone,
@@ -266,7 +274,25 @@ try
                 var lastRetainedSegmentId = retainedBeforeRenewal[^1].Id;
                 var refreshRequestedUtc = DateTimeOffset.UtcNow;
                 var refreshTimer = Stopwatch.StartNew();
-                var renewed = await replay.RefreshCaptureAsync(previousProcessId, timeout.Token);
+                bool renewed;
+                if (verifyServiceOwnedRenewal)
+                {
+                    if (!replay.RequestScheduledCaptureRefresh(
+                            $"Capture smoke scheduled renewal {renewalIndex}."))
+                    {
+                        throw new InvalidDataException(
+                            $"The service-owned WGC renewal {renewalIndex} was not queued.");
+                    }
+
+                    await replay.WaitForScheduledCaptureRefreshIdleAsync()
+                        .WaitAsync(timeout.Token)
+                        .ConfigureAwait(false);
+                    renewed = replay.CaptureProcessId != previousProcessId;
+                }
+                else
+                {
+                    renewed = await replay.RefreshCaptureAsync(previousProcessId, timeout.Token);
+                }
                 refreshTimer.Stop();
                 var refreshCompletedUtc = DateTimeOffset.UtcNow;
                 if (!renewed)
@@ -1176,6 +1202,7 @@ static async Task RunReplayConcurrentTrimSmokeAsync(
         resolution,
         framesPerSecond,
         TimeSpan.FromSeconds(30),
+        false,
         includeSystemAudio,
         includeSystemAudio ? outputs.FirstOrDefault(device => device.IsDefault) ?? outputs[0] : null,
         includeMicrophone,

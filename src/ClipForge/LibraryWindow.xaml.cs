@@ -48,6 +48,7 @@ public partial class LibraryWindow : Window
     private bool _refreshPending;
     private bool _suppressSelectionAutoplay;
     private bool _sourceReleasedForBackground;
+    private int _playerHostIndex = 1;
     private bool _isMediaReady;
     private bool _isMediaOpenDeferred;
     private bool _playWhenOpened;
@@ -158,7 +159,7 @@ public partial class LibraryWindow : Window
             // foreground player remains available, but defaults to mute so its
             // audio is not unintentionally looped back into a new replay clip.
             _replayPlaybackAudioOptIn = false;
-            if (LibraryPlayer.Source is not null)
+            if (GetAttachedPlayer() is not null)
             {
                 ApplyVolume(0);
             }
@@ -661,11 +662,12 @@ public partial class LibraryWindow : Window
                 ? 0
                 : VolumeSlider.Value / 100);
         _pendingOpenPlan = openPlan;
-        LibraryPlayer.Volume = openPlan.PrimeVolume;
-        LibraryPlayer.Source = new Uri(validatedClipPath, UriKind.Absolute);
+        var player = EnsurePlayerElement();
+        player.Volume = openPlan.PrimeVolume;
+        player.Source = new Uri(validatedClipPath, UriKind.Absolute);
         if (openPlan.MustPrimeWithPlay)
         {
-            LibraryPlayer.Play();
+            player.Play();
         }
     }
 
@@ -699,7 +701,8 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        if (LibraryPlayer.Source is null)
+        var player = GetAttachedPlayer();
+        if (player?.Source is null)
         {
             if (_isPresentationSuspended)
             {
@@ -712,19 +715,19 @@ public partial class LibraryWindow : Window
 
         if (_isPlaying)
         {
-            LibraryPlayer.Pause();
+            player.Pause();
             SetPlaying(false);
             return;
         }
 
         var duration = GetPlayerDuration();
         if (duration > TimeSpan.Zero &&
-            LibraryPlayer.Position >= duration - TimeSpan.FromMilliseconds(250))
+            player.Position >= duration - TimeSpan.FromMilliseconds(250))
         {
-            LibraryPlayer.Position = TimeSpan.Zero;
+            player.Position = TimeSpan.Zero;
         }
 
-        LibraryPlayer.Play();
+        player.Play();
         SetPlaying(true);
     }
 
@@ -736,21 +739,32 @@ public partial class LibraryWindow : Window
 
     private void RestartButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_currentClip is null || LibraryPlayer.Source is null)
+        var player = GetAttachedPlayer();
+        if (_currentClip is null || player?.Source is null)
         {
             return;
         }
 
-        LibraryPlayer.Position = TimeSpan.Zero;
-        LibraryPlayer.Play();
+        player.Position = TimeSpan.Zero;
+        player.Play();
         SetPlaying(true);
     }
 
-    private void BackTenButton_Click(object sender, RoutedEventArgs e) =>
-        SeekPlayerTo(LibraryPlayer.Position - TimeSpan.FromSeconds(10));
+    private void BackTenButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetAttachedPlayer() is { } player)
+        {
+            SeekPlayerTo(player.Position - TimeSpan.FromSeconds(10));
+        }
+    }
 
-    private void ForwardTenButton_Click(object sender, RoutedEventArgs e) =>
-        SeekPlayerTo(LibraryPlayer.Position + TimeSpan.FromSeconds(10));
+    private void ForwardTenButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetAttachedPlayer() is { } player)
+        {
+            SeekPlayerTo(player.Position + TimeSpan.FromSeconds(10));
+        }
+    }
 
     private void MuteButton_Click(object sender, RoutedEventArgs e)
     {
@@ -794,13 +808,17 @@ public partial class LibraryWindow : Window
 
     private void ApplyVolume(double? requestedVolume = null)
     {
-        if (LibraryPlayer is null || MuteButton is null)
+        if (MuteButton is null)
         {
             return;
         }
 
         var volume = Math.Clamp(requestedVolume ?? VolumeSlider.Value / 100, 0, 1);
-        LibraryPlayer.Volume = volume;
+        if (GetAttachedPlayer() is { } player)
+        {
+            player.Volume = volume;
+        }
+
         _isMuted = volume <= 0.001;
         if (!_isMuted)
         {
@@ -813,7 +831,8 @@ public partial class LibraryWindow : Window
 
     private void LibraryPlayer_MediaOpened(object sender, RoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, LibraryPlayer))
+        var player = GetAttachedPlayer();
+        if (player is null || !ReferenceEquals(sender, player))
         {
             return;
         }
@@ -824,19 +843,19 @@ public partial class LibraryWindow : Window
             !IsVisible ||
             !IsActive ||
             _isPresentationSuspended ||
-            LibraryPlayer.Source is null ||
+            player.Source is null ||
             _currentClip is null ||
             openPlan is null)
         {
             // A late graph-open event must never re-enable playback or restore
             // audible volume after Alt-Tab, owner hide, or shutdown.
-            LibraryPlayer.Volume = 0;
+            player.Volume = 0;
             ReleasePlayerForBackground();
             return;
         }
 
         // Stop the muted priming playback before restoring position or volume.
-        LibraryPlayer.Pause();
+        player.Pause();
         _isMediaReady = true;
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         SetControlsEnabled(true);
@@ -844,7 +863,7 @@ public partial class LibraryWindow : Window
         if (_positionToRestore is { } restorePosition)
         {
             var duration = GetPlayerDuration();
-            LibraryPlayer.Position = duration > TimeSpan.Zero
+            player.Position = duration > TimeSpan.Zero
                 ? TimeSpan.FromSeconds(Math.Clamp(
                     restorePosition.TotalSeconds,
                     0,
@@ -858,7 +877,7 @@ public partial class LibraryWindow : Window
         ApplyVolume(openPlan.Value.PlaybackVolume);
         if (shouldAutoplay && IsVisible && IsActive)
         {
-            LibraryPlayer.Play();
+            player.Play();
             SetPlaying(true);
         }
         else
@@ -878,21 +897,23 @@ public partial class LibraryWindow : Window
 
     private void LibraryPlayer_MediaEnded(object sender, RoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, LibraryPlayer))
+        var player = GetAttachedPlayer();
+        if (player is null || !ReferenceEquals(sender, player))
         {
             return;
         }
 
         _isPreviewingTrim = false;
-        LibraryPlayer.Pause();
-        LibraryPlayer.Position = TimeSpan.Zero;
+        player.Pause();
+        player.Position = TimeSpan.Zero;
         SetPlaying(false);
         UpdatePlayerTime();
     }
 
     private void LibraryPlayer_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, LibraryPlayer))
+        var player = GetAttachedPlayer();
+        if (player is null || !ReferenceEquals(sender, player))
         {
             return;
         }
@@ -902,10 +923,10 @@ public partial class LibraryWindow : Window
         if (_isClosing ||
             !IsVisible ||
             !IsActive ||
-            LibraryPlayer.Source is null ||
+            player.Source is null ||
             _currentClip is null)
         {
-            LibraryPlayer.Volume = 0;
+            player.Volume = 0;
             ReleasePlayerForBackground();
             return;
         }
@@ -936,7 +957,7 @@ public partial class LibraryWindow : Window
                                     !_isTrimInProgress;
         SurfacePlayButton.Visibility = !isPlaying &&
                                        _currentClip is not null &&
-                                       (LibraryPlayer.Source is not null || canOpenDeferredSource)
+                                       (GetAttachedPlayer()?.Source is not null || canOpenDeferredSource)
             ? Visibility.Visible
             : Visibility.Collapsed;
         if (_isMediaOpenDeferred)
@@ -957,15 +978,16 @@ public partial class LibraryWindow : Window
 
     private void UpdatePlayerTime()
     {
-        if (_currentClip is null || LibraryPlayer.Source is null)
+        var player = GetAttachedPlayer();
+        if (_currentClip is null || player?.Source is null)
         {
             return;
         }
 
         var total = GetPlayerDuration();
-        var position = total > TimeSpan.Zero && LibraryPlayer.Position > total
+        var position = total > TimeSpan.Zero && player.Position > total
             ? total
-            : LibraryPlayer.Position;
+            : player.Position;
         if (_isPreviewingTrim &&
             _isTrimMode &&
             position.TotalSeconds >= TrimRangeSelector.UpperValue - 0.03)
@@ -974,8 +996,8 @@ public partial class LibraryWindow : Window
             var previewEnd = total > TimeSpan.FromMilliseconds(50) && trimEnd >= total
                 ? total - TimeSpan.FromMilliseconds(50)
                 : trimEnd;
-            LibraryPlayer.Pause();
-            LibraryPlayer.Position = previewEnd;
+            player.Pause();
+            player.Position = previewEnd;
             _isPreviewingTrim = false;
             SetPlaying(false);
             TimeText.Text = $"{FormatDuration(trimEnd)} / {(total > TimeSpan.Zero ? FormatDuration(total) : "--:--")}";
@@ -1006,9 +1028,13 @@ public partial class LibraryWindow : Window
                                     !_isPresentationSuspended;
     }
 
-    private TimeSpan GetPlayerDuration() => LibraryPlayer.NaturalDuration.HasTimeSpan
-        ? LibraryPlayer.NaturalDuration.TimeSpan
-        : _currentClip?.Duration ?? TimeSpan.Zero;
+    private TimeSpan GetPlayerDuration()
+    {
+        var player = GetAttachedPlayer();
+        return player is not null && player.NaturalDuration.HasTimeSpan
+            ? player.NaturalDuration.TimeSpan
+            : _currentClip?.Duration ?? TimeSpan.Zero;
+    }
 
     private void SetSeekUi(TimeSpan position, TimeSpan total)
     {
@@ -1019,7 +1045,7 @@ public partial class LibraryWindow : Window
             SeekSlider.Maximum = maximumSeconds;
             SeekSlider.Value = Math.Clamp(position.TotalSeconds, 0, maximumSeconds);
             SeekSlider.IsEnabled = _currentClip is not null &&
-                                   LibraryPlayer.Source is not null &&
+                                   GetAttachedPlayer()?.Source is not null &&
                                    total > TimeSpan.Zero;
         }
         finally
@@ -1030,7 +1056,8 @@ public partial class LibraryWindow : Window
 
     private void SeekPlayerTo(TimeSpan requestedPosition, bool updateSlider = true)
     {
-        if (_currentClip is null || LibraryPlayer.Source is null)
+        var player = GetAttachedPlayer();
+        if (_currentClip is null || player?.Source is null)
         {
             return;
         }
@@ -1045,7 +1072,7 @@ public partial class LibraryWindow : Window
             requestedPosition.TotalSeconds,
             0,
             total.TotalSeconds));
-        LibraryPlayer.Position = target;
+        player.Position = target;
         TimeText.Text = $"{FormatDuration(target)} / {FormatDuration(total)}";
         if (updateSlider)
         {
@@ -1062,9 +1089,9 @@ public partial class LibraryWindow : Window
 
         _isSeeking = true;
         _resumeAfterSeek = _isPlaying;
-        if (_resumeAfterSeek)
+        if (_resumeAfterSeek && GetAttachedPlayer() is { } player)
         {
-            LibraryPlayer.Pause();
+            player.Pause();
             _playerTimer.Stop();
         }
 
@@ -1090,9 +1117,9 @@ public partial class LibraryWindow : Window
 
         SeekPlayerTo(TimeSpan.FromSeconds(SeekSlider.Value));
         _isSeeking = false;
-        if (_resumeAfterSeek)
+        if (_resumeAfterSeek && GetAttachedPlayer() is { } player)
         {
-            LibraryPlayer.Play();
+            player.Play();
             SetPlaying(true);
         }
         else
@@ -1116,17 +1143,18 @@ public partial class LibraryWindow : Window
 
     private void SeekSlider_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (!SeekSlider.IsEnabled || _currentClip is null)
+        var player = GetAttachedPlayer();
+        if (!SeekSlider.IsEnabled || _currentClip is null || player?.Source is null)
         {
             return;
         }
 
         var requested = e.Key switch
         {
-            Key.Left or Key.Down => LibraryPlayer.Position - TimeSpan.FromSeconds(5),
-            Key.Right or Key.Up => LibraryPlayer.Position + TimeSpan.FromSeconds(5),
-            Key.PageDown => LibraryPlayer.Position - TimeSpan.FromSeconds(10),
-            Key.PageUp => LibraryPlayer.Position + TimeSpan.FromSeconds(10),
+            Key.Left or Key.Down => player.Position - TimeSpan.FromSeconds(5),
+            Key.Right or Key.Up => player.Position + TimeSpan.FromSeconds(5),
+            Key.PageDown => player.Position - TimeSpan.FromSeconds(10),
+            Key.PageUp => player.Position + TimeSpan.FromSeconds(10),
             Key.Home => TimeSpan.Zero,
             Key.End => GetPlayerDuration(),
             _ => (TimeSpan?)null
@@ -1172,17 +1200,18 @@ public partial class LibraryWindow : Window
 
     private void BeginTrimMode()
     {
+        var player = GetAttachedPlayer();
         if (_isClosing ||
             _isTrimInProgress ||
             _currentClip is null ||
             !_isMediaReady ||
-            LibraryPlayer.Source is null ||
-            !LibraryPlayer.NaturalDuration.HasTimeSpan)
+            player?.Source is null ||
+            !player.NaturalDuration.HasTimeSpan)
         {
             return;
         }
 
-        var duration = LibraryPlayer.NaturalDuration.TimeSpan;
+        var duration = player.NaturalDuration.TimeSpan;
 
         if (duration < TimeSpan.FromSeconds(0.25))
         {
@@ -1216,7 +1245,7 @@ public partial class LibraryWindow : Window
         BeginTrimButton.IsEnabled = _isMediaReady &&
                                     !_isPresentationSuspended &&
                                     _currentClip is not null &&
-                                    LibraryPlayer.Source is not null;
+                                    GetAttachedPlayer()?.Source is not null;
     }
 
     private void InitializeTrimRange(TimeSpan duration, bool preserveSelection)
@@ -1260,14 +1289,15 @@ public partial class LibraryWindow : Window
     {
         UpdateTrimLabels();
         UpdateTrimAvailability();
+        var player = GetAttachedPlayer();
         if (_isUpdatingTrimRange ||
             e.Handle == TrimRangeHandle.None ||
-            LibraryPlayer.Source is null)
+            player?.Source is null)
         {
             return;
         }
 
-        LibraryPlayer.Pause();
+        player.Pause();
         SetPlaying(false);
         SeekPlayerTo(GetTrimBoundaryPreviewPosition(e.Handle, e.LowerValue, e.UpperValue));
     }
@@ -1275,7 +1305,7 @@ public partial class LibraryWindow : Window
     private void TrimRangeSelector_RangeChangeCompleted(object? sender, TrimRangeChangedEventArgs e)
     {
         UpdateTrimLabels();
-        if (_isUpdatingTrimRange || LibraryPlayer.Source is null)
+        if (_isUpdatingTrimRange || GetAttachedPlayer()?.Source is null)
         {
             return;
         }
@@ -1302,29 +1332,31 @@ public partial class LibraryWindow : Window
 
     private void PreviewTrimButton_Click(object sender, RoutedEventArgs e)
     {
+        var player = GetAttachedPlayer();
         if (!_isTrimMode ||
             _isTrimInProgress ||
             _currentClip is null ||
-            LibraryPlayer.Source is null)
+            player?.Source is null)
         {
             return;
         }
 
-        LibraryPlayer.Position = TimeSpan.FromSeconds(TrimRangeSelector.LowerValue);
+        player.Position = TimeSpan.FromSeconds(TrimRangeSelector.LowerValue);
         _playerTimer.Interval = TrimPreviewTimerInterval;
         _isPreviewingTrim = true;
-        LibraryPlayer.Play();
+        player.Play();
         SetPlaying(true);
         UpdatePlayerTime();
     }
 
     private async void SaveTrimButton_Click(object sender, RoutedEventArgs e)
     {
+        var player = GetAttachedPlayer();
         if (!_isTrimMode ||
             _isTrimInProgress ||
             _currentClip is null ||
             !_isMediaReady ||
-            LibraryPlayer.Source is null)
+            player?.Source is null)
         {
             return;
         }
@@ -1345,7 +1377,7 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        LibraryPlayer.Pause();
+        player.Pause();
         _isPreviewingTrim = false;
         ReleasePlayerSource(rememberPosition: false);
         SetControlsEnabled(false);
@@ -1525,7 +1557,7 @@ public partial class LibraryWindow : Window
                                     !_isPresentationSuspended &&
                                     _isMediaReady &&
                                     _currentClip is not null &&
-                                    LibraryPlayer.Source is not null;
+                                    GetAttachedPlayer()?.Source is not null;
         UpdateTrimAvailability();
     }
 
@@ -1562,12 +1594,12 @@ public partial class LibraryWindow : Window
                                    !_isPresentationSuspended &&
                                    _isMediaReady &&
                                    _currentClip is not null &&
-                                   LibraryPlayer.Source is not null;
+                                   GetAttachedPlayer()?.Source is not null;
         PreviewTrimButton.IsEnabled = _isTrimMode &&
                                       !_isTrimInProgress &&
                                       _isMediaReady &&
                                       _currentClip is not null &&
-                                      LibraryPlayer.Source is not null &&
+                                      GetAttachedPlayer()?.Source is not null &&
                                       SeekSlider.IsEnabled;
         BeginTrimButton.Content = _isTrimMode ? "Editing trim" : "Trim clip";
         if (_isTrimMode)
@@ -1777,16 +1809,20 @@ public partial class LibraryWindow : Window
 
     private void ReleasePlayerForBackground()
     {
+        _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
         _playWhenOpened = false;
         _isSeeking = false;
         _resumeAfterSeek = false;
-        if (_currentClip is null || LibraryPlayer.Source is null)
+        var player = GetAttachedPlayer();
+        var hadOpenSource = player?.Source is not null;
+        if (_currentClip is null || !hadOpenSource)
         {
+            ReleasePlayerElement();
             SetPlaying(false);
             return;
         }
 
-        _positionToRestore = LibraryPlayer.Position;
+        _positionToRestore = player!.Position;
         ReleasePlayerSource(rememberPosition: true);
         _sourceReleasedForBackground = true;
         SetControlsEnabled(false);
@@ -1803,14 +1839,20 @@ public partial class LibraryWindow : Window
             _positionToRestore = null;
         }
 
-        ReplacePlayerElement();
+        ReleasePlayerElement();
 
         SetPlaying(false);
     }
 
-    private void ReplacePlayerElement()
+    private void ReleasePlayerElement()
     {
-        var previousPlayer = LibraryPlayer;
+        var previousPlayer = GetAttachedPlayer();
+        if (previousPlayer is null)
+        {
+            LibraryPlayer = null!;
+            return;
+        }
+
         previousPlayer.MouseLeftButtonUp -= LibraryPlayer_MouseLeftButtonUp;
         previousPlayer.MediaOpened -= LibraryPlayer_MediaOpened;
         previousPlayer.MediaEnded -= LibraryPlayer_MediaEnded;
@@ -1819,15 +1861,21 @@ public partial class LibraryWindow : Window
         previousPlayer.Stop();
         previousPlayer.Close();
         previousPlayer.Source = null;
+        _playerHostIndex = LibraryPlayerHost.Children.IndexOf(previousPlayer);
+        LibraryPlayerHost.Children.Remove(previousPlayer);
+        LibraryPlayer = null!;
+    }
 
-        if (_isClosing)
+    private MediaElement EnsurePlayerElement()
+    {
+        if (GetAttachedPlayer() is { } player)
         {
-            return;
+            return player;
         }
 
-        // WPF can queue MediaOpened/MediaFailed after a graph was closed. Give
-        // every source a fresh MediaElement and detach the old handlers first,
-        // so a late event can never consume the next clip's open plan.
+        // A hidden Library window owns no media graph. Recreate one only for a
+        // foreground open/play, and detach old handlers before close so queued
+        // events cannot consume the new source's open plan.
         var replacement = new MediaElement
         {
             LoadedBehavior = MediaState.Manual,
@@ -1847,24 +1895,27 @@ public partial class LibraryWindow : Window
         System.Windows.Automation.AutomationProperties.SetHelpText(
             replacement,
             "Click to play or pause the selected clip");
-
-        var index = LibraryPlayerHost.Children.IndexOf(previousPlayer);
-        if (index >= 0)
-        {
-            LibraryPlayerHost.Children.RemoveAt(index);
-            LibraryPlayerHost.Children.Insert(index, replacement);
-        }
-        else
-        {
-            LibraryPlayerHost.Children.Insert(0, replacement);
-        }
-
+        var insertionIndex = Math.Clamp(
+            _playerHostIndex,
+            0,
+            LibraryPlayerHost.Children.Count);
+        LibraryPlayerHost.Children.Insert(insertionIndex, replacement);
         LibraryPlayer = replacement;
+        return replacement;
     }
+
+    private MediaElement? GetAttachedPlayer() =>
+        LibraryPlayer is { } player && LibraryPlayerHost.Children.Contains(player)
+            ? player
+            : null;
 
     private void LibraryWindow_Closing(object? sender, CancelEventArgs e)
     {
         _isClosing = true;
+        _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
+        _isSeeking = false;
+        _resumeAfterSeek = false;
+        _isPreviewingTrim = false;
         _lifetimeCancellation.Cancel();
         _activeTrimCancellation?.Cancel();
         lock (_refreshCancellationGate)

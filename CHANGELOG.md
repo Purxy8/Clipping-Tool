@@ -4,6 +4,37 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.6] - 2026-07-16
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- The 30-minute Windows Graphics Capture renewal is now owned by the replay service instead of depending on the WPF dispatcher, player state, or an available UI recovery callback. It runs as one PID-scoped background operation, cannot overlap another renewal, remains serialized behind an active save, and is cancelled safely during shutdown.
+- Unlock, console reconnect, remote-session reconnect, resume, and same-size graphics-device transitions renew the WGC generation so a stale D3D frame pool cannot remain attached after Windows replaces the desktop graphics device.
+- Hidden or deactivated Main and Library players now close and remove their Media Foundation media graph instead of retaining an empty decoder/D3D graph for the lifetime of the app. Player elements are recreated only for an explicit foreground open or play action, and interrupted seek gestures release only mouse capture owned by that ClipForge window.
+
+### Performance
+
+- The direct WGC/NVENC path now limits FFmpeg's simple and complex filter pools to one worker and reduces its video input queue from eight full-size GPU frames to two. The compatibility GDI queue remains unchanged.
+- Mouse-cursor composition is disabled by default to keep games on the lower-impact hardware-cursor path. A new **Include mouse cursor in clips** switch restores cursor recording when it is needed.
+- Desktop Duplication was measured as a possible alternative but is not enabled: native capture was leaner in handles and threads, while fixed 1080p required a system-memory scaling path that used materially more CPU, memory, and GPU 3D work than the current WGC path.
+
+### Diagnostics and privacy
+
+- ClipForge now keeps a bounded, rotating local capture-lifecycle journal under its local app-data Diagnostics folder. It records only timestamps, capture geometry/backend, cursor state, and numerical process resource counters every five minutes and around start/renew/stop events; it never stores pixels, audio, file names, device names, or user input.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors and the deterministic suite passes 51/51 tests, including service-owned renewal concurrency/disposal, concurrent replay-service disposal, exact WGC/GDI queue and cursor arguments, media-player release policy, and the bounded local journal.
+- A 1920x1080/60 WGC/NVIDIA NVENC session with desktop audio and microphone passed 12 consecutive process renewals. Retired PIDs exited, completed replay segments survived, the test host settled to 494 handles and 67.1 MB private memory, and the saved MP4 contained 359 frames over 6.005 seconds at 60.003 FPS with no frame-timestamp gap above 17 ms.
+- The actual UI-independent scheduled-renewal path separately passed three consecutive replacements with the same mixed-audio configuration. After finalization its test host settled to 498 handles and 30.4 MB private memory.
+- A final mixed-audio scheduled-renewal regression on the release candidate produced 360 frames over 6.005 seconds at 60.01 FPS. DWM moved from 6,169 to 6,162 handles and the Windows audio engine from 23,275 to 23,272 across renewal and stop, with no retained-handle growth in that run.
+- These tests verify the corrected lifecycle and resource bounds on the development PC. They cannot simulate every multi-hour game, driver, overlay, mixed-refresh display, or exclusive-fullscreen combination, so this beta does not claim universal zero-lag behavior.
+
 ## [1.9.0-beta.5] - 2026-07-15
 
 ### Release status

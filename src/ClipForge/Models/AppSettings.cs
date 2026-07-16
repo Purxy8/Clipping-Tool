@@ -12,6 +12,7 @@ public sealed class AppSettings
     public string ResolutionId { get; set; } = "1080p";
     public int FramesPerSecond { get; set; } = 30;
     public string? DisplayDeviceName { get; set; }
+    public bool CaptureCursor { get; set; }
     public bool CaptureSystemAudio { get; set; } = true;
     public string? OutputAudioDeviceId { get; set; }
     public bool CaptureMicrophone { get; set; }
