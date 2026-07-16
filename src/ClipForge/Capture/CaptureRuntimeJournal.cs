@@ -68,7 +68,7 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
 
         using var host = Process.GetCurrentProcess();
         var entry = new CaptureRuntimeEvent(
-            Schema: 1,
+            Schema: 2,
             TimestampUtc: DateTimeOffset.UtcNow,
             Event: eventName.Trim(),
             Backend: string.IsNullOrWhiteSpace(backend) ? null : backend.Trim(),
@@ -245,13 +245,22 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
             // counters, so probe every field independently below.
         }
 
+        var cpuPriority = TryRead(() => process.PriorityClass)?.ToString();
+        var graphicsPriority = ProcessTuning.TryReadGraphicsPriority(
+            process,
+            out var observedGraphicsPriority)
+            ? observedGraphicsPriority.ToString()
+            : null;
+
         return new CaptureProcessSnapshot(
             processId.Value,
             TryRead(() => process.HandleCount),
             TryRead(() => process.Threads.Count),
             TryRead(() => process.PrivateMemorySize64),
             TryRead(() => process.WorkingSet64),
-            TryRead(() => process.TotalProcessorTime.TotalMilliseconds));
+            TryRead(() => process.TotalProcessorTime.TotalMilliseconds),
+            cpuPriority,
+            graphicsPriority);
     }
 
     private static T? TryRead<T>(Func<T> read) where T : struct
@@ -296,5 +305,7 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
         int? Threads,
         long? PrivateMemoryBytes,
         long? WorkingSetBytes,
-        double? TotalProcessorTimeMilliseconds);
+        double? TotalProcessorTimeMilliseconds,
+        string? CpuPriority,
+        string? GraphicsPriority);
 }

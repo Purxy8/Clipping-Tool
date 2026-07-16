@@ -314,9 +314,49 @@ internal static class Program
                 item.SuspendsPresentation,
                 MainWindow.IsCapturePresentationSuspendedState(snapshot),
                 $"{item.State} has the wrong presentation-suspension classification.");
+            Assert.Equal(
+                item.IsSession,
+                MainWindow.ShouldSuppressAutomaticLibraryWork(
+                    captureCritical: false,
+                    replayServiceRunning: false,
+                    snapshot),
+                $"{item.State} has the wrong automatic-library-work policy.");
             Assert.True(!item.SuspendsPresentation || item.IsSession,
                 $"{item.State} cannot suspend presentation outside an active replay session.");
         }
+
+        var stopped = CreateReplayStateSnapshot(ReplayState.Stopped);
+        Assert.True(
+            MainWindow.ShouldSuppressAutomaticLibraryWork(
+                captureCritical: true,
+                replayServiceRunning: false,
+                stopped),
+            "Starting capture must suppress gallery helpers before replay publishes its first state.");
+        Assert.True(
+            MainWindow.ShouldSuppressAutomaticLibraryWork(
+                captureCritical: false,
+                replayServiceRunning: true,
+                stopped),
+            "A running capture process must suppress gallery helpers even during a delayed state update.");
+        Assert.True(
+            !MainWindow.ShouldSuppressAutomaticLibraryWork(
+                captureCritical: false,
+                replayServiceRunning: false,
+                stopped),
+            "Automatic gallery work may resume only after capture and replay are fully stopped.");
+
+        Assert.True(
+            LibraryWindow.ShouldSuppressAutomaticRefresh(
+                replayRunning: true,
+                presentationSuspended: false,
+                trimInProgress: false),
+            "Library discovery and thumbnail work must remain deferred for the whole replay session.");
+        Assert.True(
+            !LibraryWindow.ShouldSuppressAutomaticRefresh(
+                replayRunning: false,
+                presentationSuspended: false,
+                trimInProgress: false),
+            "The Library may refresh after replay and other foreground work have stopped.");
 
         return Task.CompletedTask;
     }
@@ -2172,6 +2212,12 @@ internal static class Program
             "Quick Sync graphics capture must use its supported NV12 system-memory format.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.CapturePriority,
             "Capture processes should yield CPU time to the foreground game.");
+        Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.HardwareCapturePriority,
+            "Direct WGC/NVENC capture must also yield CPU time to the foreground game.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.BelowNormal,
+            ProcessTuning.CaptureGraphicsPriority,
+            "WGC, scaling and hardware encoding must yield GPU scheduling to DWM and the game.");
 
         return Task.CompletedTask;
     }
@@ -3834,6 +3880,25 @@ internal static class Program
             var clipPath = Path.Combine(clipsDirectory, "Clip_2026-07-12_20-00-00.mp4");
             await File.WriteAllBytesAsync(clipPath, [1, 2, 3, 4, 5]).ConfigureAwait(false);
             var info = new FileInfo(clipPath);
+            Assert.True(
+                ClipLibraryService.TryCreateKnownOutputItem(
+                    clipsDirectory,
+                    clipPath,
+                    TimeSpan.FromSeconds(1),
+                    out var knownOutput) &&
+                knownOutput is not null &&
+                knownOutput.FileSizeBytes == info.Length &&
+                knownOutput.Duration == TimeSpan.FromSeconds(1),
+                "A trusted save/trim output should become an identity-bound cached item without a media probe.");
+            var unrelatedPath = Path.Combine(clipsDirectory, "unrelated.mp4");
+            await File.WriteAllBytesAsync(unrelatedPath, [1, 2, 3]).ConfigureAwait(false);
+            Assert.True(
+                !ClipLibraryService.TryCreateKnownOutputItem(
+                    clipsDirectory,
+                    unrelatedPath,
+                    knownDuration: null,
+                    out _),
+                "The probe-free replay cache path must reject unrelated file names.");
             Assert.True(
                 ClipLibraryService.TryGetCurrentFileIdentity(clipPath, out var identity),
                 "A discovered clip should receive a stable Windows file identity.");

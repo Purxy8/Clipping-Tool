@@ -511,6 +511,47 @@ public sealed class ClipLibraryService
     }
 
     /// <summary>
+    /// Creates an identity-bound gallery item for an output path returned directly by ClipForge's
+    /// save or trim service. This performs only bounded local file/handle validation: it never
+    /// launches FFprobe or FFmpeg, so a completed output can be added to an already validated
+    /// replay-time cache without starting another media workload.
+    /// </summary>
+    internal static bool TryCreateKnownOutputItem(
+        string saveDirectory,
+        string outputPath,
+        TimeSpan? knownDuration,
+        out ClipLibraryItem? clip)
+    {
+        clip = null;
+        if ((knownDuration is { } duration && duration < TimeSpan.Zero) ||
+            string.IsNullOrWhiteSpace(outputPath) ||
+            !Path.IsPathFullyQualified(outputPath))
+        {
+            return false;
+        }
+
+        var rootDirectory = TryGetSafeRootDirectory(saveDirectory);
+        if (rootDirectory is null ||
+            !TryGetCurrentCandidate(rootDirectory, outputPath, out var candidate) ||
+            !TryGetCurrentFileIdentity(candidate, out var identity))
+        {
+            return false;
+        }
+
+        clip = new ClipLibraryItem(
+            candidate.FileName,
+            candidate.FullPath,
+            new DateTimeOffset(candidate.LastWriteTimeUtc),
+            candidate.Length,
+            knownDuration)
+        {
+            FileIdentity = identity,
+            Kind = candidate.Kind
+        };
+        return true;
+    }
+
+    /// <summary>
     /// Revalidates a discovered clip immediately before it is handed to an in-process media decoder.
     /// </summary>
     internal static bool IsCurrentClipSafe(string saveDirectory, ClipLibraryItem clip)
@@ -1276,13 +1317,16 @@ public sealed class ClipLibraryService
         PinnedClipReadContext context,
         string candidatePath,
         out string resolvedPath,
-        out long length)
+        out long length,
+        out PinnedDirectChildValidationDiagnostic diagnostic)
     {
         ArgumentNullException.ThrowIfNull(context);
         resolvedPath = string.Empty;
         length = 0;
+        diagnostic = PinnedDirectChildValidationDiagnostic.None;
         if (string.IsNullOrWhiteSpace(candidatePath) || !Path.IsPathFullyQualified(candidatePath))
         {
+            diagnostic = new(PinnedDirectChildValidationFailure.InvalidPath, 0);
             return false;
         }
 
@@ -1294,24 +1338,54 @@ public sealed class ClipLibraryService
             OpenExisting,
             FileFlagOpenReparsePoint,
             IntPtr.Zero);
-        if (handle.IsInvalid ||
-            !GetFileInformationByHandleEx(
+        if (handle.IsInvalid)
+        {
+            diagnostic = new(
+                PinnedDirectChildValidationFailure.OpenFailed,
+                Marshal.GetLastPInvokeError());
+            return false;
+        }
+
+        if (!GetFileInformationByHandleEx(
                 handle,
                 FileInfoByHandleClass.FileAttributeTagInfo,
                 out FileAttributeTagInformation attributes,
-                Marshal.SizeOf<FileAttributeTagInformation>()) ||
-            (attributes.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
-            !GetFileInformationByHandleEx(
+                Marshal.SizeOf<FileAttributeTagInformation>()))
+        {
+            diagnostic = new(
+                PinnedDirectChildValidationFailure.AttributeQueryFailed,
+                Marshal.GetLastPInvokeError());
+            return false;
+        }
+
+        if ((attributes.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+        {
+            diagnostic = new(PinnedDirectChildValidationFailure.UnsafeAttributes, 0);
+            return false;
+        }
+
+        if (!GetFileInformationByHandleEx(
                 handle,
                 FileInfoByHandleClass.FileStandardInfo,
                 out FileStandardInformation standard,
-                Marshal.SizeOf<FileStandardInformation>()) ||
-            standard.Directory ||
-            standard.DeletePending ||
-            standard.EndOfFile <= 0 ||
-            !TryValidateDirectChildHandle(context.RootDirectoryHandle, handle, out resolvedPath))
+                Marshal.SizeOf<FileStandardInformation>()))
+        {
+            diagnostic = new(
+                PinnedDirectChildValidationFailure.StandardInfoQueryFailed,
+                Marshal.GetLastPInvokeError());
+            return false;
+        }
+
+        if (standard.Directory || standard.DeletePending || standard.EndOfFile <= 0)
+        {
+            diagnostic = new(PinnedDirectChildValidationFailure.EmptyOrDeleting, 0);
+            return false;
+        }
+
+        if (!TryValidateDirectChildHandle(context.RootDirectoryHandle, handle, out resolvedPath))
         {
             resolvedPath = string.Empty;
+            diagnostic = new(PinnedDirectChildValidationFailure.NotDirectChild, 0);
             return false;
         }
 
@@ -1962,6 +2036,30 @@ public sealed class ClipLibraryService
         FileInfoByHandleClass fileInformationClass,
         ref FileDispositionInformation fileInformation,
         int bufferSize);
+}
+
+internal enum PinnedDirectChildValidationFailure
+{
+    None,
+    InvalidPath,
+    OpenFailed,
+    AttributeQueryFailed,
+    UnsafeAttributes,
+    StandardInfoQueryFailed,
+    EmptyOrDeleting,
+    NotDirectChild
+}
+
+internal readonly record struct PinnedDirectChildValidationDiagnostic(
+    PinnedDirectChildValidationFailure Failure,
+    int NativeError)
+{
+    public static PinnedDirectChildValidationDiagnostic None { get; } =
+        new(PinnedDirectChildValidationFailure.None, 0);
+
+    public override string ToString() => NativeError == 0
+        ? Failure.ToString()
+        : $"{Failure} (Win32 {NativeError})";
 }
 
 internal enum ClipDeletionResult

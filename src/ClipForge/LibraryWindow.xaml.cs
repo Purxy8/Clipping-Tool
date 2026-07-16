@@ -20,7 +20,6 @@ namespace ClipForge;
 public partial class LibraryWindow : Window
 {
     private const int InitialClipLimit = 100;
-    private const int ReplayThumbnailHydrationLimit = 12;
     private static readonly TimeSpan NormalPlayerTimerInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan TrimPreviewTimerInterval = TimeSpan.FromMilliseconds(50);
     private static readonly LibraryFilterOption[] LibraryFilterOptions =
@@ -37,7 +36,11 @@ public partial class LibraryWindow : Window
     private readonly DispatcherTimer _playerTimer;
     private readonly NativeWindowThemeService _nativeWindowThemeService;
     private readonly string? _initialPreferredPath;
+    private readonly IReadOnlyList<ClipLibraryItem> _initialCachedClips;
+    private readonly Action<ClipLibraryItem>? _cachedClipUpserted;
+    private readonly Action<ClipLibraryItem>? _cachedClipRemoved;
     private readonly object _refreshCancellationGate = new();
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
 
     private CancellationTokenSource? _activeRefreshCancellation;
     private CancellationTokenSource? _activeTrimCancellation;
@@ -81,7 +84,10 @@ public partial class LibraryWindow : Window
         bool replayRunning,
         ClipLibraryItem? initiallySelectedClip = null,
         bool beginTrim = false,
-        bool presentationSuspended = false)
+        bool presentationSuspended = false,
+        IReadOnlyList<ClipLibraryItem>? initialCachedClips = null,
+        Action<ClipLibraryItem>? cachedClipUpserted = null,
+        Action<ClipLibraryItem>? cachedClipRemoved = null)
     {
         ArgumentNullException.ThrowIfNull(clipLibraryService);
         ArgumentNullException.ThrowIfNull(clipTrimService);
@@ -91,6 +97,9 @@ public partial class LibraryWindow : Window
         _clipTrimService = clipTrimService;
         _saveDirectory = Path.GetFullPath(saveDirectory);
         _initialPreferredPath = initiallySelectedClip?.FullPath;
+        _initialCachedClips = initialCachedClips?.Take(InitialClipLimit).ToArray() ?? [];
+        _cachedClipUpserted = cachedClipUpserted;
+        _cachedClipRemoved = cachedClipRemoved;
         _requestedPreferredPath = beginTrim ? _initialPreferredPath : null;
         _beginTrimWhenReady = beginTrim;
         _isReplayRunning = replayRunning;
@@ -152,12 +161,11 @@ public partial class LibraryWindow : Window
         }
 
         _isReplayRunning = isRunning;
-        var refreshRequired = !isRunning;
         if (isRunning)
         {
-            // Switch an in-flight full refresh to cached-thumbnail mode. The
-            // foreground player remains available, but defaults to mute so its
-            // audio is not unintentionally looped back into a new replay clip.
+            // Keep the already-bound cards, but cancel discovery and wait for
+            // replay to stop before starting any more ffprobe/thumbnail work.
+            // The foreground player remains available by explicit user action.
             _replayPlaybackAudioOptIn = false;
             if (GetAttachedPlayer() is not null)
             {
@@ -165,24 +173,28 @@ public partial class LibraryWindow : Window
             }
 
             CancelRefreshForBackground();
-            refreshRequired = _refreshPending || ClipList.Items.Count == 0;
+            _refreshPending = true;
+            SetReplayDeferredRefreshStatus();
         }
 
         ReplayPlaybackHintText.Visibility = isRunning
             ? Visibility.Visible
             : Visibility.Collapsed;
         ClipList.IsEnabled = !_isTrimInProgress && !_isPresentationSuspended;
-        LibraryFilterComboBox.IsEnabled = !_isTrimInProgress && !_isPresentationSuspended;
+        LibraryFilterComboBox.IsEnabled = !isRunning &&
+                                          !_isTrimInProgress &&
+                                          !_isPresentationSuspended;
         lock (_refreshCancellationGate)
         {
-            RefreshButton.IsEnabled = !_isTrimInProgress &&
+            RefreshButton.IsEnabled = !isRunning &&
+                                      !_isTrimInProgress &&
                                       !_isPresentationSuspended &&
                                       _activeRefreshCancellation is null &&
                                       IsVisible &&
                                       IsActive;
         }
 
-        if (refreshRequired)
+        if (!isRunning)
         {
             if (_isTrimInProgress ||
                 !_isLoaded ||
@@ -234,7 +246,7 @@ public partial class LibraryWindow : Window
         }
 
         ClipList.IsEnabled = !_isTrimInProgress;
-        LibraryFilterComboBox.IsEnabled = !_isTrimInProgress;
+        LibraryFilterComboBox.IsEnabled = !_isReplayRunning && !_isTrimInProgress;
         SetPlaying(_isPlaying);
         if (_isTrimInProgress)
         {
@@ -244,6 +256,24 @@ public partial class LibraryWindow : Window
 
         if (!_isLoaded || !IsVisible || !IsActive)
         {
+            UpdateTrimAvailability();
+            return;
+        }
+
+        if (_isReplayRunning)
+        {
+            if (_beginTrimWhenReady && _currentClip is { } requestedClip)
+            {
+                OpenClip(requestedClip, autoplay: false);
+                TryBeginRequestedTrim();
+            }
+            else if (_sourceReleasedForBackground && _currentClip is { } releasedClip)
+            {
+                // Keep the selected poster/card, but require a fresh Play click
+                // before recreating a WPF decoder during replay.
+                SelectClipWithoutOpening(releasedClip);
+            }
+
             UpdateTrimAvailability();
             return;
         }
@@ -279,6 +309,27 @@ public partial class LibraryWindow : Window
         _refreshPending = true;
         if (_isLoaded && IsVisible && IsActive)
         {
+            if (_isReplayRunning && !_isPresentationSuspended)
+            {
+                _suppressSelectionAutoplay = true;
+                try
+                {
+                    ClipList.SelectedItem = ClipList.Items
+                        .OfType<ClipLibraryItem>()
+                        .FirstOrDefault(item => item.FullPath.Equals(
+                            clip.FullPath,
+                            StringComparison.OrdinalIgnoreCase));
+                }
+                finally
+                {
+                    _suppressSelectionAutoplay = false;
+                }
+
+                OpenClip(clip, autoplay: false);
+                TryBeginRequestedTrim();
+                return;
+            }
+
             _ = RefreshLibraryAsync(clip.FullPath);
         }
     }
@@ -287,6 +338,18 @@ public partial class LibraryWindow : Window
     {
         Loaded -= LibraryWindow_Loaded;
         _isLoaded = true;
+        if (_isReplayRunning)
+        {
+            BindInitialCachedReplayClips();
+            _refreshPending = true;
+            if (_isPresentationSuspended)
+            {
+                LibraryStatusText.Text = "Capture is completing a short critical operation...";
+            }
+
+            return;
+        }
+
         if (_isPresentationSuspended)
         {
             _refreshPending = true;
@@ -331,9 +394,17 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        if (_isPresentationSuspended || _isTrimInProgress)
+        if (ShouldSuppressAutomaticRefresh(
+                _isReplayRunning,
+                _isPresentationSuspended,
+                _isTrimInProgress))
         {
             _refreshPending = true;
+            if (_isReplayRunning && !_isPresentationSuspended)
+            {
+                SetReplayDeferredRefreshStatus();
+            }
+
             return;
         }
 
@@ -352,6 +423,7 @@ public partial class LibraryWindow : Window
             _activeRefreshCancellation = refreshCancellation;
         }
 
+        var gateEntered = false;
         RefreshButton.IsEnabled = false;
         LoadingState.Visibility = Visibility.Visible;
         EmptyLibraryState.Visibility = Visibility.Collapsed;
@@ -359,18 +431,33 @@ public partial class LibraryWindow : Window
 
         try
         {
+            await _refreshGate.WaitAsync(refreshCancellation.Token);
+            gateEntered = true;
+            if (ShouldSuppressAutomaticRefresh(
+                    _isReplayRunning,
+                    _isPresentationSuspended,
+                    _isTrimInProgress))
+            {
+                _refreshPending = true;
+                return;
+            }
+
             var clips = await _clipLibraryService.GetRecentClipsAsync(
                 _saveDirectory,
                 count: InitialClipLimit,
                 includeThumbnails: true,
                 filter: _activeFilter,
-                thumbnailPolicy: _isReplayRunning
-                    ? ClipThumbnailPolicy.CachedOnly
-                    : ClipThumbnailPolicy.GenerateMissing,
+                thumbnailPolicy: ClipThumbnailPolicy.GenerateMissing,
                 cancellationToken: refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
-            if (generation != Volatile.Read(ref _refreshGeneration) || !IsVisible || !IsActive)
+            if (generation != Volatile.Read(ref _refreshGeneration) ||
+                ShouldSuppressAutomaticRefresh(
+                    _isReplayRunning,
+                    _isPresentationSuspended,
+                    _isTrimInProgress) ||
+                !IsVisible ||
+                !IsActive)
             {
                 _refreshPending = true;
                 return;
@@ -392,11 +479,6 @@ public partial class LibraryWindow : Window
                     $"Showing the newest {clips.Count} {GetFilterDescription(_activeFilter)}",
                 _ => $"{clips.Count} {GetFilterDescription(_activeFilter)} · newest first"
             };
-            if (_isReplayRunning && clips.Count > 0)
-            {
-                LibraryStatusText.Text += " - replay-friendly preview";
-            }
-
             LoadingState.Visibility = Visibility.Collapsed;
             EmptyLibraryState.Visibility = clips.Count == 0
                 ? Visibility.Visible
@@ -468,61 +550,6 @@ public partial class LibraryWindow : Window
             }
 
             _refreshPending = false;
-
-            if (_isReplayRunning &&
-                !_beginTrimWhenReady &&
-                !_isTrimInProgress &&
-                clips.Any(clip => clip.ThumbnailPath is null))
-            {
-                // The cached list is already visible. Hydrate only the newest
-                // cards likely to be on screen, without repeating discovery or
-                // probes. Focus loss, trimming, a newer refresh, or a critical
-                // capture transition cancels the Idle-priority helper.
-                var hydratedClips = await _clipLibraryService.HydrateThumbnailsAsync(
-                    _saveDirectory,
-                    clips,
-                    ReplayThumbnailHydrationLimit,
-                    cancellationToken: refreshCancellation.Token,
-                    preferredClipPath: _currentClip?.FullPath);
-
-                refreshCancellation.Token.ThrowIfCancellationRequested();
-                if (generation != Volatile.Read(ref _refreshGeneration) ||
-                    !IsVisible ||
-                    !IsActive ||
-                    _isPresentationSuspended ||
-                    _isTrimInProgress)
-                {
-                    _refreshPending = true;
-                    return;
-                }
-
-                var hydratedSelected = _currentClip is { } currentClip
-                    ? hydratedClips.FirstOrDefault(clip => clip.FullPath.Equals(
-                        currentClip.FullPath,
-                        StringComparison.OrdinalIgnoreCase))
-                    : null;
-
-                ClipList.ItemsSource = hydratedClips;
-                _suppressSelectionAutoplay = true;
-                try
-                {
-                    ClipList.SelectedItem = hydratedSelected;
-                    if (hydratedSelected is not null)
-                    {
-                        ClipList.ScrollIntoView(hydratedSelected);
-                    }
-                }
-                finally
-                {
-                    _suppressSelectionAutoplay = false;
-                }
-
-                if (hydratedSelected is not null)
-                {
-                    _currentClip = hydratedSelected;
-                    PlayerPosterImage.DataContext = hydratedSelected;
-                }
-            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -537,6 +564,11 @@ public partial class LibraryWindow : Window
         }
         finally
         {
+            if (gateEntered)
+            {
+                _refreshGate.Release();
+            }
+
             var wasActiveRefresh = false;
             lock (_refreshCancellationGate)
             {
@@ -549,7 +581,8 @@ public partial class LibraryWindow : Window
 
             if (wasActiveRefresh)
             {
-                RefreshButton.IsEnabled = !_isClosing &&
+                RefreshButton.IsEnabled = !_isReplayRunning &&
+                                          !_isClosing &&
                                           !_isTrimInProgress &&
                                           !_isPresentationSuspended &&
                                           IsVisible &&
@@ -558,6 +591,269 @@ public partial class LibraryWindow : Window
 
             refreshCancellation.Dispose();
         }
+    }
+
+    internal static bool ShouldSuppressAutomaticRefresh(
+        bool replayRunning,
+        bool presentationSuspended,
+        bool trimInProgress) =>
+        replayRunning || presentationSuspended || trimInProgress;
+
+    internal async Task WaitForAutomaticRefreshIdleAsync(CancellationToken cancellationToken)
+    {
+        CancelRefreshForBackground();
+        await _refreshGate.WaitAsync(cancellationToken);
+        _refreshGate.Release();
+    }
+
+    internal void UpsertKnownReplayClip(
+        ClipLibraryItem clip,
+        bool selectClip,
+        bool openForExplicitAction)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() => UpsertKnownReplayClip(
+                clip,
+                selectClip,
+                openForExplicitAction));
+            return;
+        }
+
+        var selectedPath = (ClipList.SelectedItem as ClipLibraryItem)?.FullPath ??
+                           _currentClip?.FullPath;
+        var cached = ClipList.Items.OfType<ClipLibraryItem>().ToArray();
+        var previous = cached.FirstOrDefault(item => item.FullPath.Equals(
+            clip.FullPath,
+            StringComparison.OrdinalIgnoreCase));
+        var mergedClip = clip with
+        {
+            Duration = clip.Duration ?? previous?.Duration,
+            ThumbnailPath = clip.ThumbnailPath ?? previous?.ThumbnailPath
+        };
+        if (MatchesActiveFilter(mergedClip))
+        {
+            var merged = cached
+                .Where(MatchesActiveFilter)
+                .Where(item => !item.FullPath.Equals(
+                    mergedClip.FullPath,
+                    StringComparison.OrdinalIgnoreCase))
+                .Append(mergedClip)
+                .OrderByDescending(item => item.RecordedAtUtc)
+                .ThenBy(item => item.FileName, StringComparer.OrdinalIgnoreCase)
+                .Take(InitialClipLimit)
+                .ToArray();
+            ClipList.ItemsSource = merged;
+            ClipCountText.Text = merged.Length.ToString(
+                System.Globalization.CultureInfo.InvariantCulture);
+            EmptyLibraryState.Visibility = merged.Length == 0
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            if (selectClip)
+            {
+                _suppressSelectionAutoplay = true;
+                try
+                {
+                    ClipList.SelectedItem = mergedClip;
+                    ClipList.ScrollIntoView(mergedClip);
+                }
+                finally
+                {
+                    _suppressSelectionAutoplay = false;
+                }
+
+                if (openForExplicitAction && !_isPresentationSuspended)
+                {
+                    OpenClip(mergedClip, autoplay: false);
+                }
+                else
+                {
+                    SelectClipWithoutOpening(mergedClip);
+                }
+            }
+            else if (selectedPath is not null &&
+                     merged.FirstOrDefault(item => item.FullPath.Equals(
+                         selectedPath,
+                         StringComparison.OrdinalIgnoreCase)) is { } retainedSelection)
+            {
+                _suppressSelectionAutoplay = true;
+                try
+                {
+                    ClipList.SelectedItem = retainedSelection;
+                }
+                finally
+                {
+                    _suppressSelectionAutoplay = false;
+                }
+            }
+        }
+
+        _refreshPending = true;
+        if (_isReplayRunning)
+        {
+            SetReplayDeferredRefreshStatus();
+        }
+    }
+
+    internal void RemoveKnownReplayClip(
+        ClipLibraryItem clip,
+        bool removedWasCurrent = false)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() => RemoveKnownReplayClip(
+                clip,
+                removedWasCurrent));
+            return;
+        }
+
+        var selectedPath = (ClipList.SelectedItem as ClipLibraryItem)?.FullPath ??
+                           _currentClip?.FullPath;
+        var removedCurrent = removedWasCurrent || _currentClip?.FullPath.Equals(
+            clip.FullPath,
+            StringComparison.OrdinalIgnoreCase) == true;
+        var remaining = ClipList.Items
+            .OfType<ClipLibraryItem>()
+            .Where(item => !item.FullPath.Equals(
+                clip.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        ClipList.ItemsSource = remaining;
+        ClipCountText.Text = remaining.Length.ToString(
+            System.Globalization.CultureInfo.InvariantCulture);
+        EmptyLibraryState.Visibility = remaining.Length == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        _refreshPending = true;
+
+        if (removedCurrent)
+        {
+            if (remaining.FirstOrDefault() is { } nextClip)
+            {
+                _suppressSelectionAutoplay = true;
+                try
+                {
+                    ClipList.SelectedItem = nextClip;
+                }
+                finally
+                {
+                    _suppressSelectionAutoplay = false;
+                }
+
+                SelectClipWithoutOpening(nextClip);
+            }
+            else
+            {
+                ClearPlayer();
+            }
+        }
+        else if (selectedPath is not null &&
+                 remaining.FirstOrDefault(item => item.FullPath.Equals(
+                     selectedPath,
+                     StringComparison.OrdinalIgnoreCase)) is { } retainedSelection)
+        {
+            _suppressSelectionAutoplay = true;
+            try
+            {
+                ClipList.SelectedItem = retainedSelection;
+            }
+            finally
+            {
+                _suppressSelectionAutoplay = false;
+            }
+        }
+
+        if (_isReplayRunning)
+        {
+            SetReplayDeferredRefreshStatus();
+        }
+    }
+
+    private bool MatchesActiveFilter(ClipLibraryItem clip) => _activeFilter switch
+    {
+        ClipLibraryFilter.Original => !clip.IsTrimmed,
+        ClipLibraryFilter.Trimmed => clip.IsTrimmed,
+        _ => true
+    };
+
+    private void BindInitialCachedReplayClips()
+    {
+        var clips = _initialCachedClips
+            .Where(clip => _activeFilter switch
+            {
+                ClipLibraryFilter.Original => !clip.IsTrimmed,
+                ClipLibraryFilter.Trimmed => clip.IsTrimmed,
+                _ => true
+            })
+            .ToArray();
+        ClipList.ItemsSource = clips;
+        ClipCountText.Text = clips.Length.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        LoadingState.Visibility = Visibility.Collapsed;
+        EmptyLibraryState.Visibility = clips.Length == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        var selected = _initialPreferredPath is { Length: > 0 }
+            ? clips.FirstOrDefault(clip => clip.FullPath.Equals(
+                _initialPreferredPath,
+                StringComparison.OrdinalIgnoreCase))
+            : null;
+        selected ??= clips.FirstOrDefault();
+
+        _suppressSelectionAutoplay = true;
+        try
+        {
+            ClipList.SelectedItem = selected;
+            if (selected is not null)
+            {
+                ClipList.ScrollIntoView(selected);
+            }
+        }
+        finally
+        {
+            _suppressSelectionAutoplay = false;
+        }
+
+        if (selected is null)
+        {
+            ClearPlayer();
+        }
+        else if (_beginTrimWhenReady && !_isPresentationSuspended)
+        {
+            // Opening the explicitly requested trim source is foreground user
+            // intent; no discovery, ffprobe, or thumbnail helper is launched.
+            OpenClip(selected, autoplay: false);
+            TryBeginRequestedTrim();
+        }
+        else
+        {
+            SelectClipWithoutOpening(selected);
+        }
+
+        RefreshButton.IsEnabled = false;
+        LibraryFilterComboBox.IsEnabled = false;
+        SetReplayDeferredRefreshStatus();
+    }
+
+    private void SetReplayDeferredRefreshStatus()
+    {
+        LoadingState.Visibility = Visibility.Collapsed;
+        LibraryStatusText.Text = ClipList.Items.Count == 0
+            ? "Replay is active - no cached clips are available yet. Stop replay to load the library."
+            : $"Replay is active - showing {ClipList.Items.Count} cached clips. Full refresh resumes when replay stops.";
     }
 
     private void ClipList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1447,11 +1743,13 @@ public partial class LibraryWindow : Window
                 MessageBoxImage.Question,
                 MessageBoxResult.No) == MessageBoxResult.Yes;
 
+            var sourceDeleted = false;
             if (deleteOriginal)
             {
                 var deletion = ClipLibraryService.DeleteCurrentClip(_saveDirectory, source);
                 if (deletion == ClipDeletionResult.Deleted)
                 {
+                    sourceDeleted = true;
                     _clipLibraryService.RemoveCachedThumbnail(source);
                 }
                 else
@@ -1465,7 +1763,30 @@ public partial class LibraryWindow : Window
             SetTrimBusy(false);
             CancelTrimMode();
             SetLibraryFilter(ClipLibraryFilter.Trimmed);
-            await RefreshLibraryAsync(outputPath);
+            if (_isReplayRunning && sourceDeleted)
+            {
+                RemoveKnownReplayClip(source);
+                _cachedClipRemoved?.Invoke(source);
+            }
+
+            if (_isReplayRunning &&
+                ClipLibraryService.TryCreateKnownOutputItem(
+                    _saveDirectory,
+                    outputPath,
+                    end - start,
+                    out var trimmedClip) &&
+                trimmedClip is not null)
+            {
+                UpsertKnownReplayClip(
+                    trimmedClip,
+                    selectClip: true,
+                    openForExplicitAction: true);
+                _cachedClipUpserted?.Invoke(trimmedClip);
+            }
+            else
+            {
+                await RefreshLibraryAsync(outputPath);
+            }
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException or
@@ -1542,8 +1863,11 @@ public partial class LibraryWindow : Window
     {
         _isTrimInProgress = isBusy;
         ClipList.IsEnabled = !isBusy && !_isPresentationSuspended;
-        LibraryFilterComboBox.IsEnabled = !isBusy && !_isPresentationSuspended;
-        RefreshButton.IsEnabled = !isBusy &&
+        LibraryFilterComboBox.IsEnabled = !_isReplayRunning &&
+                                          !isBusy &&
+                                          !_isPresentationSuspended;
+        RefreshButton.IsEnabled = !_isReplayRunning &&
+                                  !isBusy &&
                                   !_isPresentationSuspended &&
                                   IsVisible &&
                                   IsActive;
@@ -1672,11 +1996,17 @@ public partial class LibraryWindow : Window
         var result = ClipLibraryService.DeleteCurrentClip(_saveDirectory, clip);
         if (result == ClipDeletionResult.Deleted)
         {
-            ClipList.ItemsSource = null;
+            RemoveKnownReplayClip(clip, removedWasCurrent: deletingCurrentClip);
+            _cachedClipRemoved?.Invoke(clip);
             _clipLibraryService.RemoveCachedThumbnail(clip);
             LibraryChanged = true;
             await RefreshLibraryAsync();
             return;
+        }
+
+        if (deletingCurrentClip && _isReplayRunning && !_isPresentationSuspended)
+        {
+            OpenClip(clip, autoplay: false);
         }
 
         await RefreshLibraryAsync(_currentClip?.FullPath);
@@ -1759,7 +2089,8 @@ public partial class LibraryWindow : Window
 
         lock (_refreshCancellationGate)
         {
-            RefreshButton.IsEnabled = !_isTrimInProgress &&
+            RefreshButton.IsEnabled = !_isReplayRunning &&
+                                      !_isTrimInProgress &&
                                       _activeRefreshCancellation is null;
         }
         if (_refreshPending)

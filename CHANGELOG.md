@@ -4,6 +4,34 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.7] - 2026-07-16
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- The capture FFmpeg child now runs at Below Normal CPU priority on every capture path and at Below Normal Windows GPU scheduling priority. This makes WGC capture, D3D11 preset scaling, and hardware encoding yield scheduling time to the foreground game and Desktop Window Manager instead of competing at the same process class.
+- WGC creates its graphics graph asynchronously and was observed returning to Normal after an early GPU-priority assignment succeeded. ClipForge now reapplies the policy after the live D3D/WGC graph is initialized and after every capture-process renewal, then reads both CPU/GPU classes every 30 seconds and writes them again only when an observed value has drifted.
+- Start Replay now cancels and waits for both Main and Library refresh pipelines before launching capture. Automatic clip discovery, FFprobe, and thumbnail generation remain fully deferred throughout Buffering and Ready rather than resuming approximately half a second after startup. Existing cached cards remain visible, explicit local playback and trimming remain available, and trusted save/trim outputs or deletions update the identity-bound in-memory views without launching media helpers. One full refresh resumes after replay stops.
+- Main and Library now preserve a strict one-decoder invariant when the current clip is deleted. Main keeps the replacement poster-only while Library owns playback, then restores replay-safe Play/Trim controls after Library closes without silently creating a second media graph.
+
+### Diagnostics and privacy
+
+- The bounded local capture-lifecycle journal now records the observed CPU and GPU scheduling classes with its existing numerical process counters. It remains local and still records no pixels, audio, file names, device names, or user input.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors, formatting and whitespace checks are clean, and the deterministic suite passes 51/51 tests. New policy assertions cover full-session automatic-library suppression and both CPU/GPU capture scheduling targets.
+- A real 1920x1080/60 WGC/NVIDIA NVENC session with desktop audio and microphone ran at 0.3% normalized CPU and 110.7 MB working set while both observed scheduling classes were Below Normal. Its saved MP4 contained 359 frames over 6.016 seconds at 60.003 FPS with no frame-timestamp gap above 17 ms and one mixed audio stream.
+- A controlled mixed-audio 1920x1080/60 replay test moved both scheduling classes back to Normal, crossed the 30-second monitor boundary, and verified that ClipForge repaired both to Below Normal. The saved MP4 contained 360 frames over 6.01 seconds at 60.01 FPS with no gap above 17 ms.
+- A service-owned process-renewal regression retained completed segments, replaced the FFmpeg PID, and kept both the replacement CPU and GPU scheduling classes Below Normal. Its mixed-audio output contained 360 frames over 6.005 seconds at 60.01 FPS with no gap above 17 ms.
+- Separate mixed-audio 60 FPS checks passed at fixed 1280x720 and Source/native 2560x1440. Both produced 359 frames over 6.016 seconds at 60.003 FPS with no gap above 17 ms; their normalized CPU samples were 0.2% and 0.1%, respectively.
+- Replay also advanced continuously during a paced, one-thread software trim while the 1920x1080/60 WGC/NVENC capture stayed active. The trimmed 640x360 source retained 156 frames and audio over 5.221 seconds; the replay saved immediately afterward contained 4.005 seconds at 60.015 FPS with no frame gap above 17 ms.
+- These checks verify scheduling, capture cadence, output, and the absence of replay-time background media helpers on the development PC. They cannot measure the user's subjective mouse latency inside every Call of Duty/fullscreen, driver, overlay, multi-recorder, or mixed-refresh configuration, so this beta does not claim universal zero-lag behavior.
+
 ## [1.9.0-beta.6] - 2026-07-16
 
 ### Release status
