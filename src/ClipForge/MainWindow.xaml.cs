@@ -67,6 +67,7 @@ public partial class MainWindow : Window
     private bool _automaticCaptureSourceFallback;
     private bool _replayStartRequested;
     private bool _playerSourceReleasedForBackground;
+    private int _clipPlayerHostIndex = 1;
     private bool _isPlayerPlaying;
     private bool _playWhenOpened;
     private bool _isPlayerSeeking;
@@ -126,6 +127,7 @@ public partial class MainWindow : Window
         System.Windows.Application.Current.SessionEnding += Application_SessionEnding;
         SystemEvents.DisplaySettingsChanged += SystemEvents_DisplaySettingsChanged;
         SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
+        SystemEvents.SessionSwitch += SystemEvents_SessionSwitch;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -245,6 +247,7 @@ public partial class MainWindow : Window
         FpsComboBox.SelectedItem = FrameRateOptions.Contains(_settings.FramesPerSecond)
             ? _settings.FramesPerSecond
             : 30;
+        CaptureCursorCheckBox.IsChecked = _settings.CaptureCursor;
 
         var displays = _deviceDiscoveryService.GetDisplays();
         DisplayComboBox.ItemsSource = displays;
@@ -464,6 +467,9 @@ public partial class MainWindow : Window
         await CaptureConfigurationChangedAsync(restartRequired: true);
 
     private async void ResolutionComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        await CaptureConfigurationChangedAsync(restartRequired: true);
+
+    private async void CaptureCursorCheckBox_Changed(object sender, RoutedEventArgs e) =>
         await CaptureConfigurationChangedAsync(restartRequired: true);
 
     private async void SystemAudioCheckBox_Checked(object sender, RoutedEventArgs e)
@@ -757,6 +763,7 @@ public partial class MainWindow : Window
             resolution,
             framesPerSecond,
             replayLength.Duration,
+            CaptureCursorCheckBox.IsChecked == true,
             captureSystemAudio,
             outputDevice,
             captureMicrophone,
@@ -799,6 +806,24 @@ public partial class MainWindow : Window
         // that existed before sleep. Re-resolve the display after Windows has
         // restored it, then renew a same-size WGC process just like a display
         // mode transition.
+        _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: true));
+    }
+
+    private void SystemEvents_SessionSwitch(object sender, SessionSwitchEventArgs e)
+    {
+        if (e.Reason is not (SessionSwitchReason.SessionUnlock or
+                             SessionSwitchReason.ConsoleConnect or
+                             SessionSwitchReason.RemoteConnect) ||
+            _isClosing ||
+            Dispatcher.HasShutdownStarted ||
+            Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        // Lock/unlock and local/remote reconnects can replace the DWM/WGC graphics
+        // device generation without emitting a display-mode notification. Renew
+        // the capture process so an old frame pool cannot degrade desktop pacing.
         _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: true));
     }
 
@@ -1018,6 +1043,7 @@ public partial class MainWindow : Window
             _settings.FramesPerSecond = fps;
         }
 
+        _settings.CaptureCursor = CaptureCursorCheckBox.IsChecked == true;
         _settings.DisplayDeviceName = (DisplayComboBox.SelectedItem as DisplayOption)?.DeviceName;
         _settings.CaptureSystemAudio = SystemAudioCheckBox.IsChecked == true;
         _settings.OutputAudioDeviceId = (OutputDeviceComboBox.SelectedItem as AudioDeviceOption)?.Id;
@@ -2378,6 +2404,9 @@ public partial class MainWindow : Window
         ShowInTaskbar = false;
         Opacity = 0;
         Show();
+        // This launch path may never activate/deactivate the window, so release
+        // the XAML-created media graph explicitly before the tray-only session.
+        ReleasePlayerForBackground();
         Hide();
         Opacity = 1;
         ShowInTaskbar = true;
@@ -2885,7 +2914,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ReplaceClipPlayerElement();
+        ReleaseClipPlayerElement();
         ClipPlayerPosterImage.DataContext = clip;
 
         if (_captureCriticalPresentationActive)
@@ -2934,7 +2963,8 @@ public partial class MainWindow : Window
         _playerSourceReleasedForBackground = false;
         _playWhenOpened = autoplay;
         SetPlayerPlaying(false);
-        ClipPlayer.Source = new Uri(clip.FullPath, UriKind.Absolute);
+        var player = EnsureClipPlayerElement();
+        player.Source = new Uri(clip.FullPath, UriKind.Absolute);
         ApplyPlayerVolume(IsReplaySessionState(_latestState) && !_replayPlaybackAudioOptIn
             ? 0
             : null);
@@ -2950,14 +2980,14 @@ public partial class MainWindow : Window
             : "0:00 / --:--";
         if (autoplay)
         {
-            ClipPlayer.Play();
+            player.Play();
             SetPlayerPlaying(true);
         }
     }
 
     private void ClearPlayer()
     {
-        ReplaceClipPlayerElement();
+        ReleaseClipPlayerElement();
         ClipPlayerPosterImage.DataContext = null;
         _currentClip = null;
         _playerSourceReleasedForBackground = false;
@@ -2980,7 +3010,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (ClipPlayer.Source is null)
+        var player = GetAttachedClipPlayer();
+        if (player?.Source is null)
         {
             if (_captureCriticalPresentationActive)
             {
@@ -2993,18 +3024,18 @@ public partial class MainWindow : Window
 
         if (_isPlayerPlaying)
         {
-            ClipPlayer.Pause();
+            player.Pause();
             SetPlayerPlaying(false);
         }
         else
         {
             var duration = GetPlayerDuration();
-            if (duration > TimeSpan.Zero && ClipPlayer.Position >= duration - TimeSpan.FromMilliseconds(250))
+            if (duration > TimeSpan.Zero && player.Position >= duration - TimeSpan.FromMilliseconds(250))
             {
-                ClipPlayer.Position = TimeSpan.Zero;
+                player.Position = TimeSpan.Zero;
             }
 
-            ClipPlayer.Play();
+            player.Play();
             SetPlayerPlaying(true);
         }
     }
@@ -3015,11 +3046,21 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private void BackTenSecondsButton_Click(object sender, RoutedEventArgs e) =>
-        SeekPlayerTo(ClipPlayer.Position - TimeSpan.FromSeconds(10));
+    private void BackTenSecondsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetAttachedClipPlayer() is { } player)
+        {
+            SeekPlayerTo(player.Position - TimeSpan.FromSeconds(10));
+        }
+    }
 
-    private void ForwardTenSecondsButton_Click(object sender, RoutedEventArgs e) =>
-        SeekPlayerTo(ClipPlayer.Position + TimeSpan.FromSeconds(10));
+    private void ForwardTenSecondsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetAttachedClipPlayer() is { } player)
+        {
+            SeekPlayerTo(player.Position + TimeSpan.FromSeconds(10));
+        }
+    }
 
     private void MutePlayerButton_Click(object sender, RoutedEventArgs e)
     {
@@ -3051,19 +3092,19 @@ public partial class MainWindow : Window
 
     private void RestartClipButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_currentClip is null)
+        if (_currentClip is null || GetAttachedClipPlayer() is not { } player)
         {
             return;
         }
 
-        ClipPlayer.Position = TimeSpan.Zero;
-        ClipPlayer.Play();
+        player.Position = TimeSpan.Zero;
+        player.Play();
         SetPlayerPlaying(true);
     }
 
     private void ClipPlayer_MediaOpened(object sender, RoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, ClipPlayer))
+        if (GetAttachedClipPlayer() is not { } player || !ReferenceEquals(sender, player))
         {
             return;
         }
@@ -3080,7 +3121,7 @@ public partial class MainWindow : Window
         _playWhenOpened = false;
         if (shouldAutoplay)
         {
-            ClipPlayer.Play();
+            player.Play();
             SetPlayerPlaying(true);
         }
 
@@ -3089,7 +3130,7 @@ public partial class MainWindow : Window
 
     private void ClipPlayer_MediaEnded(object sender, RoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, ClipPlayer))
+        if (GetAttachedClipPlayer() is not { } player || !ReferenceEquals(sender, player))
         {
             return;
         }
@@ -3100,15 +3141,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        ClipPlayer.Pause();
-        ClipPlayer.Position = TimeSpan.Zero;
+        player.Pause();
+        player.Position = TimeSpan.Zero;
         SetPlayerPlaying(false);
         UpdatePlayerTime();
     }
 
     private void ClipPlayer_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
     {
-        if (!ReferenceEquals(sender, ClipPlayer))
+        if (GetAttachedClipPlayer() is not { } player || !ReferenceEquals(sender, player))
         {
             return;
         }
@@ -3132,7 +3173,7 @@ public partial class MainWindow : Window
         IsVisible,
         IsActive,
         _currentClip is not null,
-        ClipPlayer.Source is not null);
+        GetAttachedClipPlayer()?.Source is not null);
 
     internal static bool ShouldHandlePlayerMediaEvent(
         bool captureCritical,
@@ -3151,8 +3192,12 @@ public partial class MainWindow : Window
     private void SuppressLatePlayerMediaEvent()
     {
         _playWhenOpened = false;
-        ClipPlayer.Volume = 0;
-        ReplaceClipPlayerElement();
+        if (GetAttachedClipPlayer() is { } player)
+        {
+            player.Volume = 0;
+        }
+
+        ReleaseClipPlayerElement();
 
         _playerSourceReleasedForBackground = _currentClip is not null;
         SetPlayerPlaying(false);
@@ -3162,9 +3207,10 @@ public partial class MainWindow : Window
 
     private void SetPlayerPlaying(bool isPlaying)
     {
+        var player = GetAttachedClipPlayer();
         _isPlayerPlaying = isPlaying &&
                            !_captureCriticalPresentationActive &&
-                           ClipPlayer.Source is not null;
+                           player?.Source is not null;
         PlayPauseButton.Content = _isPlayerPlaying ? "⏸" : "▶";
         PlayPauseButton.ToolTip = _isPlayerPlaying ? "Pause clip" : "Play clip";
         PlayPauseButton.SetValue(
@@ -3173,7 +3219,7 @@ public partial class MainWindow : Window
         PlayerSurfacePlayButton.Visibility = !_isPlayerPlaying &&
                                              !_captureCriticalPresentationActive &&
                                              _currentClip is not null &&
-                                             ClipPlayer.Source is not null
+                                             player?.Source is not null
             ? Visibility.Visible
             : Visibility.Collapsed;
         if (_isPlayerPlaying && IsActive && IsVisible)
@@ -3190,15 +3236,15 @@ public partial class MainWindow : Window
 
     private void UpdatePlayerTime()
     {
-        if (_currentClip is null)
+        if (_currentClip is null || GetAttachedClipPlayer() is not { } player)
         {
             return;
         }
 
         var total = GetPlayerDuration();
-        var position = total > TimeSpan.Zero && ClipPlayer.Position > total
+        var position = total > TimeSpan.Zero && player.Position > total
             ? total
-            : ClipPlayer.Position;
+            : player.Position;
         PlayerTimeText.Text = $"{FormatDuration(position)} / {(total > TimeSpan.Zero ? FormatDuration(total) : "--:--")}";
         if (!_isPlayerSeeking)
         {
@@ -3218,9 +3264,10 @@ public partial class MainWindow : Window
         PlayerSeekSlider.IsEnabled = isEnabled && GetPlayerDuration() > TimeSpan.Zero;
     }
 
-    private TimeSpan GetPlayerDuration() => ClipPlayer.NaturalDuration.HasTimeSpan
-        ? ClipPlayer.NaturalDuration.TimeSpan
-        : _currentClip?.Duration ?? TimeSpan.Zero;
+    private TimeSpan GetPlayerDuration() =>
+        GetAttachedClipPlayer() is { NaturalDuration.HasTimeSpan: true } player
+            ? player.NaturalDuration.TimeSpan
+            : _currentClip?.Duration ?? TimeSpan.Zero;
 
     private void SetSeekUi(TimeSpan position, TimeSpan total)
     {
@@ -3231,7 +3278,7 @@ public partial class MainWindow : Window
             PlayerSeekSlider.Maximum = maximumSeconds;
             PlayerSeekSlider.Value = Math.Clamp(position.TotalSeconds, 0, maximumSeconds);
             PlayerSeekSlider.IsEnabled = _currentClip is not null &&
-                                         ClipPlayer.Source is not null &&
+                                         GetAttachedClipPlayer()?.Source is not null &&
                                          !_captureCriticalPresentationActive &&
                                          total > TimeSpan.Zero;
         }
@@ -3243,7 +3290,7 @@ public partial class MainWindow : Window
 
     private void SeekPlayerTo(TimeSpan requestedPosition, bool updateSlider = true)
     {
-        if (_currentClip is null)
+        if (_currentClip is null || GetAttachedClipPlayer() is not { } player)
         {
             return;
         }
@@ -3255,7 +3302,7 @@ public partial class MainWindow : Window
         }
 
         var target = TimeSpan.FromSeconds(Math.Clamp(requestedPosition.TotalSeconds, 0, total.TotalSeconds));
-        ClipPlayer.Position = target;
+        player.Position = target;
         PlayerTimeText.Text = $"{FormatDuration(target)} / {FormatDuration(total)}";
         if (updateSlider)
         {
@@ -3272,9 +3319,9 @@ public partial class MainWindow : Window
 
         _isPlayerSeeking = true;
         _resumePlayerAfterSeek = _isPlayerPlaying;
-        if (_resumePlayerAfterSeek)
+        if (_resumePlayerAfterSeek && GetAttachedClipPlayer() is { } player)
         {
-            ClipPlayer.Pause();
+            player.Pause();
             _playerTimer.Stop();
         }
 
@@ -3300,9 +3347,9 @@ public partial class MainWindow : Window
 
         SeekPlayerTo(TimeSpan.FromSeconds(PlayerSeekSlider.Value));
         _isPlayerSeeking = false;
-        if (_resumePlayerAfterSeek)
+        if (_resumePlayerAfterSeek && GetAttachedClipPlayer() is { } player)
         {
-            ClipPlayer.Play();
+            player.Play();
             SetPlayerPlaying(true);
         }
         else
@@ -3353,13 +3400,17 @@ public partial class MainWindow : Window
 
     private void ApplyPlayerVolume(double? requestedVolume = null)
     {
-        if (ClipPlayer is null || MutePlayerButton is null)
+        if (MutePlayerButton is null)
         {
             return;
         }
 
         var volume = Math.Clamp(requestedVolume ?? PlayerVolumeSlider.Value / 100, 0, 1);
-        ClipPlayer.Volume = volume;
+        if (GetAttachedClipPlayer() is { } player)
+        {
+            player.Volume = volume;
+        }
+
         _isPlayerMuted = volume <= 0.001;
         if (!_isPlayerMuted)
         {
@@ -3438,9 +3489,9 @@ public partial class MainWindow : Window
         _playWhenOpened = false;
         _isPlayerSeeking = false;
         _resumePlayerAfterSeek = false;
-        if (_isPlayerPlaying)
+        if (_isPlayerPlaying && GetAttachedClipPlayer() is { } player)
         {
-            ClipPlayer.Pause();
+            player.Pause();
         }
 
         SetPlayerPlaying(false);
@@ -3448,19 +3499,26 @@ public partial class MainWindow : Window
 
     private void ReleasePlayerForBackground()
     {
+        _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
         PausePlayerForBackgroundWork();
-        if (_currentClip is null || ClipPlayer.Source is null)
+        var hadOpenSource = GetAttachedClipPlayer()?.Source is not null;
+        ReleaseClipPlayerElement();
+        if (hadOpenSource)
+        {
+            _playerSourceReleasedForBackground = _currentClip is not null;
+        }
+
+        SetPlayerPlaying(false);
+        SetPlayerControlsEnabled(false);
+    }
+
+    private void ReleaseClipPlayerElement()
+    {
+        if (GetAttachedClipPlayer() is not { } previousPlayer)
         {
             return;
         }
 
-        ReplaceClipPlayerElement();
-        _playerSourceReleasedForBackground = true;
-    }
-
-    private void ReplaceClipPlayerElement()
-    {
-        var previousPlayer = ClipPlayer;
         previousPlayer.MouseLeftButtonUp -= ClipPlayer_MouseLeftButtonUp;
         previousPlayer.MediaOpened -= ClipPlayer_MediaOpened;
         previousPlayer.MediaEnded -= ClipPlayer_MediaEnded;
@@ -3469,15 +3527,21 @@ public partial class MainWindow : Window
         previousPlayer.Stop();
         previousPlayer.Close();
         previousPlayer.Source = null;
+        _clipPlayerHostIndex = ClipPlayerHost.Children.IndexOf(previousPlayer);
+        ClipPlayerHost.Children.Remove(previousPlayer);
+        ClipPlayer = null!;
+    }
 
-        if (_isClosing)
+    private MediaElement EnsureClipPlayerElement()
+    {
+        if (GetAttachedClipPlayer() is { } player)
         {
-            return;
+            return player;
         }
 
-        // Each clip owns a fresh WPF media graph. Late events from a closed
-        // source remain attached to the detached element and cannot mutate the
-        // next clip's controls or autoplay state.
+        // Recreate the graph only for an explicit foreground open/play. Keeping
+        // an empty MediaElement loaded while ClipForge is hidden still retains
+        // WPF/Media Foundation/D3D resources that can compete with a game.
         var replacement = new MediaElement
         {
             LoadedBehavior = MediaState.Manual,
@@ -3497,20 +3561,19 @@ public partial class MainWindow : Window
         System.Windows.Automation.AutomationProperties.SetHelpText(
             replacement,
             "Click to play or pause the selected clip");
-
-        var index = ClipPlayerHost.Children.IndexOf(previousPlayer);
-        if (index >= 0)
-        {
-            ClipPlayerHost.Children.RemoveAt(index);
-            ClipPlayerHost.Children.Insert(index, replacement);
-        }
-        else
-        {
-            ClipPlayerHost.Children.Insert(0, replacement);
-        }
-
+        var insertionIndex = Math.Clamp(
+            _clipPlayerHostIndex,
+            0,
+            ClipPlayerHost.Children.Count);
+        ClipPlayerHost.Children.Insert(insertionIndex, replacement);
         ClipPlayer = replacement;
+        return replacement;
     }
+
+    private MediaElement? GetAttachedClipPlayer() =>
+        ClipPlayer is { } player && ClipPlayerHost.Children.Contains(player)
+            ? player
+            : null;
 
     private static string FormatDuration(TimeSpan duration) =>
         duration.TotalHours >= 1
@@ -3535,6 +3598,7 @@ public partial class MainWindow : Window
         e.Cancel = true;
         _isClosing = true;
         _replayStartRequested = false;
+        ReleasePlayerForBackground();
         IsEnabled = false;
         StatusText.Text = "Closing ClipForge…";
         _lifetimeCancellation.Cancel();
@@ -3579,12 +3643,14 @@ public partial class MainWindow : Window
             System.Windows.Application.Current.SessionEnding -= Application_SessionEnding;
             SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
             SystemEvents.PowerModeChanged -= SystemEvents_PowerModeChanged;
+            SystemEvents.SessionSwitch -= SystemEvents_SessionSwitch;
             PreviewKeyDown -= MainWindow_PreviewKeyDown;
             Activated -= MainWindow_Activated;
             Deactivated -= MainWindow_Deactivated;
             _playerTimer.Stop();
             _playerTimer.Tick -= PlayerTimer_Tick;
-            ReplaceClipPlayerElement();
+            _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
+            ReleaseClipPlayerElement();
             if (_overlayWindow is not null)
             {
                 _overlayWindow.Close();

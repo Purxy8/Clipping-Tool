@@ -42,6 +42,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly List<WasapiAudioPipe> _audioPipes = [];
     private readonly List<BufferedSegment> _segments = [];
     private readonly CaptureRecoveryRequestGate _captureRecoveryRequestGate = new();
+    private readonly CaptureRuntimeJournal _runtimeJournal = new();
+    private readonly ScheduledCaptureRefreshCoordinator _scheduledCaptureRefreshCoordinator;
+    private readonly TaskCompletionSource _disposeCompletion = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Task _legacyBufferCleanupTask;
 
     private Process? _captureProcess;
@@ -74,6 +78,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _isStopping;
     private long _recoveryRetryNotBefore;
     private int _recoveryRetryGeneration;
+    private int _disposeStarted;
     private int _disposed;
 
     public ReplayBufferService(
@@ -82,6 +87,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         _ffmpegSetupService = ffmpegSetupService ?? new FfmpegSetupService();
         _bufferRoot = Path.GetFullPath(bufferRoot ?? GetDefaultBufferRoot());
+        _scheduledCaptureRefreshCoordinator = new ScheduledCaptureRefreshCoordinator(
+            RunScheduledCaptureRefreshAsync,
+            (processId, diagnostic, exception) =>
+                EnqueueDiagnostic(
+                    $"Background WGC renewal for process {processId} failed: " +
+                    $"{diagnostic} {exception.GetBaseException().Message}"));
 
         // MainWindow creates this service only after primary single-instance
         // ownership is established, so pre-existing sessions are crash residue.
@@ -381,6 +392,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     configuration,
                     capabilitySelection.Strategy,
                     _sessionCancellation.Token);
+                RecordCaptureRuntimeEvent(
+                    "capture_started",
+                    captureProcess,
+                    configuration,
+                    capabilitySelection.Strategy,
+                    "Initial capture generation is active.");
                 Publish(new ReplayStateSnapshot(
                     ReplayState.Buffering,
                     TimeSpan.Zero,
@@ -684,6 +701,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         configuration,
                         strategy,
                         _sessionCancellation.Token);
+                    RecordCaptureRuntimeEvent(
+                        "capture_renewed",
+                        replacement,
+                        configuration,
+                        strategy,
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"BoundaryAligned={reachedSegmentBoundary}; boundaryWaitMs={boundaryWait.TotalMilliseconds:0}; replacementMs={Stopwatch.GetElapsedTime(replacementStarted).TotalMilliseconds:0}."));
                     EnqueueDiagnostic(
                         string.Create(
                             CultureInfo.InvariantCulture,
@@ -790,16 +815,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
-    internal void RequestScheduledCaptureRefresh(string diagnostic)
+    internal bool RequestScheduledCaptureRefresh(string diagnostic)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(diagnostic);
-        if (IsRunning &&
-            _activeCaptureStrategy?.CaptureBackend ==
-                DesktopCaptureBackend.WindowsGraphicsCapture)
-        {
-            RequestCaptureRecovery(CaptureRecoveryReason.ScheduledRefresh, diagnostic);
-        }
+        return QueueScheduledCaptureRefresh(CaptureProcessId, diagnostic);
     }
+
+    internal Task WaitForScheduledCaptureRefreshIdleAsync() =>
+        _scheduledCaptureRefreshCoordinator.WaitForIdleAsync();
 
     public async Task<string> SaveClipAsync(
         TimeSpan requestedDuration,
@@ -918,32 +941,51 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (Volatile.Read(ref _disposed) != 0)
+        if (Interlocked.CompareExchange(ref _disposeStarted, 1, 0) != 0)
         {
+            await _disposeCompletion.Task.ConfigureAwait(false);
             return;
         }
 
-        await _saveGate.WaitAsync().ConfigureAwait(false);
+        // Reject new public work immediately; the owner below still uses the
+        // internal cleanup path. Concurrent DisposeAsync callers await the same
+        // completion instead of racing semaphore disposal.
+        Volatile.Write(ref _disposed, 1);
         try
         {
-            await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+            // Stop accepting maintenance before waiting for the lifecycle gates.
+            // This cancels a coordinator that is queued behind a long save and lets
+            // an in-flight refresh perform its normal bounded capture cleanup.
+            await _scheduledCaptureRefreshCoordinator.DisposeAsync().ConfigureAwait(false);
+
+            await _saveGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
-                Volatile.Write(ref _disposed, 1);
+                await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    await StopCoreAsync(deleteBuffer: true, publishStopped: false).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _lifecycleGate.Release();
+                }
             }
             finally
             {
-                _lifecycleGate.Release();
+                _saveGate.Release();
             }
-        }
-        finally
-        {
-            _saveGate.Release();
-        }
 
-        _lifecycleGate.Dispose();
-        _saveGate.Dispose();
+            _lifecycleGate.Dispose();
+            _saveGate.Dispose();
+            await _runtimeJournal.DisposeAsync().ConfigureAwait(false);
+            _disposeCompletion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            _disposeCompletion.TrySetException(exception);
+            throw;
+        }
     }
 
     private void CreateAudioPipes(CaptureConfiguration configuration)
@@ -1265,6 +1307,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         Volatile.Write(ref _isRunning, 0);
+        if (hadSession)
+        {
+            RecordCaptureRuntimeEvent(
+                "capture_stopping",
+                _captureProcess,
+                detail: publishStopped ? "Manual or application stop." : "Internal cleanup.");
+        }
 
         var processExited = await StopCaptureResourcesForRefreshAsync(
                 gracefulStopTimeout: TimeSpan.FromSeconds(5))
@@ -1285,6 +1334,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _activeConfiguration = null;
         _activeCaptureStrategy = null;
         _activeFfmpegPath = null;
+        if (hadSession)
+        {
+            RecordCaptureRuntimeEvent(
+                "capture_stopped",
+                detail: "Capture resources released.");
+        }
 
         var oldSegmentDirectory = _segmentDirectory;
         _segmentDirectory = null;
@@ -1320,6 +1375,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         using var healthTimer = new PeriodicTimer(CaptureHealthPollInterval);
         var captureStarted = Stopwatch.GetTimestamp();
         var lastBufferRefresh = Stopwatch.GetTimestamp();
+        var lastRuntimeSample = captureStarted;
         var lastCaptureActivity = captureStarted;
         long lastProgressFrame = -1;
         long lastProgressOutputTime = -1;
@@ -1435,6 +1491,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 RefreshBufferState();
 
+                if (Stopwatch.GetElapsedTime(lastRuntimeSample) >= TimeSpan.FromMinutes(5))
+                {
+                    lastRuntimeSample = Stopwatch.GetTimestamp();
+                    RecordCaptureRuntimeEvent(
+                        "capture_runtime_sample",
+                        process,
+                        configuration,
+                        strategy,
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"uptimeMinutes={Stopwatch.GetElapsedTime(captureStarted).TotalMinutes:0.0}."));
+                }
+
                 var progress = Volatile.Read(ref _latestCaptureProgress);
                 int segmentNumber;
                 long bufferBytes;
@@ -1468,8 +1537,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         strategy.CaptureBackend,
                         captureProcessUptime))
                 {
-                    RequestCaptureRecovery(
-                        CaptureRecoveryReason.ScheduledRefresh,
+                    _ = QueueScheduledCaptureRefresh(
+                        process.Id,
                         string.Create(
                             CultureInfo.InvariantCulture,
                             $"The WGC capture process reached its bounded {CaptureProcessMaximumAge.TotalMinutes:0}-minute lifetime; renewing it prevents long-session frame-pool degradation."));
@@ -1783,6 +1852,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
         CaptureRecoveryReason reason,
         string diagnostic)
     {
+        if (reason == CaptureRecoveryReason.ScheduledRefresh)
+        {
+            // Routine maintenance must never depend on a WPF Dispatcher
+            // subscriber. Health and hang policy remains UI-owned below.
+            _ = QueueScheduledCaptureRefresh(CaptureProcessId, diagnostic);
+            return;
+        }
+
         var retryNotBefore = Volatile.Read(ref _recoveryRetryNotBefore);
         if (Volatile.Read(ref _isStopping) != 0 ||
             retryNotBefore > 0 && Stopwatch.GetTimestamp() < retryNotBefore)
@@ -1843,9 +1920,67 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return;
         }
 
-        RequestCaptureRecovery(
-            CaptureRecoveryReason.ScheduledRefresh,
+        _ = QueueScheduledCaptureRefresh(
+            CaptureProcessId,
             "Running one coalesced WGC refresh that arrived while another recovery request was active.");
+    }
+
+    private bool QueueScheduledCaptureRefresh(
+        int? expectedProcessId,
+        string diagnostic)
+    {
+        var retryNotBefore = Volatile.Read(ref _recoveryRetryNotBefore);
+        if (expectedProcessId is not { } processId ||
+            processId <= 0 ||
+            Volatile.Read(ref _disposed) != 0 ||
+            Volatile.Read(ref _isStopping) != 0 ||
+            retryNotBefore > 0 && Stopwatch.GetTimestamp() < retryNotBefore ||
+            !IsRunning ||
+            _activeCaptureStrategy?.CaptureBackend !=
+                DesktopCaptureBackend.WindowsGraphicsCapture ||
+            CaptureProcessId != processId)
+        {
+            return false;
+        }
+
+        var queued = _scheduledCaptureRefreshCoordinator.TrySchedule(
+            processId,
+            diagnostic);
+        if (queued)
+        {
+            EnqueueDiagnostic(
+                $"Queued service-owned WGC renewal for capture process {processId}: {diagnostic}");
+            RecordCaptureRuntimeEvent(
+                "capture_renewal_queued",
+                _captureProcess,
+                detail: diagnostic);
+        }
+
+        return queued;
+    }
+
+    private async Task RunScheduledCaptureRefreshAsync(
+        int expectedProcessId,
+        string diagnostic,
+        CancellationToken cancellationToken)
+    {
+        RecordCaptureRuntimeEvent(
+            "capture_renewal_started",
+            _captureProcess,
+            detail: diagnostic);
+        var refreshed = await RefreshCaptureAsync(
+                expectedProcessId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!refreshed)
+        {
+            EnqueueDiagnostic(
+                $"Skipped stale service-owned WGC renewal for capture process {expectedProcessId}: {diagnostic}");
+            RecordCaptureRuntimeEvent(
+                "capture_renewal_skipped",
+                _captureProcess,
+                detail: diagnostic);
+        }
     }
 
     private void DeferCaptureRecoveryRetry(int expectedProcessId)
@@ -1879,8 +2014,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
 
             Volatile.Write(ref _recoveryRetryNotBefore, 0);
-            RequestCaptureRecovery(
-                CaptureRecoveryReason.ScheduledRefresh,
+            _ = QueueScheduledCaptureRefresh(
+                expectedProcessId,
                 "Retrying a capture-process renewal after a transient executable or buffer preflight failure.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1909,6 +2044,38 @@ public sealed class ReplayBufferService : IAsyncDisposable
             {
                 _ = _diagnosticLines.Dequeue();
             }
+        }
+    }
+
+    private void RecordCaptureRuntimeEvent(
+        string eventName,
+        Process? process = null,
+        CaptureConfiguration? configuration = null,
+        VideoEncodingStrategy? strategy = null,
+        string? detail = null)
+    {
+        try
+        {
+            configuration ??= _activeConfiguration;
+            strategy ??= _activeCaptureStrategy;
+            CaptureOutputSize? outputSize = configuration is null
+                ? null
+                : CaptureGeometry.ResolveOutputSize(
+                    configuration.Display,
+                    configuration.Resolution);
+            _runtimeJournal.Record(
+                eventName,
+                process,
+                strategy?.CaptureBackend.ToString(),
+                outputSize?.Width,
+                outputSize?.Height,
+                configuration?.FramesPerSecond,
+                configuration?.CaptureCursor,
+                detail);
+        }
+        catch
+        {
+            // Optional local observability must never affect capture or cleanup.
         }
     }
 
@@ -2590,4 +2757,125 @@ public sealed class ReplayBufferService : IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
     private readonly record struct BufferedSegment(string Path, long Length);
+}
+
+/// <summary>
+/// Owns one scheduled capture-maintenance operation on the thread pool. The
+/// service supplies the PID-checked refresh callback; this coordinator only
+/// provides non-overlap, dispatcher independence, and bounded shutdown.
+/// </summary>
+internal sealed class ScheduledCaptureRefreshCoordinator : IAsyncDisposable
+{
+    private readonly object _sync = new();
+    private readonly Func<int, string, CancellationToken, Task> _refreshAsync;
+    private readonly Action<int, string, Exception>? _failureHandler;
+    private readonly CancellationTokenSource _shutdown = new();
+    private Task _worker = Task.CompletedTask;
+    private bool _sealed;
+
+    public ScheduledCaptureRefreshCoordinator(
+        Func<int, string, CancellationToken, Task> refreshAsync,
+        Action<int, string, Exception>? failureHandler = null)
+    {
+        _refreshAsync = refreshAsync ?? throw new ArgumentNullException(nameof(refreshAsync));
+        _failureHandler = failureHandler;
+    }
+
+    internal bool IsActive
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return !_worker.IsCompleted;
+            }
+        }
+    }
+
+    public bool TrySchedule(int expectedProcessId, string diagnostic)
+    {
+        if (expectedProcessId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedProcessId));
+        }
+
+        ArgumentException.ThrowIfNullOrWhiteSpace(diagnostic);
+        lock (_sync)
+        {
+            if (_sealed || !_worker.IsCompleted)
+            {
+                return false;
+            }
+
+            var cancellationToken = _shutdown.Token;
+            _worker = Task.Run(
+                () => RunWorkerAsync(
+                    expectedProcessId,
+                    diagnostic,
+                    cancellationToken),
+                CancellationToken.None);
+            return true;
+        }
+    }
+
+    internal Task WaitForIdleAsync()
+    {
+        lock (_sync)
+        {
+            return _worker;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Task worker;
+        var cancel = false;
+        lock (_sync)
+        {
+            if (!_sealed)
+            {
+                _sealed = true;
+                cancel = true;
+            }
+
+            worker = _worker;
+        }
+
+        if (!cancel)
+        {
+            await worker.ConfigureAwait(false);
+            return;
+        }
+
+        _shutdown.Cancel();
+        await worker.ConfigureAwait(false);
+        _shutdown.Dispose();
+    }
+
+    private async Task RunWorkerAsync(
+        int expectedProcessId,
+        string diagnostic,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _refreshAsync(expectedProcessId, diagnostic, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Disposal cancels a queued save-gate wait or an in-flight refresh.
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                _failureHandler?.Invoke(expectedProcessId, diagnostic, exception);
+            }
+            catch
+            {
+                // Diagnostics must not fault the maintenance coordinator.
+            }
+        }
+    }
 }

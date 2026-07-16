@@ -6,7 +6,8 @@ namespace ClipForge.Capture;
 internal static class FfmpegArgumentBuilder
 {
     internal const int SegmentSeconds = 2;
-    internal const int VideoInputQueuePackets = 8;
+    internal const int VideoInputQueuePackets = 2;
+    internal const int CompatibilityVideoInputQueuePackets = 8;
     internal const int AudioInputQueuePackets = 64;
 
     public static IReadOnlyList<string> BuildCaptureArguments(
@@ -56,6 +57,18 @@ internal static class FfmpegArgumentBuilder
             "-stats_period", "1",
             "-progress", "pipe:1"
         };
+
+        if (UsesDirectWindowsGraphicsHardwarePath(encodingStrategy))
+        {
+            // gfxcapture already owns a two-frame D3D11 pool. Keep FFmpeg's
+            // simple and complex filter executors single-threaded so a live
+            // hardware capture cannot create extra worker pools that compete
+            // with the foreground game and DWM for long-running sessions.
+            arguments.AddRange([
+                "-filter_threads", "1",
+                "-filter_complex_threads", "1"
+            ]);
+        }
 
         AddVideoInput(arguments, configuration, encodingStrategy);
 
@@ -386,13 +399,13 @@ internal static class FfmpegArgumentBuilder
         VideoEncodingStrategy encodingStrategy)
     {
         var display = configuration.Display;
-        arguments.AddRange([
-            "-thread_queue_size", Invariant(VideoInputQueuePackets)
-        ]);
 
         if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
         {
             arguments.AddRange([
+                // Match gfxcapture's bounded two-frame D3D11 pool instead of
+                // retaining eight full-size BGRA surfaces under GPU pressure.
+                "-thread_queue_size", Invariant(VideoInputQueuePackets),
                 "-f", "lavfi",
                 "-i", BuildGraphicsCaptureFilter(configuration, encodingStrategy)
             ]);
@@ -400,8 +413,9 @@ internal static class FfmpegArgumentBuilder
         }
 
         arguments.AddRange([
+            "-thread_queue_size", Invariant(CompatibilityVideoInputQueuePackets),
             "-f", "gdigrab",
-            "-draw_mouse", "1",
+            "-draw_mouse", configuration.CaptureCursor ? "1" : "0",
             "-framerate", Invariant(configuration.FramesPerSecond),
             "-offset_x", Invariant(display.Left),
             "-offset_y", Invariant(display.Top),
@@ -418,7 +432,8 @@ internal static class FfmpegArgumentBuilder
             configuration.Display,
             configuration.Resolution);
         var filter = $"gfxcapture=monitor_idx={configuration.Display.MonitorIndex}" +
-                     $":capture_cursor=1:max_framerate={Invariant(configuration.FramesPerSecond)}" +
+                     $":capture_cursor={(configuration.CaptureCursor ? "1" : "0")}" +
+                     $":max_framerate={Invariant(configuration.FramesPerSecond)}" +
                      ":output_fmt=bgra";
 
         if (output.RequiresScaling)
@@ -456,6 +471,12 @@ internal static class FfmpegArgumentBuilder
             _ => filter + ",hwdownload,format=bgra"
         };
     }
+
+    private static bool UsesDirectWindowsGraphicsHardwarePath(
+        VideoEncodingStrategy encodingStrategy) =>
+        encodingStrategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+        encodingStrategy.IsHardwareEncoder &&
+        !encodingStrategy.RequiresSystemMemoryTransfer;
 
     private static void AddEncoderArguments(
         List<string> arguments,

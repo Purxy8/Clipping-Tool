@@ -139,6 +139,7 @@ Local data is kept in these locations:
 | Optional Windows autostart entry | The signed-in user's Windows Startup folder; present only while **Start ClipForge and replay with Windows** is enabled |
 | Private FFmpeg install | `%LOCALAPPDATA%\ClipForge\Tools\FFmpeg` |
 | Rolling replay segments | `%LOCALAPPDATA%\ClipForge\Buffer\WindowsSession-<id>` in a per-capture folder removed when replay stops normally |
+| Bounded local capture diagnostics | `%LOCALAPPDATA%\ClipForge\Diagnostics`; two rotating JSONL files with lifecycle/resource counters only, never capture media, paths, device names, or user input |
 
 Choosing a cloud-synced save folder, such as a OneDrive folder, can cause the operating system or another application to upload saved clips; ClipForge itself does not do so. A forced shutdown can leave temporary files behind; ClipForge removes stale session folders on a later launch. Avoid selecting a replay length larger than the available disk space.
 

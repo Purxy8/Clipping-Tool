@@ -297,6 +297,15 @@
                                     <TextBlock Margin="0,12,0,6" Style="{StaticResource FieldLabelStyle}" Text="RESOLUTION" />
                                     <ComboBox x:Name="ResolutionComboBox" SelectionChanged="ResolutionComboBox_SelectionChanged" />
 
+                                    <CheckBox x:Name="CaptureCursorCheckBox" Margin="0,12,0,0"
+                                              Content="Include mouse cursor in clips"
+                                              Checked="CaptureCursorCheckBox_Changed"
+                                              Unchecked="CaptureCursorCheckBox_Changed"
+                                              Style="{StaticResource ToggleCheckBoxStyle}" />
+                                    <TextBlock Margin="0,5,0,0" Style="{StaticResource MutedTextStyle}"
+                                               TextWrapping="Wrap"
+                                               Text="Off by default so games keep the lowest-impact hardware cursor path." />
+
                                     <Border Margin="0,12,0,0" Padding="10,8" Background="{StaticResource SurfaceTranslucentBrush}" CornerRadius="8">
                                         <StackPanel>
                                             <TextBlock x:Name="EncoderStatusText" FontSize="12" FontWeight="SemiBold"
