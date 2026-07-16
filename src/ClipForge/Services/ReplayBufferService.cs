@@ -19,6 +19,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private const int MaximumLegacyCleanupFilesPerDirectory = 10_000;
     private static readonly TimeSpan CaptureHealthPollInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan BufferRefreshInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan CapturePriorityRefreshInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan CaptureBoundaryWaitTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan CaptureRefreshGracefulStopTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CaptureCleanupTimeout = TimeSpan.FromSeconds(2);
@@ -78,6 +79,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _isStopping;
     private long _recoveryRetryNotBefore;
     private int _recoveryRetryGeneration;
+    private int _capturePriorityRefreshWarningReported;
     private int _disposeStarted;
     private int _disposed;
 
@@ -386,6 +388,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     throw new InvalidOperationException(BuildCaptureFailureMessage());
                 }
 
+                // gfxcapture creates its D3D11/WGC graph asynchronously after
+                // Process.Start. Runtime validation observed the process back at
+                // Normal GPU scheduling after that graph initialized even though
+                // the early policy call succeeded. Reapply here so the observed
+                // live capture contexts use the intended class.
+                if (!ProcessTuning.TryApplyCapturePriority(
+                        captureProcess,
+                        capabilitySelection.Strategy))
+                {
+                    EnqueueDiagnostic(
+                        "Windows did not allow ClipForge to finalize the live capture priority policy.");
+                }
+
                 Volatile.Write(ref _isStopping, 0);
                 _monitorTask = MonitorCaptureAsync(
                     captureProcess,
@@ -690,6 +705,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     if (replacement.HasExited)
                     {
                         throw new InvalidOperationException(BuildCaptureFailureMessage());
+                    }
+
+                    if (!ProcessTuning.TryApplyCapturePriority(replacement, strategy))
+                    {
+                        EnqueueDiagnostic(
+                            "Windows did not allow ClipForge to finalize the renewed capture priority policy.");
                     }
 
                     Volatile.Write(ref _recoveryRetryNotBefore, 0);
@@ -1376,6 +1397,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var captureStarted = Stopwatch.GetTimestamp();
         var lastBufferRefresh = Stopwatch.GetTimestamp();
         var lastRuntimeSample = captureStarted;
+        var lastPriorityRefresh = captureStarted;
         var lastCaptureActivity = captureStarted;
         long lastProgressFrame = -1;
         long lastProgressOutputTime = -1;
@@ -1490,6 +1512,26 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 RefreshBufferState();
+
+                if (Stopwatch.GetElapsedTime(lastPriorityRefresh) >=
+                    CapturePriorityRefreshInterval)
+                {
+                    lastPriorityRefresh = Stopwatch.GetTimestamp();
+                    if (!ProcessTuning.TryEnsureCapturePriority(process, strategy))
+                    {
+                        if (Interlocked.Exchange(
+                                ref _capturePriorityRefreshWarningReported,
+                                1) == 0)
+                        {
+                            EnqueueDiagnostic(
+                                "Windows did not allow ClipForge to refresh the live capture priority policy.");
+                        }
+                    }
+                    else
+                    {
+                        Volatile.Write(ref _capturePriorityRefreshWarningReported, 0);
+                    }
+                }
 
                 if (Stopwatch.GetElapsedTime(lastRuntimeSample) >= TimeSpan.FromMinutes(5))
                 {

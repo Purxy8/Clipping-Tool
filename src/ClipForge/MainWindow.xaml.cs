@@ -700,6 +700,10 @@ public partial class MainWindow : Window
         SetCaptureCriticalPresentationState(isActive: true);
         try
         {
+            // Cancellation is cooperative: wait until both gallery refresh pipelines
+            // have actually unwound before starting capture. This prevents a late
+            // ffprobe/thumbnail helper from overlapping the first replay frames.
+            await WaitForAutomaticLibraryWorkIdleAsync(_lifetimeCancellation.Token);
             _replayStartRequested = true;
             if (sessionStrategyOverride is null && !sourceSafetyMode)
             {
@@ -1581,6 +1585,15 @@ public partial class MainWindow : Window
         var wasReplaySession = IsReplaySessionState(_latestState);
         var isReplaySession = IsReplaySessionState(snapshot);
         _latestState = snapshot;
+        if (isReplaySession)
+        {
+            // Buffering and Ready are long-lived capture states, not a signal to
+            // resume presentation helpers. Keep the cached gallery on screen and
+            // defer all automatic discovery until replay has fully stopped.
+            _libraryRefreshPending = true;
+            CancelActiveLibraryRefreshForBackground();
+        }
+
         if (isReplaySession && !wasReplaySession)
         {
             // Desktop loopback would otherwise record ClipForge's own preview
@@ -1603,8 +1616,8 @@ public partial class MainWindow : Window
         if (!suspendPresentation)
         {
             // On the way back to Ready/Stopped, update the replay policy first;
-            // the resumed refresh then immediately selects the correct cached
-            // or full thumbnail mode instead of starting twice.
+            // Ready keeps automatic library work deferred, while Stopped can
+            // safely resume the queued full refresh exactly once.
             SetCaptureCriticalPresentationState(isActive: false);
         }
         if (IsVisible && IsActive)
@@ -1634,10 +1647,46 @@ public partial class MainWindow : Window
     internal static bool IsCapturePresentationSuspendedState(ReplayStateSnapshot snapshot) =>
         snapshot.State is ReplayState.Starting or ReplayState.Saving or ReplayState.Stopping;
 
+    internal static bool ShouldSuppressAutomaticLibraryWork(
+        bool captureCritical,
+        bool replayServiceRunning,
+        ReplayStateSnapshot snapshot) =>
+        captureCritical || replayServiceRunning || IsReplaySessionState(snapshot);
+
+    private bool IsAutomaticLibraryWorkSuppressed =>
+        ShouldSuppressAutomaticLibraryWork(
+            _captureCriticalPresentationActive,
+            _replayBufferService.IsRunning,
+            _latestState);
+
+    private async Task WaitForAutomaticLibraryWorkIdleAsync(CancellationToken cancellationToken)
+    {
+        await _libraryRefreshGate.WaitAsync(cancellationToken);
+        _libraryRefreshGate.Release();
+
+        if (_libraryWindow is { } libraryWindow)
+        {
+            await libraryWindow.WaitForAutomaticRefreshIdleAsync(cancellationToken);
+        }
+    }
+
     private void SetCaptureCriticalPresentationState(bool isActive)
     {
         if (_captureCriticalPresentationActive == isActive)
         {
+            if (!isActive &&
+                !_isClosing &&
+                IsVisible &&
+                IsActive &&
+                !IsAutomaticLibraryWorkSuppressed &&
+                (_libraryRefreshPending || _pendingLibraryPreferredPath is not null))
+            {
+                // A capture process can fault directly from Ready without first
+                // publishing a presentation-suspended state. Resume the queued
+                // full refresh when that session ends as well.
+                _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
+            }
+
             return;
         }
 
@@ -1656,6 +1705,18 @@ public partial class MainWindow : Window
 
         if (_isClosing || !IsVisible || !IsActive)
         {
+            return;
+        }
+
+        if (IsAutomaticLibraryWorkSuppressed)
+        {
+            if (_playerSourceReleasedForBackground && _currentClip is { } cachedClip)
+            {
+                // Restoring cached presentation state does not open a decoder or
+                // launch a media helper during replay.
+                SelectClip(cachedClip, autoplay: false);
+            }
+
             return;
         }
 
@@ -1946,6 +2007,21 @@ public partial class MainWindow : Window
             else
             {
                 LastSavedPanel.Visibility = Visibility.Collapsed;
+            }
+
+            if (IsReplaySessionState(_latestState) &&
+                ClipLibraryService.TryCreateKnownOutputItem(
+                    _settings.SaveDirectory,
+                    path,
+                    knownDuration: null,
+                    out var savedClip) &&
+                savedClip is not null)
+            {
+                // SaveClipAsync returned this exact identity-bound output. Add it
+                // to the in-memory views without folder discovery, FFprobe or a
+                // thumbnail helper while replay remains active.
+                UpsertKnownReplayClip(savedClip, selectClip: true, notifyLibrary: true);
+                return;
             }
 
             if (IsVisible && IsActive && !_captureCriticalPresentationActive)
@@ -2605,13 +2681,135 @@ public partial class MainWindow : Window
             IsReplaySessionState(_latestState) || _replayBufferService.IsRunning,
             preferredClip,
             beginTrim,
-            presentationSuspended: _captureCriticalPresentationActive)
+            presentationSuspended: _captureCriticalPresentationActive,
+            initialCachedClips: GetCachedLibrarySeed(preferredClip),
+            cachedClipUpserted: clip =>
+                UpsertKnownReplayClip(clip, selectClip: false, notifyLibrary: false),
+            cachedClipRemoved: clip =>
+                RemoveKnownReplayClip(clip, notifyLibrary: false))
         {
             Owner = this
         };
         _libraryWindow = libraryWindow;
         libraryWindow.Closed += LibraryWindow_Closed;
         libraryWindow.Show();
+    }
+
+    private IReadOnlyList<ClipLibraryItem> GetCachedLibrarySeed(ClipLibraryItem? preferredClip)
+    {
+        var clips = RecentClipsItemsControl.Items
+            .OfType<ClipLibraryItem>()
+            .ToList();
+        if (preferredClip is not null &&
+            clips.All(clip => !clip.FullPath.Equals(
+                preferredClip.FullPath,
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            clips.Insert(0, preferredClip);
+        }
+
+        return clips;
+    }
+
+    private void UpsertKnownReplayClip(
+        ClipLibraryItem clip,
+        bool selectClip,
+        bool notifyLibrary)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        var cached = RecentClipsItemsControl.Items
+            .OfType<ClipLibraryItem>()
+            .ToArray();
+        var previous = cached.FirstOrDefault(item => item.FullPath.Equals(
+            clip.FullPath,
+            StringComparison.OrdinalIgnoreCase));
+        var mergedClip = clip with
+        {
+            Duration = clip.Duration ?? previous?.Duration,
+            ThumbnailPath = clip.ThumbnailPath ?? previous?.ThumbnailPath
+        };
+        var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
+        var merged = cached
+            .Where(item => !item.FullPath.Equals(
+                mergedClip.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+            .Append(mergedClip)
+            .OrderByDescending(item => item.RecordedAtUtc)
+            .ThenBy(item => item.FileName, StringComparer.OrdinalIgnoreCase)
+            .Take(requestedCount)
+            .ToArray();
+        RecentClipsItemsControl.ItemsSource = merged;
+        UpdateRecentGalleryCardWidth();
+        _libraryRefreshPending = true;
+        _pendingLibraryPreferredPath = mergedClip.FullPath;
+
+        if (selectClip)
+        {
+            SelectClip(mergedClip, autoplay: false);
+        }
+
+        if (notifyLibrary)
+        {
+            _libraryWindow?.UpsertKnownReplayClip(
+                mergedClip,
+                selectClip: false,
+                openForExplicitAction: false);
+        }
+    }
+
+    private void RemoveKnownReplayClip(
+        ClipLibraryItem clip,
+        bool notifyLibrary,
+        bool removedWasCurrent = false)
+    {
+        ArgumentNullException.ThrowIfNull(clip);
+        var removedCurrent = removedWasCurrent || _currentClip?.FullPath.Equals(
+            clip.FullPath,
+            StringComparison.OrdinalIgnoreCase) == true;
+        var remaining = RecentClipsItemsControl.Items
+            .OfType<ClipLibraryItem>()
+            .Where(item => !item.FullPath.Equals(
+                clip.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        RecentClipsItemsControl.ItemsSource = remaining;
+        UpdateRecentGalleryCardWidth();
+        _libraryRefreshPending = true;
+        if (string.Equals(
+                _pendingLibraryPreferredPath,
+                clip.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingLibraryPreferredPath = null;
+        }
+
+        if (removedCurrent)
+        {
+            if (remaining.FirstOrDefault() is { } nextClip)
+            {
+                if (_libraryWindow is not null)
+                {
+                    // Library owns the only foreground decoder until it closes.
+                    // Keep Main's replacement selection identity-bound and
+                    // poster-only so a Library delete cannot leave two media
+                    // graphs competing with capture for GPU/compositor time.
+                    SelectClipWithoutOpening(nextClip);
+                }
+                else
+                {
+                    SelectClip(nextClip, autoplay: false);
+                }
+            }
+            else
+            {
+                ClearPlayer();
+            }
+        }
+
+        if (notifyLibrary)
+        {
+            _libraryWindow?.RemoveKnownReplayClip(clip);
+        }
     }
 
     private void LibraryWindow_Closed(object? sender, EventArgs e)
@@ -2625,6 +2823,16 @@ public partial class MainWindow : Window
         if (ReferenceEquals(_libraryWindow, libraryWindow))
         {
             _libraryWindow = null;
+        }
+
+        if (IsAutomaticLibraryWorkSuppressed &&
+            _playerSourceReleasedForBackground &&
+            _currentClip is { } replayClip)
+        {
+            // Automatic discovery remains suppressed during replay, so restore
+            // the cached controls explicitly. SelectClip's replay branch stays
+            // poster-only and creates no decoder until the user presses Play.
+            SelectClip(replayClip, autoplay: false);
         }
 
         // Refresh even when no in-app delete occurred so recordings saved while
@@ -2715,9 +2923,10 @@ public partial class MainWindow : Window
         var result = ClipLibraryService.DeleteCurrentClip(_settings.SaveDirectory, clip);
         if (result == ClipDeletionResult.Deleted)
         {
-            // Release gallery image bindings before removing the cached JPEG so
-            // a decoded thumbnail cannot keep the privacy-sensitive file open.
-            RecentClipsItemsControl.ItemsSource = null;
+            RemoveKnownReplayClip(
+                clip,
+                notifyLibrary: true,
+                removedWasCurrent: deletingCurrentClip);
             _clipLibraryService.RemoveCachedThumbnail(clip);
 
             if (string.Equals(_lastSavedPath, clip.FullPath, StringComparison.OrdinalIgnoreCase))
@@ -2728,6 +2937,11 @@ public partial class MainWindow : Window
 
             await RefreshClipLibraryAsync();
             return;
+        }
+
+        if (deletingCurrentClip && IsAutomaticLibraryWorkSuppressed)
+        {
+            SelectClip(clip, autoplay: false);
         }
 
         await RefreshClipLibraryAsync();
@@ -2751,7 +2965,7 @@ public partial class MainWindow : Window
             _pendingLibraryPreferredPath = preferredPath;
         }
 
-        if (_captureCriticalPresentationActive)
+        if (IsAutomaticLibraryWorkSuppressed)
         {
             _libraryRefreshPending = true;
             return;
@@ -2779,17 +2993,21 @@ public partial class MainWindow : Window
         {
             await _libraryRefreshGate.WaitAsync(refreshCancellation.Token);
             gateEntered = true;
+            if (IsAutomaticLibraryWorkSuppressed)
+            {
+                _libraryRefreshPending = true;
+                return;
+            }
+
             var snapshot = await _clipLibraryService.LoadAsync(
                 _settings.SaveDirectory,
                 count: requestedCount,
                 includeThumbnails: true,
-                thumbnailPolicy: IsReplaySessionState(_latestState)
-                    ? ClipThumbnailPolicy.CachedOnly
-                    : ClipThumbnailPolicy.GenerateMissing,
+                thumbnailPolicy: ClipThumbnailPolicy.GenerateMissing,
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
-            if (_captureCriticalPresentationActive || !IsVisible || !IsActive)
+            if (IsAutomaticLibraryWorkSuppressed || !IsVisible || !IsActive)
             {
                 _libraryRefreshPending = true;
                 return;
@@ -2835,37 +3053,6 @@ public partial class MainWindow : Window
                 _pendingLibraryPreferredPath = null;
             }
 
-            if (IsReplaySessionState(_latestState) &&
-                snapshot.Clips.Any(clip => clip.ThumbnailPath is null))
-            {
-                // Paint the cached snapshot first, then fill only the bounded
-                // recent strip while ClipForge remains foreground. Extraction
-                // is serialized, single-threaded and Idle priority, and this
-                // refresh token is cancelled as soon as the game regains focus
-                // or capture enters a critical transition.
-                var hydratedClips = await _clipLibraryService.HydrateThumbnailsAsync(
-                    _settings.SaveDirectory,
-                    snapshot.Clips,
-                    maximumMissingThumbnails: requestedCount,
-                    refreshCancellation.Token);
-
-                refreshCancellation.Token.ThrowIfCancellationRequested();
-                if (_captureCriticalPresentationActive || !IsVisible || !IsActive)
-                {
-                    _libraryRefreshPending = true;
-                    return;
-                }
-
-                RecentClipsItemsControl.ItemsSource = hydratedClips;
-                if (_currentClip is { } currentClip &&
-                    hydratedClips.FirstOrDefault(clip => clip.FullPath.Equals(
-                        currentClip.FullPath,
-                        StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrentClip)
-                {
-                    _currentClip = hydratedCurrentClip;
-                    ClipPlayerPosterImage.DataContext = hydratedCurrentClip;
-                }
-            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -2875,7 +3062,7 @@ public partial class MainWindow : Window
         {
             if (IsVisible &&
                 IsActive &&
-                !_captureCriticalPresentationActive &&
+                !IsAutomaticLibraryWorkSuppressed &&
                 _playerSourceReleasedForBackground &&
                 _currentClip is { } releasedClip)
             {
@@ -2903,6 +3090,32 @@ public partial class MainWindow : Window
 
             refreshCancellation.Dispose();
         }
+    }
+
+    private void SelectClipWithoutOpening(ClipLibraryItem clip)
+    {
+        if (!ClipLibraryService.IsCurrentClipSafe(_settings.SaveDirectory, clip))
+        {
+            ClearPlayer();
+            return;
+        }
+
+        ReleaseClipPlayerElement();
+        ClipPlayerPosterImage.DataContext = clip;
+        _currentClip = clip;
+        _playerSourceReleasedForBackground = true;
+        _playWhenOpened = false;
+        SetPlayerPlaying(false);
+        LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
+        PlayerEmptyState.Visibility = Visibility.Collapsed;
+        PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+        OpenCurrentClipButton.IsEnabled = true;
+        TrimCurrentClipButton.IsEnabled = false;
+        SetPlayerControlsEnabled(false);
+        SetSeekUi(TimeSpan.Zero, clip.Duration ?? TimeSpan.Zero);
+        PlayerTimeText.Text = clip.Duration is { } duration
+            ? $"0:00 / {FormatDuration(duration)}"
+            : "0:00 / --:--";
     }
 
     private void SelectClip(ClipLibraryItem clip, bool autoplay)

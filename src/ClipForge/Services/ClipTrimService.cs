@@ -360,12 +360,17 @@ public sealed class ClipTrimService
                     pinnedSource,
                     stagingPath,
                     out var validatedStagingPath,
-                    out _))
+                    out _,
+                    out var initialValidationDiagnostic))
             {
                 return new ClipTrimResult(
                     ClipTrimStatus.OutputValidationFailed,
                     null,
-                    "The media engine produced an unsafe or empty output file.");
+                    "The media engine produced an unsafe or empty output file.")
+                {
+                    Diagnostic = $"{initialValidationDiagnostic}; " +
+                                 SanitizeDiagnostic(execution.StandardError)
+                };
             }
 
             var outputMetadata = await ProbeMediaAsync(
@@ -398,12 +403,16 @@ public sealed class ClipTrimService
                     pinnedSource,
                     validatedStagingPath,
                     out validatedStagingPath,
-                    out _))
+                    out _,
+                    out var finalValidationDiagnostic))
             {
                 return new ClipTrimResult(
                     ClipTrimStatus.OutputValidationFailed,
                     null,
-                    "The generated MP4 changed before it could be saved.");
+                    "The generated MP4 changed before it could be saved.")
+                {
+                    Diagnostic = finalValidationDiagnostic.ToString()
+                };
             }
 
             var committedPath = CommitStagingFile(
@@ -980,4 +989,6 @@ public sealed record ClipTrimResult(
     string Message)
 {
     public bool Succeeded => Status == ClipTrimStatus.Succeeded && OutputPath is not null;
+
+    internal string? Diagnostic { get; init; }
 }

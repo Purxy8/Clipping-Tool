@@ -222,11 +222,17 @@ try
         Console.WriteLine($"Capture strategy: {replay.ActiveEncoderDescription ?? "unknown"}");
         var performance = await ReadPerformanceSampleAsync(replay, timeout.Token)
             ?? throw new InvalidDataException("Capture process metrics were unavailable during the smoke test.");
-        if (performance.Priority is not (ProcessPriorityClass.BelowNormal or ProcessPriorityClass.Normal))
+        if (performance.Priority != ProcessPriorityClass.BelowNormal)
         {
             throw new InvalidDataException(
-                $"Capture priority was {performance.Priority}; expected Normal for direct hardware capture " +
-                "or BelowNormal for a fallback path.");
+                $"Capture CPU priority was {performance.Priority}; expected BelowNormal for every path.");
+        }
+
+        if (performance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+        {
+            throw new InvalidDataException(
+                $"Capture GPU priority was {performance.GraphicsPriority?.ToString() ?? "unavailable"}; " +
+                "expected BelowNormal.");
         }
 
         if (forceGdi && performance.Priority != ProcessPriorityClass.BelowNormal)
@@ -250,8 +256,74 @@ try
         Console.WriteLine(
             $"Capture performance (5s diagnostic): CPU {performance.NormalizedCpuPercent:0.0}% normalized, " +
             $"working set {performance.WorkingSetBytes / (1024d * 1024d):0.0} MB, " +
-            $"priority {performance.Priority}, encoder {replay.ActiveEncoderDescription ?? "unknown"}");
+            $"CPU priority {performance.Priority}, GPU priority {performance.GraphicsPriority}, " +
+            $"encoder {replay.ActiveEncoderDescription ?? "unknown"}");
         await buffered.Task.WaitAsync(TimeSpan.FromSeconds(30), timeout.Token);
+        if (args.Contains("--priority-repair", StringComparer.OrdinalIgnoreCase))
+        {
+            var captureProcessId = replay.CaptureProcessId
+                ?? throw new InvalidDataException(
+                    "The capture process id was unavailable for the priority-repair test.");
+            using (var captureProcess = Process.GetProcessById(captureProcessId))
+            {
+                captureProcess.PriorityClass = ProcessPriorityClass.Normal;
+                if (!ProcessTuning.TryApplyGraphicsPriority(
+                        captureProcess,
+                        GraphicsSchedulingPriorityClass.Normal) ||
+                    !ProcessTuning.TryReadGraphicsPriority(
+                        captureProcess,
+                        out var driftedGraphicsPriority) ||
+                    driftedGraphicsPriority != GraphicsSchedulingPriorityClass.Normal)
+                {
+                    throw new InvalidDataException(
+                        "The priority-repair smoke could not create a controlled GPU-priority drift.");
+                }
+            }
+
+            Console.WriteLine(
+                "Injected a controlled Normal CPU/GPU priority drift; waiting for the 30s repair policy.");
+            await Task.Delay(TimeSpan.FromSeconds(32), timeout.Token);
+            var repairedPerformance = await ReadPerformanceSampleAsync(replay, timeout.Token)
+                ?? throw new InvalidDataException(
+                    "Capture process metrics were unavailable after the priority-repair interval.");
+            if (repairedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
+                repairedPerformance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+            {
+                throw new InvalidDataException(
+                    $"Capture priority repair failed: CPU {repairedPerformance.Priority}, " +
+                    $"GPU {repairedPerformance.GraphicsPriority?.ToString() ?? "unavailable"}.");
+            }
+
+            Console.WriteLine(
+                $"Capture priority repair passed: CPU {repairedPerformance.Priority}, " +
+                $"GPU {repairedPerformance.GraphicsPriority}.");
+        }
+
+        if (int.TryParse(
+                GetOption(args, "--hold-seconds"),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var holdSeconds) && holdSeconds > 0)
+        {
+            holdSeconds = Math.Clamp(holdSeconds, 1, 300);
+            Console.WriteLine($"Holding live replay for {holdSeconds}s before the sustained-priority check.");
+            await Task.Delay(TimeSpan.FromSeconds(holdSeconds), timeout.Token);
+            var sustainedPerformance = await ReadPerformanceSampleAsync(replay, timeout.Token)
+                ?? throw new InvalidDataException(
+                    "Capture process metrics were unavailable after the live replay hold.");
+            if (sustainedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
+                sustainedPerformance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+            {
+                throw new InvalidDataException(
+                    $"Sustained capture priority drifted to CPU {sustainedPerformance.Priority}, " +
+                    $"GPU {sustainedPerformance.GraphicsPriority?.ToString() ?? "unavailable"}.");
+            }
+
+            Console.WriteLine(
+                $"Sustained capture priority: CPU {sustainedPerformance.Priority}, " +
+                $"GPU {sustainedPerformance.GraphicsPriority}.");
+        }
+
         if (verifyRenewal)
         {
             for (var renewalIndex = 1; renewalIndex <= renewalCount; renewalIndex++)
@@ -308,6 +380,20 @@ try
                 {
                     throw new InvalidDataException(
                         $"WGC renewal {renewalIndex} did not replace the FFmpeg process.");
+                }
+
+                using (var replacementProcess = Process.GetProcessById(replacementProcessId))
+                {
+                    if (replacementProcess.PriorityClass != ProcessPriorityClass.BelowNormal ||
+                        !ProcessTuning.TryReadGraphicsPriority(
+                            replacementProcess,
+                            out var replacementGraphicsPriority) ||
+                        replacementGraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+                    {
+                        throw new InvalidDataException(
+                            $"Replacement process {replacementProcessId} did not inherit the " +
+                            "BelowNormal CPU/GPU capture policy.");
+                    }
                 }
 
                 var immediatelyAfterRenewal = ReadSegmentSnapshots(bufferDirectory);
@@ -1604,7 +1690,9 @@ static async Task RunTrimSmokeAsync(
         .ConfigureAwait(false);
     if (!trim.Succeeded || trim.OutputPath is null || !File.Exists(trim.OutputPath))
     {
-        throw new InvalidDataException($"Real trim export failed ({trim.Status}): {trim.Message}");
+        throw new InvalidDataException(
+            $"Real trim export failed ({trim.Status}): {trim.Message} " +
+            $"Diagnostic: {trim.Diagnostic ?? "unavailable"}");
     }
 
     var outputPath = Path.GetFullPath(trim.OutputPath);
@@ -1761,10 +1849,16 @@ static async Task<CapturePerformanceSample?> ReadPerformanceSampleAsync(
         var cpuSeconds = (process.TotalProcessorTime - initialCpu).TotalSeconds;
         var normalizedCpuPercent = cpuSeconds / wallSeconds /
                                    Math.Max(1, Environment.ProcessorCount) * 100;
+        GraphicsSchedulingPriorityClass? graphicsPriority = ProcessTuning.TryReadGraphicsPriority(
+            process,
+            out var observedGraphicsPriority)
+            ? observedGraphicsPriority
+            : null;
         return new CapturePerformanceSample(
             normalizedCpuPercent,
             process.WorkingSet64,
-            process.PriorityClass);
+            process.PriorityClass,
+            graphicsPriority);
     }
     catch (Exception exception) when (
         exception is InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception)
@@ -2142,7 +2236,8 @@ static async Task<double> ReadDurationAsync(
 internal sealed record CapturePerformanceSample(
     double NormalizedCpuPercent,
     long WorkingSetBytes,
-    ProcessPriorityClass Priority);
+    ProcessPriorityClass Priority,
+    GraphicsSchedulingPriorityClass? GraphicsPriority);
 
 internal sealed record SegmentSnapshot(
     int Id,
