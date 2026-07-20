@@ -7,6 +7,7 @@ internal static class FfmpegArgumentBuilder
 {
     internal const int SegmentSeconds = 2;
     internal const int VideoInputQueuePackets = 2;
+    internal const int ScaledVideoInputQueuePackets = 4;
     internal const int CompatibilityVideoInputQueuePackets = 8;
     internal const int AudioInputQueuePackets = 64;
 
@@ -402,10 +403,18 @@ internal static class FfmpegArgumentBuilder
 
         if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
         {
+            var output = CaptureGeometry.ResolveOutputSize(
+                configuration.Display,
+                configuration.Resolution);
+            var queuePackets = output.RequiresScaling
+                ? ScaledVideoInputQueuePackets
+                : VideoInputQueuePackets;
             arguments.AddRange([
-                // Match gfxcapture's bounded two-frame D3D11 pool instead of
-                // retaining eight full-size BGRA surfaces under GPU pressure.
-                "-thread_queue_size", Invariant(VideoInputQueuePackets),
+                // Source/native keeps the two-frame low-latency budget that
+                // prevents long-session desktop lag. A fixed downscale gets two
+                // extra, already output-sized frames so the capture shader can
+                // absorb short fullscreen GPU stalls without starving CFR.
+                "-thread_queue_size", Invariant(queuePackets),
                 "-f", "lavfi",
                 "-i", BuildGraphicsCaptureFilter(configuration, encodingStrategy)
             ]);

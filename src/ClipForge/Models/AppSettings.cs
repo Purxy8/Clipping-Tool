@@ -28,15 +28,34 @@ public sealed class AppSettings
     public HotkeyGesture ToggleOverlayHotkey { get; set; } = HotkeyGesture.DefaultToggleOverlay;
     public string SaveDirectory { get; set; } = GetDefaultSaveDirectory();
 
-    public static string GetDefaultSaveDirectory()
+    public static string GetDefaultSaveDirectory() =>
+        ResolveDefaultSaveDirectory(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+
+    internal static string ResolveDefaultSaveDirectory(
+        string? videosDirectory,
+        string? documentsDirectory,
+        string? localApplicationDataDirectory)
     {
-        var videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
-        if (string.IsNullOrWhiteSpace(videos))
+        if (!string.IsNullOrWhiteSpace(videosDirectory) &&
+            Path.IsPathFullyQualified(videosDirectory))
         {
-            videos = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            return Path.Combine(Path.GetFullPath(videosDirectory), "ClipForge");
         }
 
-        return Path.Combine(videos, "ClipForge");
+        if (!string.IsNullOrWhiteSpace(documentsDirectory) &&
+            Path.IsPathFullyQualified(documentsDirectory))
+        {
+            return Path.Combine(Path.GetFullPath(documentsDirectory), "ClipForge");
+        }
+
+        var fallbackRoot = !string.IsNullOrWhiteSpace(localApplicationDataDirectory) &&
+                           Path.IsPathFullyQualified(localApplicationDataDirectory)
+            ? Path.GetFullPath(localApplicationDataDirectory)
+            : Path.GetFullPath(Path.GetTempPath());
+        return Path.Combine(fallbackRoot, "ClipForge", "Clips");
     }
 
     internal static string NormalizeBackgroundColor(string? requestedColor) =>
