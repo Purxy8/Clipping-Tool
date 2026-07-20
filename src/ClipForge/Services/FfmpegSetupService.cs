@@ -138,11 +138,10 @@ public sealed class FfmpegSetupService
 
         try
         {
-            var existing = FindExecutable();
-            if (existing is not null)
+            if (TryFindUsableToolPair(out var existing, out _))
             {
                 progress?.Report(1);
-                return existing;
+                return existing!;
             }
 
             var parentDirectory = Path.GetDirectoryName(_installDirectory)
@@ -200,8 +199,11 @@ public sealed class FfmpegSetupService
             }
 
             await VerifyArchiveAsync(archivePath, cancellationToken).ConfigureAwait(false);
-            var extractedFfmpeg = Path.Combine(temporaryDirectory, ExecutableName);
-            var extractedFfprobe = Path.Combine(temporaryDirectory, ProbeExecutableName);
+            var payloadDirectory = Path.Combine(temporaryDirectory, "payload");
+            Directory.CreateDirectory(payloadDirectory);
+            EnsureSafeDirectoryChain(payloadDirectory);
+            var extractedFfmpeg = Path.Combine(payloadDirectory, ExecutableName);
+            var extractedFfprobe = Path.Combine(payloadDirectory, ProbeExecutableName);
             await ExtractExecutableAsync(archivePath, ExecutableName, extractedFfmpeg, cancellationToken)
                 .ConfigureAwait(false);
             await ExtractExecutableAsync(archivePath, ProbeExecutableName, extractedFfprobe, cancellationToken)
@@ -215,24 +217,30 @@ public sealed class FfmpegSetupService
 
             progress?.Report(0.98);
 
-            EnsureSafeDirectoryChain(_installDirectory);
-            Directory.CreateDirectory(_installDirectory);
-            EnsureSafeDirectoryChain(_installDirectory);
             var installedFfmpeg = Path.Combine(_installDirectory, ExecutableName);
             var installedFfprobe = Path.Combine(_installDirectory, ProbeExecutableName);
-            File.Move(extractedFfmpeg, installedFfmpeg, overwrite: true);
-            File.Move(extractedFfprobe, installedFfprobe, overwrite: true);
-
-            lock (_verificationGate)
+            try
             {
-                _verifiedTools.Remove(installedFfmpeg);
-                _verifiedTools.Remove(installedFfprobe);
+                PublishPreparedInstallation(
+                    payloadDirectory,
+                    _installDirectory,
+                    _ =>
+                    {
+                        InvalidateToolVerification(installedFfmpeg, installedFfprobe);
+                        if (!IsVerifiedTool(installedFfmpeg, ExpectedFfmpegSha256) ||
+                            !IsVerifiedTool(installedFfprobe, ExpectedFfprobeSha256))
+                        {
+                            throw new InvalidDataException(
+                                "The installed FFmpeg tools failed their checksum verification.");
+                        }
+                    });
             }
-
-            if (!IsVerifiedTool(installedFfmpeg, ExpectedFfmpegSha256) ||
-                !IsVerifiedTool(installedFfprobe, ExpectedFfprobeSha256))
+            catch
             {
-                throw new InvalidDataException("The installed FFmpeg tools failed their checksum verification.");
+                // A failed verification may have cached one member of the new
+                // pair before the directory transaction restored the old pair.
+                InvalidateToolVerification(installedFfmpeg, installedFfprobe);
+                throw;
             }
 
             progress?.Report(1);
@@ -247,6 +255,32 @@ public sealed class FfmpegSetupService
 
             _downloadGate.Release();
         }
+    }
+
+    internal bool TryFindUsableToolPair(
+        out string? ffmpegPath,
+        out string? ffprobePath)
+    {
+        ffmpegPath = FindExecutable();
+        ffprobePath = null;
+        if (ffmpegPath is null)
+        {
+            return false;
+        }
+
+        var sibling = Path.Combine(
+            Path.GetDirectoryName(ffmpegPath)!,
+            ProbeExecutableName);
+        var developerExternalPath = IsConfiguredDeveloperExecutablePath(ffmpegPath);
+        if (developerExternalPath
+                ? IsUsableRegularFile(sibling)
+                : IsVerifiedTool(sibling, ExpectedFfprobeSha256))
+        {
+            ffprobePath = Path.GetFullPath(sibling);
+            return true;
+        }
+
+        return false;
     }
 
     internal string? FindProbeExecutable()
@@ -280,6 +314,141 @@ public sealed class FfmpegSetupService
 
         return GetPrivateToolCandidates(ProbeExecutableName)
             .FirstOrDefault(candidate => IsVerifiedTool(candidate, ExpectedFfprobeSha256));
+    }
+
+    /// <summary>
+    /// Publishes a completely prepared tool directory as one unit. Both paths
+    /// must be on the same volume so each directory rename is atomic. The old
+    /// directory remains in a uniquely named backup until post-publish
+    /// verification succeeds.
+    /// </summary>
+    internal static void PublishPreparedInstallation(
+        string payloadDirectory,
+        string installDirectory,
+        Action<string> verifyPublished,
+        Action<string, string>? moveDirectory = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(payloadDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(installDirectory);
+        ArgumentNullException.ThrowIfNull(verifyPublished);
+
+        var payloadPath = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(payloadDirectory));
+        var installPath = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(installDirectory));
+        if (payloadPath.Equals(installPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException(
+                "The prepared FFmpeg payload cannot also be the installation directory.",
+                nameof(payloadDirectory));
+        }
+
+        if (!Directory.Exists(payloadPath))
+        {
+            throw new DirectoryNotFoundException(
+                "The prepared FFmpeg payload directory does not exist.");
+        }
+
+        var installParent = Path.GetDirectoryName(installPath)
+            ?? throw new InvalidOperationException(
+                "The FFmpeg installation directory is invalid.");
+        var payloadRoot = Path.GetPathRoot(payloadPath);
+        var installRoot = Path.GetPathRoot(installPath);
+        if (string.IsNullOrWhiteSpace(payloadRoot) ||
+            string.IsNullOrWhiteSpace(installRoot) ||
+            !payloadRoot.Equals(installRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException(
+                "The prepared FFmpeg payload and installation directory must be on the same volume.");
+        }
+
+        EnsureSafeDirectoryChain(payloadPath);
+        EnsureSafeDirectoryChain(installParent);
+        if (Directory.Exists(installPath))
+        {
+            EnsureSafeDirectoryChain(installPath);
+        }
+
+        Directory.CreateDirectory(installParent);
+        moveDirectory ??= static (source, destination) =>
+            Directory.Move(source, destination);
+
+        var transactionId = Guid.NewGuid().ToString("N");
+        var backupPath = Path.Combine(
+            installParent,
+            $".ffmpeg-backup-{transactionId}");
+        string? failedPath = null;
+        var backupOwnsPreviousInstallation = false;
+        var payloadWasPublished = false;
+        var committed = false;
+        var rollbackCompleted = false;
+
+        try
+        {
+            if (Directory.Exists(installPath))
+            {
+                moveDirectory(installPath, backupPath);
+                backupOwnsPreviousInstallation = true;
+            }
+
+            moveDirectory(payloadPath, installPath);
+            payloadWasPublished = true;
+            verifyPublished(installPath);
+            committed = true;
+        }
+        catch (Exception publishException)
+        {
+            try
+            {
+                if (payloadWasPublished && Directory.Exists(installPath))
+                {
+                    failedPath = Path.Combine(
+                        installParent,
+                        $".ffmpeg-failed-{transactionId}");
+                    moveDirectory(installPath, failedPath);
+                    payloadWasPublished = false;
+                }
+
+                if (backupOwnsPreviousInstallation)
+                {
+                    if (Directory.Exists(installPath) || File.Exists(installPath))
+                    {
+                        throw new IOException(
+                            "The failed FFmpeg installation still occupies the install path.");
+                    }
+
+                    moveDirectory(backupPath, installPath);
+                    backupOwnsPreviousInstallation = false;
+                }
+
+                rollbackCompleted = true;
+            }
+            catch (Exception rollbackException)
+            {
+                var retainedBackup = backupOwnsPreviousInstallation
+                    ? $" The previous installation backup was retained at '{backupPath}'."
+                    : string.Empty;
+                throw new AggregateException(
+                    "The FFmpeg tool-pair publication failed and could not be rolled back." +
+                    retainedBackup,
+                    publishException,
+                    rollbackException);
+            }
+
+            throw;
+        }
+        finally
+        {
+            if (committed && backupOwnsPreviousInstallation)
+            {
+                TryDeleteDirectory(backupPath);
+            }
+
+            if (rollbackCompleted && failedPath is not null)
+            {
+                TryDeleteDirectory(failedPath);
+            }
+        }
     }
 
     private IEnumerable<string> GetPrivateToolCandidates(string executableName)
@@ -608,6 +777,17 @@ public sealed class FfmpegSetupService
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             // A later installation can safely ignore this uniquely named staging directory.
+        }
+    }
+
+    private void InvalidateToolVerification(params string[] paths)
+    {
+        lock (_verificationGate)
+        {
+            foreach (var path in paths)
+            {
+                _verifiedTools.Remove(Path.GetFullPath(path));
+            }
         }
     }
 

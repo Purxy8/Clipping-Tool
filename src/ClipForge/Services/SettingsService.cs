@@ -18,6 +18,8 @@ public sealed class SettingsService : IDisposable
     };
 
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _disposeGate = new();
+    private int _activeOperations;
     private bool _disposed;
 
     public SettingsService(string? settingsDirectory = null)
@@ -44,18 +46,21 @@ public sealed class SettingsService : IDisposable
 
     public async Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        BeginOperation();
+        var gateAcquired = false;
 
         try
         {
-            if (!File.Exists(SettingsPath))
-            {
-                return new AppSettings();
-            }
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            gateAcquired = true;
 
             try
             {
+                if (!File.Exists(SettingsPath))
+                {
+                    return new AppSettings();
+                }
+
                 if (new FileInfo(SettingsPath).Length > MaximumSettingsBytes)
                 {
                     return new AppSettings();
@@ -85,23 +90,44 @@ public sealed class SettingsService : IDisposable
             {
                 return new AppSettings();
             }
+            catch (IOException)
+            {
+                // A temporary lock, concurrent replacement, or unavailable local
+                // profile should not prevent the application from starting.
+                return new AppSettings();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return new AppSettings();
+            }
+            catch (System.Security.SecurityException)
+            {
+                return new AppSettings();
+            }
         }
         finally
         {
-            _gate.Release();
+            if (gateAcquired)
+            {
+                _gate.Release();
+            }
+
+            EndOperation();
         }
     }
 
     public async Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-
+        BeginOperation();
+        var gateAcquired = false;
         string? temporaryPath = null;
 
         try
         {
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            gateAcquired = true;
+
             Directory.CreateDirectory(SettingsDirectory);
             temporaryPath = Path.Combine(SettingsDirectory, $".{SettingsFileName}.{Guid.NewGuid():N}.tmp");
 
@@ -143,18 +169,56 @@ public sealed class SettingsService : IDisposable
                 }
             }
 
-            _gate.Release();
+            if (gateAcquired)
+            {
+                _gate.Release();
+            }
+
+            EndOperation();
         }
     }
 
     public void Dispose()
     {
-        if (_disposed)
+        var disposeSemaphore = false;
+        lock (_disposeGate)
         {
-            return;
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            disposeSemaphore = _activeOperations == 0;
         }
 
-        _disposed = true;
-        _gate.Dispose();
+        if (disposeSemaphore)
+        {
+            _gate.Dispose();
+        }
+    }
+
+    private void BeginOperation()
+    {
+        lock (_disposeGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _activeOperations++;
+        }
+    }
+
+    private void EndOperation()
+    {
+        var disposeSemaphore = false;
+        lock (_disposeGate)
+        {
+            _activeOperations--;
+            disposeSemaphore = _disposed && _activeOperations == 0;
+        }
+
+        if (disposeSemaphore)
+        {
+            _gate.Dispose();
+        }
     }
 }

@@ -83,6 +83,11 @@ public partial class MainWindow : Window
     private OverlayWindow? _overlayWindow;
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
+    private CancellationTokenSource? _activeRecentThumbnailHydrationCancellation;
+    private bool _recentThumbnailHydrationPending;
+    private long _recentClipSnapshotVersion;
+    private long _activeRecentThumbnailHydrationSnapshotVersion = -1;
+    private long _lastAttemptedRecentThumbnailHydrationSnapshotVersion = -1;
     private CancellationTokenSource? _displayModeChangeCancellation;
     private int _displayModeWgcRenewalRequested;
     private bool _refreshingDisplaySelection;
@@ -214,16 +219,17 @@ public partial class MainWindow : Window
                     _trayIconService.ShowReplayStartupFailure(
                         "Install the ClipForge capture engine, then start replay once from the app.");
                 }
-                else if (ShouldAutoStartReplay(
-                             _launchOptions.IsAutoStart,
-                             _settings.StartReplayWithWindows,
-                             initializationCompleted,
-                             _engineReady,
-                             _replayBufferService.IsRunning,
-                             _isClosing))
-                {
-                    await StartReplayAfterWindowsLoginAsync();
-                }
+                var shouldAutoStartReplay = ShouldAutoStartReplay(
+                    _launchOptions.IsAutoStart,
+                    _settings.StartReplayWithWindows,
+                    initializationCompleted,
+                    _engineReady,
+                    _replayBufferService.IsRunning,
+                    _isClosing);
+                await RunAutoStartReplaySequenceAsync(
+                    shouldAutoStartReplay,
+                    PreloadClipLibraryBeforeAutoStartAsync,
+                    StartReplayAfterWindowsLoginAsync);
 
                 _ = RunAutomaticUpdateCheckAsync();
                 _ = RefreshClipLibraryAsync();
@@ -621,6 +627,75 @@ public partial class MainWindow : Window
         engineReady &&
         !replayRunning &&
         !isClosing;
+
+    internal static async Task RunAutoStartReplaySequenceAsync(
+        bool shouldAutoStartReplay,
+        Func<Task> preloadClipLibrary,
+        Func<Task> startReplay)
+    {
+        ArgumentNullException.ThrowIfNull(preloadClipLibrary);
+        ArgumentNullException.ThrowIfNull(startReplay);
+        if (!shouldAutoStartReplay)
+        {
+            return;
+        }
+
+        // Automatic library work is suppressed for the complete replay session.
+        // Populate the hidden window before capture starts so Windows-login
+        // startup does not leave Recent clips empty until replay is stopped.
+        await preloadClipLibrary();
+        await startReplay();
+    }
+
+    private async Task PreloadClipLibraryBeforeAutoStartAsync()
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        try
+        {
+            var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
+            // Autostart must not wait up to the thumbnail-generation budget
+            // before replay begins. Bind validated clips and any existing
+            // posters now; missing posters hydrate when the window is active.
+            var snapshot = await _clipLibraryService.LoadAsync(
+                _settings.SaveDirectory,
+                count: requestedCount,
+                includeThumbnails: true,
+                thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
+                _lifetimeCancellation.Token);
+
+            _lifetimeCancellation.Token.ThrowIfCancellationRequested();
+            if (_isClosing)
+            {
+                return;
+            }
+
+            RecentClipsItemsControl.ItemsSource = snapshot.Clips;
+            MarkRecentClipSnapshotChanged();
+            UpdateRecentGalleryCardWidth();
+            if (snapshot.LatestClip is { } latestClip)
+            {
+                // The autostart window is hidden. Bind only identity-checked
+                // metadata/posters; never create a Media Foundation decoder.
+                SelectClipWithoutOpening(latestClip);
+            }
+
+            _libraryRefreshPending = false;
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Windows is signing out or ClipForge is exiting.
+        }
+        catch (Exception)
+        {
+            // Gallery preload is best effort and must never prevent replay from
+            // starting. A normal full refresh remains queued for replay stop.
+            _libraryRefreshPending = true;
+        }
+    }
 
     private async Task StartReplayAfterWindowsLoginAsync()
     {
@@ -1591,7 +1666,10 @@ public partial class MainWindow : Window
             // resume presentation helpers. Keep the cached gallery on screen and
             // defer all automatic discovery until replay has fully stopped.
             _libraryRefreshPending = true;
-            CancelActiveLibraryRefreshForBackground();
+            if (!wasReplaySession || IsCapturePresentationSuspendedState(snapshot))
+            {
+                CancelActiveLibraryRefreshForBackground();
+            }
         }
 
         if (isReplaySession && !wasReplaySession)
@@ -1638,6 +1716,8 @@ public partial class MainWindow : Window
         {
             ShowError(snapshot.Message);
         }
+
+        QueueRecentClipThumbnailHydration();
     }
 
     internal static bool IsReplaySessionState(ReplayStateSnapshot snapshot) =>
@@ -1652,6 +1732,32 @@ public partial class MainWindow : Window
         bool replayServiceRunning,
         ReplayStateSnapshot snapshot) =>
         captureCritical || replayServiceRunning || IsReplaySessionState(snapshot);
+
+    internal static bool ShouldHydrateRecentClipThumbnails(
+        bool isClosing,
+        bool isVisible,
+        bool isActive,
+        bool captureCritical,
+        bool replayServiceRunning,
+        ReplayStateSnapshot snapshot,
+        int clipCount,
+        int missingThumbnailCount) =>
+        !isClosing &&
+        isVisible &&
+        isActive &&
+        !captureCritical &&
+        replayServiceRunning &&
+        snapshot.State == ReplayState.Ready &&
+        clipCount > 0 &&
+        missingThumbnailCount > 0 &&
+        missingThumbnailCount <= clipCount;
+
+    internal static bool ShouldContinueRecentClipThumbnailHydration(
+        int missingThumbnailCountBefore,
+        int missingThumbnailCountAfter) =>
+        missingThumbnailCountBefore > 0 &&
+        missingThumbnailCountAfter > 0 &&
+        missingThumbnailCountAfter < missingThumbnailCountBefore;
 
     private bool IsAutomaticLibraryWorkSuppressed =>
         ShouldSuppressAutomaticLibraryWork(
@@ -1717,6 +1823,7 @@ public partial class MainWindow : Window
                 SelectClip(cachedClip, autoplay: false);
             }
 
+            QueueRecentClipThumbnailHydration();
             return;
         }
 
@@ -1843,7 +1950,7 @@ public partial class MainWindow : Window
 
     private void RefreshEngineState()
     {
-        _engineReady = _ffmpegSetupService.FindExecutable() is not null;
+        _engineReady = _ffmpegSetupService.TryFindUsableToolPair(out _, out _);
         InstallEnginePanel.Visibility = _engineReady ? Visibility.Collapsed : Visibility.Visible;
         BufferToggleButton.IsEnabled = _engineReady && !_isClosing;
     }
@@ -2739,6 +2846,7 @@ public partial class MainWindow : Window
             .Take(requestedCount)
             .ToArray();
         RecentClipsItemsControl.ItemsSource = merged;
+        MarkRecentClipSnapshotChanged();
         UpdateRecentGalleryCardWidth();
         _libraryRefreshPending = true;
         _pendingLibraryPreferredPath = mergedClip.FullPath;
@@ -2755,6 +2863,8 @@ public partial class MainWindow : Window
                 selectClip: false,
                 openForExplicitAction: false);
         }
+
+        QueueRecentClipThumbnailHydration();
     }
 
     private void RemoveKnownReplayClip(
@@ -2773,6 +2883,7 @@ public partial class MainWindow : Window
                 StringComparison.OrdinalIgnoreCase))
             .ToArray();
         RecentClipsItemsControl.ItemsSource = remaining;
+        MarkRecentClipSnapshotChanged();
         UpdateRecentGalleryCardWidth();
         _libraryRefreshPending = true;
         if (string.Equals(
@@ -2810,6 +2921,8 @@ public partial class MainWindow : Window
         {
             _libraryWindow?.RemoveKnownReplayClip(clip);
         }
+
+        QueueRecentClipThumbnailHydration();
     }
 
     private void LibraryWindow_Closed(object? sender, EventArgs e)
@@ -2968,6 +3081,7 @@ public partial class MainWindow : Window
         if (IsAutomaticLibraryWorkSuppressed)
         {
             _libraryRefreshPending = true;
+            QueueRecentClipThumbnailHydration();
             return;
         }
 
@@ -2984,6 +3098,8 @@ public partial class MainWindow : Window
             _lifetimeCancellation.Token);
         lock (_libraryRefreshCancellationGate)
         {
+            _activeRecentThumbnailHydrationCancellation?.Cancel();
+            _recentThumbnailHydrationPending = false;
             _activeLibraryRefreshCancellation?.Cancel();
             _activeLibraryRefreshCancellation = refreshCancellation;
         }
@@ -3014,6 +3130,7 @@ public partial class MainWindow : Window
             }
 
             RecentClipsItemsControl.ItemsSource = snapshot.Clips;
+            MarkRecentClipSnapshotChanged();
             UpdateRecentGalleryCardWidth();
             if (IsVisible && IsActive)
             {
@@ -3665,6 +3782,8 @@ public partial class MainWindow : Window
             _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
         }
 
+        QueueRecentClipThumbnailHydration();
+
         if (!_isPlayerPlaying)
         {
             return;
@@ -3680,17 +3799,232 @@ public partial class MainWindow : Window
         CancelActiveLibraryRefreshForBackground();
     }
 
-    private void CancelActiveLibraryRefreshForBackground()
+    private void QueueRecentClipThumbnailHydration()
     {
-        lock (_libraryRefreshCancellationGate)
+        var clips = RecentClipsItemsControl.Items
+            .OfType<ClipLibraryItem>()
+            .ToArray();
+        var missingThumbnailCount = clips.Count(clip => clip.ThumbnailPath is null);
+        if (!ShouldHydrateRecentClipThumbnails(
+                _isClosing,
+                IsVisible,
+                IsActive,
+                _captureCriticalPresentationActive,
+                _replayBufferService.IsRunning,
+                _latestState,
+                clips.Length,
+                missingThumbnailCount))
         {
-            if (_activeLibraryRefreshCancellation is null)
+            return;
+        }
+
+        if (_activeRecentThumbnailHydrationCancellation is not null)
+        {
+            if (_activeRecentThumbnailHydrationSnapshotVersion != _recentClipSnapshotVersion)
+            {
+                _recentThumbnailHydrationPending = true;
+            }
+
+            return;
+        }
+
+        if (_lastAttemptedRecentThumbnailHydrationSnapshotVersion == _recentClipSnapshotVersion)
+        {
+            return;
+        }
+
+        _recentThumbnailHydrationPending = false;
+        _ = HydrateRecentClipThumbnailsAsync();
+    }
+
+    private async Task HydrateRecentClipThumbnailsAsync()
+    {
+        var snapshotVersion = _recentClipSnapshotVersion;
+        var hydrationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _activeRecentThumbnailHydrationCancellation = hydrationCancellation;
+        _activeRecentThumbnailHydrationSnapshotVersion = snapshotVersion;
+        var gateEntered = false;
+
+        try
+        {
+            await _libraryRefreshGate.WaitAsync(hydrationCancellation.Token);
+            gateEntered = true;
+            if (snapshotVersion != _recentClipSnapshotVersion)
+            {
+                _recentThumbnailHydrationPending = true;
+                return;
+            }
+
+            var clips = RecentClipsItemsControl.Items
+                .OfType<ClipLibraryItem>()
+                .ToArray();
+            var missingThumbnailCount = clips.Count(clip => clip.ThumbnailPath is null);
+            if (!ShouldHydrateRecentClipThumbnails(
+                    _isClosing,
+                    IsVisible,
+                    IsActive,
+                    _captureCriticalPresentationActive,
+                    _replayBufferService.IsRunning,
+                    _latestState,
+                    clips.Length,
+                    missingThumbnailCount))
             {
                 return;
             }
 
-            _libraryRefreshPending = true;
-            _activeLibraryRefreshCancellation.Cancel();
+            var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
+            var hydrated = await _clipLibraryService.HydrateThumbnailsAsync(
+                _settings.SaveDirectory,
+                clips,
+                maximumMissingThumbnails: Math.Min(requestedCount, missingThumbnailCount),
+                hydrationCancellation.Token,
+                preferredClipPath: _currentClip?.FullPath);
+
+            hydrationCancellation.Token.ThrowIfCancellationRequested();
+            var currentClips = RecentClipsItemsControl.Items
+                .OfType<ClipLibraryItem>()
+                .ToArray();
+            if (snapshotVersion != _recentClipSnapshotVersion ||
+                !ShouldHydrateRecentClipThumbnails(
+                    _isClosing,
+                    IsVisible,
+                    IsActive,
+                    _captureCriticalPresentationActive,
+                    _replayBufferService.IsRunning,
+                    _latestState,
+                    currentClips.Length,
+                    currentClips.Count(clip => clip.ThumbnailPath is null)) ||
+                !HasSameRecentClipSnapshot(clips, currentClips))
+            {
+                _recentThumbnailHydrationPending = true;
+                return;
+            }
+
+            var remainingThumbnailCount = hydrated.Count(clip => clip.ThumbnailPath is null);
+            var madeProgress = remainingThumbnailCount < missingThumbnailCount;
+            _lastAttemptedRecentThumbnailHydrationSnapshotVersion = snapshotVersion;
+            RecentClipsItemsControl.ItemsSource = hydrated;
+            if (madeProgress)
+            {
+                MarkRecentClipSnapshotChanged();
+                if (ShouldContinueRecentClipThumbnailHydration(
+                        missingThumbnailCount,
+                        remainingThumbnailCount))
+                {
+                    // The service deliberately stops after a bounded 20-second
+                    // helper budget. Continue with another bounded foreground
+                    // pass only when the previous pass actually made progress.
+                    _recentThumbnailHydrationPending = true;
+                }
+            }
+
+            if (_currentClip is { } currentClip &&
+                hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
+                    currentClip.FullPath,
+                    StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrentClip)
+            {
+                _currentClip = hydratedCurrentClip;
+                ClipPlayerPosterImage.DataContext = hydratedCurrentClip;
+            }
+        }
+        catch (OperationCanceledException) when (hydrationCancellation.IsCancellationRequested)
+        {
+            // Focus loss, a critical capture transition, full refresh, or
+            // shutdown cancels the low-priority helper immediately.
+        }
+        catch (Exception)
+        {
+            // Thumbnail presentation is best effort. Observe unexpected helper
+            // failures and avoid a Ready-state retry loop until the clip
+            // snapshot changes.
+            if (snapshotVersion == _recentClipSnapshotVersion)
+            {
+                _lastAttemptedRecentThumbnailHydrationSnapshotVersion = snapshotVersion;
+            }
+            else
+            {
+                _recentThumbnailHydrationPending = true;
+            }
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                _libraryRefreshGate.Release();
+            }
+
+            if (ReferenceEquals(
+                    _activeRecentThumbnailHydrationCancellation,
+                    hydrationCancellation))
+            {
+                _activeRecentThumbnailHydrationCancellation = null;
+                _activeRecentThumbnailHydrationSnapshotVersion = -1;
+            }
+
+            hydrationCancellation.Dispose();
+            if (_recentThumbnailHydrationPending)
+            {
+                _recentThumbnailHydrationPending = false;
+                QueueRecentClipThumbnailHydration();
+            }
+        }
+    }
+
+    private void MarkRecentClipSnapshotChanged()
+    {
+        if (_recentClipSnapshotVersion == long.MaxValue)
+        {
+            _recentClipSnapshotVersion = 0;
+            _lastAttemptedRecentThumbnailHydrationSnapshotVersion = -1;
+            return;
+        }
+
+        _recentClipSnapshotVersion++;
+    }
+
+    private static bool HasSameRecentClipSnapshot(
+        IReadOnlyList<ClipLibraryItem> expected,
+        IReadOnlyList<ClipLibraryItem> current)
+    {
+        if (expected.Count != current.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < expected.Count; index++)
+        {
+            if (expected[index] != current[index])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void CancelActiveLibraryRefreshForBackground()
+    {
+        lock (_libraryRefreshCancellationGate)
+        {
+            var cancellationRequested = false;
+            if (_activeLibraryRefreshCancellation is not null)
+            {
+                _activeLibraryRefreshCancellation.Cancel();
+                cancellationRequested = true;
+            }
+
+            if (_activeRecentThumbnailHydrationCancellation is not null)
+            {
+                _activeRecentThumbnailHydrationCancellation.Cancel();
+                cancellationRequested = true;
+            }
+
+            _recentThumbnailHydrationPending = false;
+            if (cancellationRequested)
+            {
+                _libraryRefreshPending = true;
+            }
         }
     }
 

@@ -52,6 +52,7 @@ internal static class Program
             ("Trim range and output naming", TestTrimRangeAndNamingAsync),
             ("Configured FFmpeg discovery", TestConfiguredFfmpegDiscoveryAsync),
             ("Pinned FFmpeg trust policy", TestPinnedFfmpegTrustPolicyAsync),
+            ("Transactional FFmpeg tool-pair publication", TestTransactionalFfmpegToolPairAsync),
             ("FFmpeg download byte limits", TestFfmpegDownloadLimitsAsync),
             ("Release metadata", TestReleaseMetadataAsync),
             ("Unconfigured updater is non-fatal", TestUnconfiguredUpdaterAsync),
@@ -65,6 +66,8 @@ internal static class Program
             ("Settings JSON roundtrip", TestSettingsRoundtripAsync),
             ("Malformed settings fallback", TestMalformedSettingsFallbackAsync),
             ("Oversized settings fallback", TestOversizedSettingsFallbackAsync),
+            ("Settings I/O fallback", TestSettingsIoFallbackAsync),
+            ("Settings concurrent disposal", TestSettingsConcurrentDisposalAsync),
             ("Secure clip discovery and thumbnail cache", TestClipLibraryAsync),
             ("Replay-safe thumbnail hydration", TestReplayThumbnailHydrationAsync),
             ("Clip classification and filtered discovery", TestClipClassificationAndFilteringAsync),
@@ -133,8 +136,27 @@ internal static class Program
     private static Task TestDefaultSaveDirectoryAsync()
     {
         var path = AppSettings.GetDefaultSaveDirectory();
-        Assert.True(Path.IsPathRooted(path), "The default save directory must be absolute.");
+        Assert.True(Path.IsPathFullyQualified(path), "The default save directory must be absolute.");
         Assert.Equal("ClipForge", Path.GetFileName(path), "The default save directory should have a ClipForge folder.");
+
+        var localFallbackRoot = Path.Combine(
+            Path.GetTempPath(),
+            "ClipForge-default-save-directory-test");
+        var localFallback = AppSettings.ResolveDefaultSaveDirectory(
+            videosDirectory: string.Empty,
+            documentsDirectory: string.Empty,
+            localFallbackRoot);
+        Assert.Equal(
+            Path.Combine(localFallbackRoot, "ClipForge", "Clips"),
+            localFallback,
+            "Missing media folders should fall back to a local application-data Clips directory.");
+        Assert.True(
+            Path.IsPathFullyQualified(
+                AppSettings.ResolveDefaultSaveDirectory(
+                    videosDirectory: null,
+                    documentsDirectory: null,
+                    localApplicationDataDirectory: null)),
+            "The last-resort default clips directory must remain absolute.");
 
         var expectedSettingsDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -247,7 +269,7 @@ internal static class Program
         return Task.CompletedTask;
     }
 
-    private static Task TestAutoStartReplayPolicyAsync()
+    private static async Task TestAutoStartReplayPolicyAsync()
     {
         Assert.True(
             MainWindow.ShouldAutoStartReplay(
@@ -283,7 +305,39 @@ internal static class Program
                 "Autostart replay must wait for every safety precondition and must not restart an active session.");
         }
 
-        return Task.CompletedTask;
+        var startupSteps = new List<string>();
+        await MainWindow.RunAutoStartReplaySequenceAsync(
+            shouldAutoStartReplay: true,
+            preloadClipLibrary: () =>
+            {
+                startupSteps.Add("library");
+                return Task.CompletedTask;
+            },
+            startReplay: () =>
+            {
+                startupSteps.Add("replay");
+                return Task.CompletedTask;
+            });
+        Assert.SequenceEqual(
+            new[] { "library", "replay" },
+            startupSteps,
+            "Windows autostart must populate Recent clips before replay suppresses library work.");
+
+        startupSteps.Clear();
+        await MainWindow.RunAutoStartReplaySequenceAsync(
+            shouldAutoStartReplay: false,
+            preloadClipLibrary: () =>
+            {
+                startupSteps.Add("library");
+                return Task.CompletedTask;
+            },
+            startReplay: () =>
+            {
+                startupSteps.Add("replay");
+                return Task.CompletedTask;
+            });
+        Assert.Equal(0, startupSteps.Count,
+            "A normal launch must leave gallery refresh and manual replay startup on their existing paths.");
     }
 
     private static Task TestReplayPresentationStatePolicyAsync()
@@ -344,6 +398,62 @@ internal static class Program
                 replayServiceRunning: false,
                 stopped),
             "Automatic gallery work may resume only after capture and replay are fully stopped.");
+
+        var ready = CreateReplayStateSnapshot(ReplayState.Ready);
+        Assert.True(
+            MainWindow.ShouldHydrateRecentClipThumbnails(
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                captureCritical: false,
+                replayServiceRunning: true,
+                ready,
+                clipCount: 4,
+                missingThumbnailCount: 2),
+            "A foreground steady replay may hydrate already validated recent cards.");
+
+        (bool Closing, bool Visible, bool Active, bool Critical, bool Running, ReplayState State, int Clips, int Missing)[]
+            blockedHydrationCases =
+            [
+                (true, true, true, false, true, ReplayState.Ready, 4, 2),
+                (false, false, true, false, true, ReplayState.Ready, 4, 2),
+                (false, true, false, false, true, ReplayState.Ready, 4, 2),
+                (false, true, true, true, true, ReplayState.Ready, 4, 2),
+                (false, true, true, false, false, ReplayState.Ready, 4, 2),
+                (false, true, true, false, true, ReplayState.Buffering, 4, 2),
+                (false, true, true, false, true, ReplayState.Saving, 4, 2),
+                (false, true, true, false, true, ReplayState.Ready, 0, 0),
+                (false, true, true, false, true, ReplayState.Ready, 4, 0),
+                (false, true, true, false, true, ReplayState.Ready, 1, 2)
+            ];
+        foreach (var item in blockedHydrationCases)
+        {
+            Assert.True(
+                !MainWindow.ShouldHydrateRecentClipThumbnails(
+                    item.Closing,
+                    item.Visible,
+                    item.Active,
+                    item.Critical,
+                    item.Running,
+                    CreateReplayStateSnapshot(item.State),
+                    item.Clips,
+                    item.Missing),
+                $"Unsafe thumbnail hydration policy was accepted for {item.State}.");
+        }
+
+        Assert.True(
+            MainWindow.ShouldContinueRecentClipThumbnailHydration(
+                missingThumbnailCountBefore: 4,
+                missingThumbnailCountAfter: 2),
+            "A bounded hydration pass that made partial progress must continue.");
+        foreach (var counts in new[] { (Before: 4, After: 4), (Before: 4, After: 0), (Before: 0, After: 0) })
+        {
+            Assert.True(
+                !MainWindow.ShouldContinueRecentClipThumbnailHydration(
+                    counts.Before,
+                    counts.After),
+                $"Thumbnail hydration must stop after no progress or completion ({counts}).");
+        }
 
         Assert.True(
             LibraryWindow.ShouldSuppressAutomaticRefresh(
@@ -932,7 +1042,7 @@ internal static class Program
             arguments,
             "-filter_threads", "1",
             "-filter_complex_threads", "1",
-            "-thread_queue_size", "2",
+            "-thread_queue_size", "4",
             "-f", "lavfi");
         Assert.Equal(
             1,
@@ -961,13 +1071,12 @@ internal static class Program
             @"C:\Buffer");
         Assert.ContainsSequence(
             transferArguments,
-            "-thread_queue_size", "2",
+            "-thread_queue_size", "4",
             "-f", "lavfi");
         Assert.True(
             !transferArguments.Contains("-filter_threads", StringComparer.Ordinal) &&
             !transferArguments.Contains("-filter_complex_threads", StringComparer.Ordinal),
             "Compatibility-transfer WGC must not inherit the direct hardware filter-pool policy.");
-
         var hardwareGdiArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration,
             [],
@@ -1875,6 +1984,7 @@ internal static class Program
             (3840, 2160),
             (5120, 1440),
             (1024, 768),
+            (1290, 980),
             (1080, 1080),
             (1080, 1920),
             (1919, 1079),
@@ -1971,10 +2081,16 @@ internal static class Program
                     $"{context} built the wrong WGC geometry path: {wgcFilter}");
                 Assert.True(!wgcFilter.Contains("resize_mode=scale_aspect", StringComparison.Ordinal),
                     $"{context} reintroduced the padded WGC aspect scaler.");
+                Assert.Equal(
+                    expected.RequiresScaling
+                        ? FfmpegArgumentBuilder.ScaledVideoInputQueuePackets.ToString()
+                        : FfmpegArgumentBuilder.VideoInputQueuePackets.ToString(),
+                    GetArgumentAfter(wgcArguments, "-thread_queue_size"),
+                    $"{context} built the wrong WGC input queue budget.");
             }
         }
 
-        Assert.Equal(75, caseNumber, "The capture geometry Cartesian matrix is incomplete.");
+        Assert.Equal(80, caseNumber, "The capture geometry Cartesian matrix is incomplete.");
         Assert.Equal(
             (1920, 804, true),
             ResolveExpectedCaptureSize(
@@ -2180,6 +2296,14 @@ internal static class Program
                 ":width=1920:height=1080:resize_mode=scale:scale_mode=point",
                 StringComparison.Ordinal)),
             "A smaller fixed preset must use the low-overhead WGC point scaler.");
+        Assert.ContainsSequence(
+            nativeFullHdGraphics,
+            "-thread_queue_size", "2",
+            "-f", "lavfi");
+        Assert.ContainsSequence(
+            graphicsNvenc,
+            "-thread_queue_size", "4",
+            "-f", "lavfi");
 
         var amfTransferStrategy = new VideoEncodingStrategy(
             VideoEncoderKind.AmdAmf,
@@ -2859,6 +2983,252 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestTransactionalFfmpegToolPairAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var previousConfiguredPath =
+            Environment.GetEnvironmentVariable("CLIPFORGE_FFMPEG_PATH");
+        var previousDeveloperMode =
+            Environment.GetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE");
+        var previousPath = Environment.GetEnvironmentVariable("PATH");
+
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+
+            var discoveryDirectory = Path.Combine(testDirectory, "discovery");
+            Directory.CreateDirectory(discoveryDirectory);
+            var discoveredFfmpeg = Path.Combine(discoveryDirectory, "ffmpeg.exe");
+            var discoveredFfprobe = Path.Combine(discoveryDirectory, "ffprobe.exe");
+            File.WriteAllBytes(discoveredFfmpeg, [0x4D, 0x5A, 1]);
+            Environment.SetEnvironmentVariable(
+                "CLIPFORGE_FFMPEG_PATH",
+                discoveryDirectory);
+            Environment.SetEnvironmentVariable("CLIPFORGE_DEVELOPER_MODE", "1");
+            Environment.SetEnvironmentVariable("PATH", string.Empty);
+
+            var discoveryService = new FfmpegSetupService(
+                Path.Combine(testDirectory, "unused-private-install"));
+            Assert.True(
+                !discoveryService.TryFindUsableToolPair(
+                    out var incompleteFfmpeg,
+                    out var incompleteFfprobe) &&
+                incompleteFfmpeg == Path.GetFullPath(discoveredFfmpeg) &&
+                incompleteFfprobe is null,
+                "A usable FFmpeg without its sibling FFprobe must not complete installation.");
+
+            File.WriteAllBytes(discoveredFfprobe, [0x4D, 0x5A, 2]);
+            Assert.True(
+                discoveryService.TryFindUsableToolPair(
+                    out var completeFfmpeg,
+                    out var completeFfprobe),
+                "A complete usable FFmpeg/FFprobe pair was not discovered.");
+            Assert.Equal(
+                Path.GetFullPath(discoveredFfmpeg),
+                completeFfmpeg,
+                "Complete pair discovery returned the wrong FFmpeg path.");
+            Assert.Equal(
+                Path.GetFullPath(discoveredFfprobe),
+                completeFfprobe,
+                "Complete pair discovery returned the wrong FFprobe path.");
+
+            var successfulRoot = Path.Combine(testDirectory, "successful-publish");
+            Directory.CreateDirectory(successfulRoot);
+            var successfulInstall = Path.Combine(successfulRoot, "install");
+            var successfulPayload = Path.Combine(successfulRoot, "payload");
+            WriteToolPair(successfulInstall, ffmpegMarker: 10, ffprobeMarker: 11);
+            WriteToolPair(successfulPayload, ffmpegMarker: 20, ffprobeMarker: 21);
+            var verificationCalls = 0;
+            FfmpegSetupService.PublishPreparedInstallation(
+                successfulPayload,
+                successfulInstall,
+                publishedDirectory =>
+                {
+                    verificationCalls++;
+                    AssertToolPair(
+                        publishedDirectory,
+                        ffmpegMarker: 20,
+                        ffprobeMarker: 21,
+                        "Post-publish verification did not observe the complete new pair.");
+                });
+            Assert.Equal(
+                1,
+                verificationCalls,
+                "The published FFmpeg pair must be verified exactly once.");
+            AssertToolPair(
+                successfulInstall,
+                ffmpegMarker: 20,
+                ffprobeMarker: 21,
+                "A successful directory transaction did not publish both new tools.");
+            AssertNoTransactionDirectories(
+                successfulRoot,
+                "A successful FFmpeg publication left transaction directories behind.");
+
+            var rollbackRoot = Path.Combine(testDirectory, "verified-rollback");
+            Directory.CreateDirectory(rollbackRoot);
+            var rollbackInstall = Path.Combine(rollbackRoot, "install");
+            var rollbackPayload = Path.Combine(rollbackRoot, "payload");
+            WriteToolPair(rollbackInstall, ffmpegMarker: 30, ffprobeMarker: 31);
+            WriteToolPair(rollbackPayload, ffmpegMarker: 40, ffprobeMarker: 41);
+            Assert.Throws<InvalidDataException>(
+                () => FfmpegSetupService.PublishPreparedInstallation(
+                    rollbackPayload,
+                    rollbackInstall,
+                    publishedDirectory =>
+                    {
+                        AssertToolPair(
+                            publishedDirectory,
+                            ffmpegMarker: 40,
+                            ffprobeMarker: 41,
+                            "Rollback verification did not observe the complete staged pair.");
+                        throw new InvalidDataException("Synthetic checksum failure.");
+                    }),
+                "A post-publish verification failure was not propagated.");
+            AssertToolPair(
+                rollbackInstall,
+                ffmpegMarker: 30,
+                ffprobeMarker: 31,
+                "A verification failure did not restore both old tools.");
+            AssertNoTransactionDirectories(
+                rollbackRoot,
+                "A completed FFmpeg rollback left transaction directories behind.");
+
+            var firstInstallRoot = Path.Combine(testDirectory, "failed-first-install");
+            Directory.CreateDirectory(firstInstallRoot);
+            var firstInstallPath = Path.Combine(firstInstallRoot, "install");
+            var firstInstallPayload = Path.Combine(firstInstallRoot, "payload");
+            WriteToolPair(
+                firstInstallPayload,
+                ffmpegMarker: 45,
+                ffprobeMarker: 46);
+            Assert.Throws<InvalidDataException>(
+                () => FfmpegSetupService.PublishPreparedInstallation(
+                    firstInstallPayload,
+                    firstInstallPath,
+                    _ => throw new InvalidDataException(
+                        "Synthetic checksum failure on first installation.")),
+                "A first-install verification failure was not propagated.");
+            Assert.True(
+                !Directory.Exists(firstInstallPath),
+                "A failed first installation left a partially published tool directory.");
+            AssertNoTransactionDirectories(
+                firstInstallRoot,
+                "A failed first installation left transaction directories behind.");
+
+            var failedRollbackRoot = Path.Combine(testDirectory, "failed-rollback");
+            Directory.CreateDirectory(failedRollbackRoot);
+            var failedRollbackInstall = Path.Combine(failedRollbackRoot, "install");
+            var failedRollbackPayload = Path.Combine(failedRollbackRoot, "payload");
+            WriteToolPair(
+                failedRollbackInstall,
+                ffmpegMarker: 50,
+                ffprobeMarker: 51);
+            WriteToolPair(
+                failedRollbackPayload,
+                ffmpegMarker: 60,
+                ffprobeMarker: 61);
+            var moveCount = 0;
+            AggregateException? rollbackFailure = null;
+            try
+            {
+                FfmpegSetupService.PublishPreparedInstallation(
+                    failedRollbackPayload,
+                    failedRollbackInstall,
+                    _ => throw new InvalidDataException(
+                        "Synthetic verification failure before rollback."),
+                    (source, destination) =>
+                    {
+                        moveCount++;
+                        if (moveCount == 4)
+                        {
+                            throw new IOException(
+                                "Synthetic failure while restoring the backup.");
+                        }
+
+                        Directory.Move(source, destination);
+                    });
+            }
+            catch (AggregateException exception)
+            {
+                rollbackFailure = exception;
+            }
+
+            Assert.True(
+                rollbackFailure is not null &&
+                rollbackFailure.InnerExceptions.Count == 2,
+                "A rollback failure must preserve both the publish and rollback diagnostics.");
+            var retainedBackups = Directory.GetDirectories(
+                failedRollbackRoot,
+                ".ffmpeg-backup-*",
+                SearchOption.TopDirectoryOnly);
+            Assert.Equal(
+                1,
+                retainedBackups.Length,
+                "A failed rollback must retain exactly one old-install backup.");
+            AssertToolPair(
+                retainedBackups[0],
+                ffmpegMarker: 50,
+                ffprobeMarker: 51,
+                "Rollback failure deleted or modified the retained old tool pair.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                "CLIPFORGE_FFMPEG_PATH",
+                previousConfiguredPath);
+            Environment.SetEnvironmentVariable(
+                "CLIPFORGE_DEVELOPER_MODE",
+                previousDeveloperMode);
+            Environment.SetEnvironmentVariable("PATH", previousPath);
+            DeleteTestDirectory(testDirectory);
+        }
+
+        return Task.CompletedTask;
+
+        static void WriteToolPair(
+            string directory,
+            byte ffmpegMarker,
+            byte ffprobeMarker)
+        {
+            Directory.CreateDirectory(directory);
+            File.WriteAllBytes(
+                Path.Combine(directory, "ffmpeg.exe"),
+                [0x4D, 0x5A, ffmpegMarker]);
+            File.WriteAllBytes(
+                Path.Combine(directory, "ffprobe.exe"),
+                [0x4D, 0x5A, ffprobeMarker]);
+        }
+
+        static void AssertToolPair(
+            string directory,
+            byte ffmpegMarker,
+            byte ffprobeMarker,
+            string message)
+        {
+            Assert.SequenceEqual(
+                new byte[] { 0x4D, 0x5A, ffmpegMarker },
+                File.ReadAllBytes(Path.Combine(directory, "ffmpeg.exe")),
+                message);
+            Assert.SequenceEqual(
+                new byte[] { 0x4D, 0x5A, ffprobeMarker },
+                File.ReadAllBytes(Path.Combine(directory, "ffprobe.exe")),
+                message);
+        }
+
+        static void AssertNoTransactionDirectories(
+            string parentDirectory,
+            string message)
+        {
+            Assert.True(
+                !Directory.EnumerateDirectories(
+                        parentDirectory,
+                        ".ffmpeg-*",
+                        SearchOption.TopDirectoryOnly)
+                    .Any(),
+                message);
+        }
+    }
+
     private static async Task TestFfmpegDownloadLimitsAsync()
     {
         await using (var source = new MemoryStream([1, 2, 3, 4]))
@@ -3063,6 +3433,99 @@ internal static class Program
         }
         finally
         {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestSettingsIoFallbackAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            using var service = new SettingsService(testDirectory);
+            await File.WriteAllTextAsync(
+                    service.SettingsPath,
+                    "{\"replaySeconds\":600}")
+                .ConfigureAwait(false);
+            await using var exclusiveLock = new FileStream(
+                service.SettingsPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None);
+
+            var settings = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                120,
+                settings.ReplaySeconds,
+                "A temporarily locked settings file should fall back to defaults.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestSettingsConcurrentDisposalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        SettingsService? service = null;
+        SemaphoreSlim? serializationGate = null;
+        var ownsSerializationGate = false;
+
+        try
+        {
+            service = new SettingsService(testDirectory);
+            var gateField = typeof(SettingsService).GetField(
+                "_gate",
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic);
+            Assert.True(gateField is not null, "The settings serialization gate was not found.");
+            serializationGate = gateField!.GetValue(service) as SemaphoreSlim;
+            Assert.True(serializationGate is not null, "The settings serialization gate has an unexpected type.");
+
+            await serializationGate!.WaitAsync().ConfigureAwait(false);
+            ownsSerializationGate = true;
+            var pendingSave = service.SaveAsync(new AppSettings
+            {
+                ReplaySeconds = 600,
+                SaveDirectory = Path.Combine(testDirectory, "Clips")
+            });
+            Assert.True(
+                !pendingSave.IsCompleted,
+                "The disposal regression test must hold an in-flight settings operation.");
+
+            service.Dispose();
+            serializationGate.Release();
+            ownsSerializationGate = false;
+            await pendingSave.ConfigureAwait(false);
+            Assert.True(
+                File.Exists(service.SettingsPath),
+                "An operation started before disposal should finish safely.");
+
+            var rejectedAfterDisposal = false;
+            try
+            {
+                _ = await service.LoadAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                rejectedAfterDisposal = true;
+            }
+
+            Assert.True(
+                rejectedAfterDisposal,
+                "A settings operation started after disposal must be rejected.");
+        }
+        finally
+        {
+            if (ownsSerializationGate)
+            {
+                serializationGate!.Release();
+            }
+
+            service?.Dispose();
             DeleteTestDirectory(testDirectory);
         }
     }

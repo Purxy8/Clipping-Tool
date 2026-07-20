@@ -4,6 +4,18 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows-sign-in autostart now validates and binds the configured 4/8/10/15 recent clips before replay suppresses automatic library discovery. Opening the foreground window can then fill missing posters from that identity-bound snapshot without repeating folder enumeration or FFprobe work, fixing the single poster-less card left by a hidden autostart session.
+- Fixed-resolution WGC capture now gives its already downscaled input a four-frame queue, while Source/native retains the two-frame low-latency queue. This restores bounded pacing headroom for 1080p capture during stretched/custom-resolution fullscreen transitions without reverting the larger native queue that caused foreground desktop/game latency.
+- Settings loading now falls back safely when the local JSON file is temporarily locked or inaccessible, concurrent disposal no longer destroys the serialization gate underneath an operation that already started, and the default clips folder remains fully qualified even when Windows media-folder discovery returns no path.
+- FFmpeg setup now treats FFmpeg and FFprobe as one verified installation. It publishes the prepared pair with a same-volume directory swap, retains the old pair until both new tools pass post-publish verification, and restores the complete backup after a failure instead of leaving capture installed while Library previews are broken.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors, the deterministic suite passes 54/54 tests, and the curated capture matrix passes 75 geometry combinations plus 36 real FFmpeg encodes at 30/60 FPS with no duplicated frames.
+- The scaled-queue policy includes custom 1290x980 coverage. A synthetic matrix cannot reproduce a game monopolizing the GPU or every exclusive-fullscreen driver path, so a final target-PC CS2/custom-resolution smoke remains required.
+
 ## [1.9.0-beta.7] - 2026-07-16
 
 ### Release status
