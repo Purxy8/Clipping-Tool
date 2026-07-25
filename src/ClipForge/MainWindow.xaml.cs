@@ -76,6 +76,7 @@ public partial class MainWindow : Window
     private bool _isPlayerMuted;
     private bool _replayPlaybackAudioOptIn;
     private double _playerVolumeBeforeMute = 0.8;
+    private double? _playerVolumeAfterOpen;
     private string? _pendingLibraryPreferredPath;
     private string? _lastSavedPath;
     private ClipLibraryItem? _currentClip;
@@ -84,7 +85,9 @@ public partial class MainWindow : Window
     private GlobalHotkeyAction? _capturingHotkeyAction;
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
     private CancellationTokenSource? _activeRecentThumbnailHydrationCancellation;
+    private CancellationTokenSource? _recentThumbnailRetryCancellation;
     private bool _recentThumbnailHydrationPending;
+    private int _recentThumbnailRetryAttempt;
     private long _recentClipSnapshotVersion;
     private long _activeRecentThumbnailHydrationSnapshotVersion = -1;
     private long _lastAttemptedRecentThumbnailHydrationSnapshotVersion = -1;
@@ -1004,7 +1007,7 @@ public partial class MainWindow : Window
                 {
                     await CaptureConfigurationChangedAsync(restartRequired: true);
                 }
-                else
+                else if (forceWgcRenewal)
                 {
                     QueueSameGeometryWgcRefresh();
                 }
@@ -1571,8 +1574,13 @@ public partial class MainWindow : Window
                     return;
                 }
 
+                var activePlan = _replayBufferService.LastCapturePlan;
+                var scaledWgcPath = activePlan is not null &&
+                    CaptureGeometry.ResolveOutputSize(
+                        activePlan.Display,
+                        activePlan.Resolution).RequiresScaling;
                 var useSourceSafetyMode = !scheduledRefresh &&
-                    _automaticCaptureRecoveryCount == 1;
+                    (_automaticCaptureRecoveryCount == 1 || scaledWgcPath);
 
                 var suspendPresentation = !scheduledRefresh;
                 _captureRestartInProgress = suspendPresentation;
@@ -1585,13 +1593,14 @@ public partial class MainWindow : Window
                 {
                     if (scheduledRefresh || !useSourceSafetyMode)
                     {
-                        // A routine renewal and the first health recovery keep
-                        // every completed segment, discard at most the in-flight
-                        // two-second tail, and re-verify the WGC executable before
-                        // launching the replacement process.
+                        // A boundary-aligned routine renewal can keep its trusted
+                        // completed segments. A health recovery invalidates the
+                        // old generation because audio may have continued while
+                        // video was already stalled.
                         var refreshed = await _replayBufferService.RefreshCaptureAsync(
                             eventArgs.ProcessId,
-                            _lifetimeCancellation.Token);
+                            _lifetimeCancellation.Token,
+                            preserveCompletedSegments: scheduledRefresh);
                         if (refreshed && !scheduledRefresh)
                         {
                             _automaticCaptureRecoveryCount++;
@@ -1602,9 +1611,10 @@ public partial class MainWindow : Window
                         await _replayBufferService.StopAsync();
                         if (!_isClosing && _replayStartRequested)
                         {
-                            // The second health recovery changes geometry to
-                            // Source, so it must probe native geometry instead
-                            // of reusing a strategy proven for a fixed preset.
+                            // A scaled WGC path falls back on its first confirmed
+                            // pacing fault; native capture waits for a second
+                            // fault. Source is probed independently instead of
+                            // reusing a strategy proven for the fixed preset.
                             await StartReplayCoreAsync(
                                 sourceSafetyMode: true,
                                 sessionStrategyOverride: null);
@@ -1746,8 +1756,9 @@ public partial class MainWindow : Window
         isVisible &&
         isActive &&
         !captureCritical &&
-        replayServiceRunning &&
-        snapshot.State == ReplayState.Ready &&
+        (replayServiceRunning
+            ? snapshot.State == ReplayState.Ready
+            : !IsReplaySessionState(snapshot)) &&
         clipCount > 0 &&
         missingThumbnailCount > 0 &&
         missingThumbnailCount <= clipCount;
@@ -3119,7 +3130,9 @@ public partial class MainWindow : Window
                 _settings.SaveDirectory,
                 count: requestedCount,
                 includeThumbnails: true,
-                thumbnailPolicy: ClipThumbnailPolicy.GenerateMissing,
+                // Bind validated cards immediately and move new JPEG work to
+                // the cancellable/retrying hydration lane below.
+                thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
@@ -3170,6 +3183,9 @@ public partial class MainWindow : Window
                 _pendingLibraryPreferredPath = null;
             }
 
+            // CachedOnly keeps the bind fast. Fill fallback cards through the
+            // cancellable capped-retry lane even when replay is stopped.
+            QueueRecentClipThumbnailHydration();
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -3292,27 +3308,31 @@ public partial class MainWindow : Window
         _currentClip = clip;
         _playerSourceReleasedForBackground = false;
         _playWhenOpened = autoplay;
+        _playerVolumeAfterOpen = IsReplaySessionState(_latestState) &&
+                                 !_replayPlaybackAudioOptIn
+            ? 0
+            : Math.Clamp(PlayerVolumeSlider.Value / 100, 0, 1);
         SetPlayerPlaying(false);
         var player = EnsureClipPlayerElement();
+        player.Volume = 0;
         player.Source = new Uri(clip.FullPath, UriKind.Absolute);
-        ApplyPlayerVolume(IsReplaySessionState(_latestState) && !_replayPlaybackAudioOptIn
-            ? 0
-            : null);
+        // LoadedBehavior=Manual does not reliably build the native graph from
+        // Source assignment alone. Prime silently; MediaOpened either continues
+        // an explicit autoplay or pauses at frame zero.
+        player.Play();
         LatestClipNameText.Text = $"{clip.FileName} · {clip.RecordedAtUtc.ToLocalTime():dd MMM yyyy, HH:mm}";
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         OpenCurrentClipButton.IsEnabled = true;
         TrimCurrentClipButton.IsEnabled = true;
-        SetPlayerControlsEnabled(true);
+        // MediaElement opens its decoder asynchronously. Keep controls disabled
+        // until MediaOpened so an eager Play/seek cannot race graph creation and
+        // make the first seconds look frozen.
         PlayerSurfacePlayButton.Visibility = Visibility.Visible;
         SetSeekUi(TimeSpan.Zero, clip.Duration ?? TimeSpan.Zero);
+        SetPlayerControlsEnabled(false);
         PlayerTimeText.Text = clip.Duration is { } duration
             ? $"0:00 / {FormatDuration(duration)}"
             : "0:00 / --:--";
-        if (autoplay)
-        {
-            player.Play();
-            SetPlayerPlaying(true);
-        }
     }
 
     private void ClearPlayer()
@@ -3446,13 +3466,25 @@ public partial class MainWindow : Window
         }
 
         PlayerEmptyState.Visibility = Visibility.Collapsed;
+        // Stop the muted priming playback before restoring audible volume. This
+        // prevents even a single decoded audio buffer from leaking into speakers
+        // or desktop capture when the clip was opened paused.
+        player.Pause();
         SetPlayerControlsEnabled(true);
+        var playbackVolume = _playerVolumeAfterOpen ?? 0;
+        _playerVolumeAfterOpen = null;
+        ApplyPlayerVolume(playbackVolume);
         var shouldAutoplay = _playWhenOpened;
         _playWhenOpened = false;
         if (shouldAutoplay)
         {
             player.Play();
             SetPlayerPlaying(true);
+        }
+        else
+        {
+            player.Position = TimeSpan.Zero;
+            SetPlayerPlaying(false);
         }
 
         UpdatePlayerTime();
@@ -3491,9 +3523,15 @@ public partial class MainWindow : Window
         }
 
         _playWhenOpened = false;
+        _playerVolumeAfterOpen = null;
         SetPlayerPlaying(false);
         SetPlayerControlsEnabled(false);
         PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+        ReleaseClipPlayerElement();
+        // The warning deactivates and then reactivates Main. Do not mark a
+        // decoder that just failed as background-restorable or activation will
+        // reopen the same unreadable clip and repeat the failure dialog.
+        _playerSourceReleasedForBackground = false;
         ShowError($"This clip could not be played inside ClipForge. {e.ErrorException.Message}");
     }
 
@@ -3918,6 +3956,10 @@ public partial class MainWindow : Window
                     _recentThumbnailHydrationPending = true;
                 }
             }
+            else if (remainingThumbnailCount > 0)
+            {
+                ScheduleRecentClipThumbnailRetry(snapshotVersion);
+            }
 
             if (_currentClip is { } currentClip &&
                 hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
@@ -3935,12 +3977,13 @@ public partial class MainWindow : Window
         }
         catch (Exception)
         {
-            // Thumbnail presentation is best effort. Observe unexpected helper
-            // failures and avoid a Ready-state retry loop until the clip
-            // snapshot changes.
+            // Thumbnail presentation is best effort. A transient decoder or
+            // file-sharing failure must not permanently poison an unchanged
+            // gallery snapshot, so retry with a short capped backoff.
             if (snapshotVersion == _recentClipSnapshotVersion)
             {
                 _lastAttemptedRecentThumbnailHydrationSnapshotVersion = snapshotVersion;
+                ScheduleRecentClipThumbnailRetry(snapshotVersion);
             }
             else
             {
@@ -3971,8 +4014,69 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ScheduleRecentClipThumbnailRetry(long snapshotVersion)
+    {
+        if (_isClosing ||
+            snapshotVersion != _recentClipSnapshotVersion ||
+            _recentThumbnailRetryCancellation is not null ||
+            _recentThumbnailRetryAttempt >= 3)
+        {
+            return;
+        }
+
+        var retryAttempt = ++_recentThumbnailRetryAttempt;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _recentThumbnailRetryCancellation = cancellation;
+        _ = RetryRecentClipThumbnailHydrationAsync(
+            snapshotVersion,
+            retryAttempt,
+            cancellation);
+    }
+
+    private async Task RetryRecentClipThumbnailHydrationAsync(
+        long snapshotVersion,
+        int retryAttempt,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            var delay = retryAttempt switch
+            {
+                1 => TimeSpan.FromSeconds(3),
+                2 => TimeSpan.FromSeconds(10),
+                _ => TimeSpan.FromSeconds(30)
+            };
+            await Task.Delay(delay, cancellation.Token);
+            if (_isClosing ||
+                snapshotVersion != _recentClipSnapshotVersion)
+            {
+                return;
+            }
+
+            _lastAttemptedRecentThumbnailHydrationSnapshotVersion = -1;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            return;
+        }
+        finally
+        {
+            if (ReferenceEquals(_recentThumbnailRetryCancellation, cancellation))
+            {
+                _recentThumbnailRetryCancellation = null;
+            }
+
+            cancellation.Dispose();
+        }
+
+        QueueRecentClipThumbnailHydration();
+    }
+
     private void MarkRecentClipSnapshotChanged()
     {
+        _recentThumbnailRetryCancellation?.Cancel();
+        _recentThumbnailRetryAttempt = 0;
         if (_recentClipSnapshotVersion == long.MaxValue)
         {
             _recentClipSnapshotVersion = 0;
@@ -4061,6 +4165,7 @@ public partial class MainWindow : Window
 
     private void ReleaseClipPlayerElement()
     {
+        _playerVolumeAfterOpen = null;
         if (GetAttachedClipPlayer() is not { } previousPlayer)
         {
             return;

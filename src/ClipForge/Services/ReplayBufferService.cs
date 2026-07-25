@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security;
 using System.Text;
+using System.Text.Json;
 using ClipForge.Capture;
 using ClipForge.Models;
 
@@ -24,6 +25,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private static readonly TimeSpan CaptureRefreshGracefulStopTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CaptureCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan CaptureRecoveryRetryDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ExportProcessMaximumRuntime = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LegacyBufferMinimumInactivity = TimeSpan.FromHours(24);
     // Windows Graphics Capture frame pools can lose delivery cadence after a
     // long, uninterrupted desktop session while FFmpeg itself remains alive.
@@ -74,8 +76,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private long _bufferBytes;
     private long _reportedDroppedAudioBlocks;
     private int _nextSegmentNumber;
+    private int _activeCaptureGeneration;
+    private int _quarantinedGenerationHeadSegmentNumber = -1;
     private int _isRunning;
     private int _isSaving;
+    private int _saveOperationPending;
     private int _isStopping;
     private long _recoveryRetryNotBefore;
     private int _recoveryRetryGeneration;
@@ -259,6 +264,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 lock (_fileGate)
                 {
                     ResetSegmentIndexLocked();
+                    BeginCaptureGenerationLocked(firstSegmentNumber: 0);
                 }
 
                 _sessionCancellation = new CancellationTokenSource();
@@ -361,7 +367,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _captureProcess = captureProcess;
                 if (!ProcessTuning.TryApplyCapturePriority(
                         captureProcess,
-                        capabilitySelection.Strategy))
+                        capabilitySelection.Strategy,
+                        CaptureGeometry.ResolveOutputSize(
+                            configuration.Display,
+                            configuration.Resolution).RequiresScaling))
                 {
                     EnqueueDiagnostic(
                         "Windows did not allow ClipForge to apply the capture process priority policy.");
@@ -395,7 +404,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 // live capture contexts use the intended class.
                 if (!ProcessTuning.TryApplyCapturePriority(
                         captureProcess,
-                        capabilitySelection.Strategy))
+                        capabilitySelection.Strategy,
+                        CaptureGeometry.ResolveOutputSize(
+                            configuration.Display,
+                            configuration.Resolution).RequiresScaling))
                 {
                     EnqueueDiagnostic(
                         "Windows did not allow ClipForge to finalize the live capture priority policy.");
@@ -506,7 +518,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     /// </summary>
     internal async Task<bool> RefreshCaptureAsync(
         int? expectedProcessId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool preserveCompletedSegments = true)
     {
         ThrowIfDisposed();
         await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -631,11 +644,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     }
 
                     int segmentStartNumber;
+                    var retainedCompletedSegments = ShouldRetainCompletedSegments(
+                        preserveCompletedSegments,
+                        reachedSegmentBoundary);
                     lock (_fileGate)
                     {
                         RefreshSegmentIndexLocked();
-                        DiscardNewestCaptureTailLocked();
+                        if (retainedCompletedSegments)
+                        {
+                            DiscardNewestCaptureTailLocked();
+                        }
+                        else
+                        {
+                            InvalidateRetainedCaptureGenerationLocked();
+                        }
+
                         segmentStartNumber = _nextSegmentNumber;
+                        BeginCaptureGenerationLocked(segmentStartNumber);
                     }
 
                     cancellationToken.ThrowIfCancellationRequested();
@@ -682,7 +707,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     }
 
                     _captureProcess = replacement;
-                    if (!ProcessTuning.TryApplyCapturePriority(replacement, strategy))
+                    if (!ProcessTuning.TryApplyCapturePriority(
+                            replacement,
+                            strategy,
+                            CaptureGeometry.ResolveOutputSize(
+                                configuration.Display,
+                                configuration.Resolution).RequiresScaling))
                     {
                         EnqueueDiagnostic(
                             "Windows did not allow ClipForge to reapply the capture process priority policy.");
@@ -707,7 +737,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         throw new InvalidOperationException(BuildCaptureFailureMessage());
                     }
 
-                    if (!ProcessTuning.TryApplyCapturePriority(replacement, strategy))
+                    if (!ProcessTuning.TryApplyCapturePriority(
+                            replacement,
+                            strategy,
+                            CaptureGeometry.ResolveOutputSize(
+                                configuration.Display,
+                                configuration.Resolution).RequiresScaling))
                     {
                         EnqueueDiagnostic(
                             "Windows did not allow ClipForge to finalize the renewed capture priority policy.");
@@ -734,7 +769,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         string.Create(
                             CultureInfo.InvariantCulture,
                             $"Renewed the WGC capture process at segment {segmentStartNumber}; " +
-                            $"completed replay segments were retained. BoundaryAligned={reachedSegmentBoundary}; " +
+                            $"{(retainedCompletedSegments
+                                ? "completed replay segments were retained. "
+                                : "the previous capture generation was invalidated and is rebuffering. ")}" +
+                            $"BoundaryAligned={reachedSegmentBoundary}; " +
                             $"boundaryWaitMs={boundaryWait.TotalMilliseconds:0}; " +
                             $"replacementMs={Stopwatch.GetElapsedTime(replacementStarted).TotalMilliseconds:0}."));
                     RefreshBufferState();
@@ -859,13 +897,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 "Clip length must be between one second and one hour.");
         }
 
-        await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (Interlocked.CompareExchange(ref _saveOperationPending, 1, 0) != 0)
+        {
+            throw new InvalidOperationException(
+                "A clip is already being saved. ClipForge ignored the duplicate request.");
+        }
+
+        var enteredSaveGate = false;
         IReadOnlyList<string> selectedSegments = [];
         string? manifestPath = null;
         string? partialPath = null;
 
         try
         {
+            await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            enteredSaveGate = true;
             if (!IsRunning)
             {
                 throw new InvalidOperationException("Instant Replay is not running.");
@@ -904,6 +950,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             var ffmpegPath = _ffmpegSetupService.FindExecutable()
                 ?? throw new InvalidOperationException("The capture engine is no longer available.");
+            var ffprobePath = _ffmpegSetupService.FindProbeExecutable()
+                ?? throw new InvalidOperationException("The clip validator is no longer available.");
             Directory.CreateDirectory(saveDirectory);
             var finalPath = GetUniqueClipPath(saveDirectory);
             partialPath = Path.Combine(
@@ -937,6 +985,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 throw new InvalidDataException("The capture engine produced an empty clip.");
             }
 
+            var expectedFramesPerSecond = _activeConfiguration?.FramesPerSecond ?? 60;
+            var expectedAudio = _activeConfiguration is
+            {
+                CaptureSystemAudio: true
+            } or
+            {
+                CaptureMicrophone: true
+            };
+            await ValidateExportAsync(
+                    ffprobePath,
+                    partialPath,
+                    actualDuration,
+                    expectedFramesPerSecond,
+                    expectedAudio,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             File.Move(partialPath, finalPath);
             partialPath = null;
             _lastSavedPath = finalPath;
@@ -955,7 +1020,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             TryDeleteFile(manifestPath);
             TryDeleteFile(partialPath);
-            _saveGate.Release();
+            if (enteredSaveGate)
+            {
+                _saveGate.Release();
+            }
+
+            Volatile.Write(ref _saveOperationPending, 0);
             RefreshBufferState(_lastSavedPath);
         }
     }
@@ -1298,12 +1368,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         var tailIndex = _segments.Count - 1;
-        var tail = _segments[tailIndex];
+        var tail = _segments[tailIndex] with { IsTrusted = false };
+        _segments[tailIndex] = tail;
         if (_protectedSegments.Contains(tail.Path) || !TryDeleteFile(tail.Path))
         {
             // Never overwrite an uncertain file. If deletion is unavailable,
-            // the replacement starts at the next number and leaves this short
-            // tail intact rather than risking completed replay data.
+            // the replacement starts at the next number. The short tail stays
+            // indexed only for later cleanup and can never enter an export.
             return;
         }
 
@@ -1517,7 +1588,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     CapturePriorityRefreshInterval)
                 {
                     lastPriorityRefresh = Stopwatch.GetTimestamp();
-                    if (!ProcessTuning.TryEnsureCapturePriority(process, strategy))
+                    if (!ProcessTuning.TryEnsureCapturePriority(
+                            process,
+                            strategy,
+                            CaptureGeometry.ResolveOutputSize(
+                                configuration.Display,
+                                configuration.Resolution).RequiresScaling))
                     {
                         if (Interlocked.Exchange(
                                 ref _capturePriorityRefreshWarningReported,
@@ -1697,10 +1773,34 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var maximumCompletedSegments = checked((int)Math.Ceiling(
                 _retention.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
 
-            while (Math.Max(0, _segments.Count - 1) > maximumCompletedSegments)
+            // Once a later segment exists, a quarantined generation head is
+            // closed and can be removed. If Windows temporarily keeps the file
+            // open, it remains untrusted but does not consume replay capacity.
+            for (var index = _segments.Count - 2; index >= 0; index--)
             {
-                var candidateIndex = _segments.FindIndex(0, _segments.Count - 1, segment =>
-                    !_protectedSegments.Contains(segment.Path));
+                var segment = _segments[index];
+                if (segment.IsTrusted ||
+                    _protectedSegments.Contains(segment.Path) ||
+                    !TryDeleteFile(segment.Path))
+                {
+                    continue;
+                }
+
+                _bufferBytes = Math.Max(0, _bufferBytes - segment.Length);
+                _segments.RemoveAt(index);
+            }
+
+            var trustedCompletedCount = _segments
+                .Take(Math.Max(0, _segments.Count - 1))
+                .Count(segment => segment.Length > 0 && segment.IsTrusted);
+            while (trustedCompletedCount > maximumCompletedSegments)
+            {
+                var candidateIndex = _segments.FindIndex(
+                    0,
+                    Math.Max(0, _segments.Count - 1),
+                    segment => segment.Length > 0 &&
+                               segment.IsTrusted &&
+                               !_protectedSegments.Contains(segment.Path));
                 if (candidateIndex < 0)
                 {
                     break;
@@ -1714,11 +1814,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 _bufferBytes = Math.Max(0, _bufferBytes - candidate.Length);
                 _segments.RemoveAt(candidateIndex);
+                trustedCompletedCount--;
             }
 
             var completedCount = _segments
                 .Take(Math.Max(0, _segments.Count - 1))
-                .Count(segment => segment.Length > 0);
+                .Count(segment => segment.Length > 0 && segment.IsTrusted);
             available = TimeSpan.FromSeconds(Math.Min(
                 _retention.TotalSeconds,
                 completedCount * FfmpegArgumentBuilder.SegmentSeconds));
@@ -1766,7 +1867,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
              index--)
         {
             var segment = _segments[index];
-            if (GetFileLengthSafely(segment.Path) > 0)
+            if (segment.IsTrusted && GetFileLengthSafely(segment.Path) > 0)
             {
                 result.Add(segment.Path);
             }
@@ -1800,7 +1901,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
 
             UpdateNewestSegmentLengthLocked();
-            _segments.Add(new BufferedSegment(nextPath, 0));
+            var segmentNumber = _nextSegmentNumber;
+            _segments.Add(new BufferedSegment(
+                nextPath,
+                0,
+                segmentNumber,
+                _activeCaptureGeneration,
+                IsCaptureSegmentTrusted(
+                    segmentNumber,
+                    _quarantinedGenerationHeadSegmentNumber)));
             _nextSegmentNumber++;
         }
 
@@ -1826,6 +1935,57 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _segments.Clear();
         _bufferBytes = 0;
         _nextSegmentNumber = 0;
+        _activeCaptureGeneration = 0;
+        _quarantinedGenerationHeadSegmentNumber = -1;
+    }
+
+    private void BeginCaptureGenerationLocked(int firstSegmentNumber)
+    {
+        if (firstSegmentNumber < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(firstSegmentNumber));
+        }
+
+        _activeCaptureGeneration = checked(_activeCaptureGeneration + 1);
+        // The first segment of a new WGC process can contain a delayed first
+        // video frame while audio already begins at zero. Never concatenate
+        // that startup segment into a user clip; the next closed segment proves
+        // the replacement process has reached its steady two-second cadence.
+        _quarantinedGenerationHeadSegmentNumber = firstSegmentNumber;
+    }
+
+    internal static bool ShouldRetainCompletedSegments(
+        bool preserveCompletedSegments,
+        bool reachedSegmentBoundary) =>
+        preserveCompletedSegments && reachedSegmentBoundary;
+
+    internal static bool IsCaptureSegmentTrusted(
+        int segmentNumber,
+        int quarantinedGenerationHeadSegmentNumber) =>
+        segmentNumber >= 0 &&
+        segmentNumber != quarantinedGenerationHeadSegmentNumber;
+
+    private void InvalidateRetainedCaptureGenerationLocked()
+    {
+        // A timed-out boundary or a health-triggered renewal means the old
+        // process may have continued writing audio while video was stalled.
+        // Keeping any of that generation can create a nominal 180-second MP4
+        // whose video starts tens of seconds late. Mark every entry untrusted
+        // even when Windows prevents immediate deletion, then rebuffer from the
+        // replacement generation without reusing segment numbers.
+        for (var index = _segments.Count - 1; index >= 0; index--)
+        {
+            var segment = _segments[index] with { IsTrusted = false };
+            if (!_protectedSegments.Contains(segment.Path) &&
+                TryDeleteFile(segment.Path))
+            {
+                _bufferBytes = Math.Max(0, _bufferBytes - segment.Length);
+                _segments.RemoveAt(index);
+                continue;
+            }
+
+            _segments[index] = segment;
+        }
     }
 
     private static long GetFileLengthSafely(string path)
@@ -2168,6 +2328,355 @@ public sealed class ReplayBufferService : IAsyncDisposable
                ?? lines.LastOrDefault();
     }
 
+    internal static IReadOnlyList<string> BuildExportValidationArguments(string mediaPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaPath);
+        return
+        [
+            "-v", "error",
+            "-protocol_whitelist", "file",
+            "-show_entries",
+            "stream=codec_type,start_time,duration,avg_frame_rate,r_frame_rate,nb_frames:format=duration",
+            "-of", "json",
+            mediaPath
+        ];
+    }
+
+    internal static bool TryValidateExportProbe(
+        string probeJson,
+        TimeSpan expectedDuration,
+        int expectedFramesPerSecond,
+        bool expectedAudio,
+        out string failure)
+    {
+        failure = string.Empty;
+        if (expectedDuration <= TimeSpan.Zero ||
+            expectedFramesPerSecond is < 1 or > 240)
+        {
+            failure = "The expected clip timeline is invalid.";
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(probeJson, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 16
+            });
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("streams", out var streams) ||
+                streams.ValueKind != JsonValueKind.Array)
+            {
+                failure = "The validator did not find an MP4 stream table.";
+                return false;
+            }
+
+            JsonElement? video = null;
+            JsonElement? audio = null;
+            foreach (var stream in streams.EnumerateArray())
+            {
+                if (stream.ValueKind != JsonValueKind.Object ||
+                    !stream.TryGetProperty("codec_type", out var codecType) ||
+                    codecType.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                switch (codecType.GetString())
+                {
+                    case "video" when video is null:
+                        video = stream.Clone();
+                        break;
+                    case "audio" when audio is null:
+                        audio = stream.Clone();
+                        break;
+                }
+            }
+
+            if (video is null)
+            {
+                failure = "The generated clip has no video stream.";
+                return false;
+            }
+
+            if (expectedAudio && audio is null)
+            {
+                failure = "The generated clip is missing its expected audio stream.";
+                return false;
+            }
+
+            if (!TryReadProbeSeconds(video.Value, "start_time", out var videoStart) ||
+                !TryReadProbeSeconds(video.Value, "duration", out var videoDuration))
+            {
+                failure = "The video timeline is missing start or duration metadata.";
+                return false;
+            }
+
+            var frameTolerance = Math.Max(0.05, 2d / expectedFramesPerSecond);
+            var durationTolerance = Math.Max(0.15, 3d / expectedFramesPerSecond);
+            if (Math.Abs(videoStart) > frameTolerance)
+            {
+                failure = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The video begins at {videoStart:0.###}s instead of zero.");
+                return false;
+            }
+
+            if (Math.Abs(videoDuration - expectedDuration.TotalSeconds) > durationTolerance)
+            {
+                failure = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The video duration is {videoDuration:0.###}s; expected {expectedDuration.TotalSeconds:0.###}s.");
+                return false;
+            }
+
+            if (!TryReadProbeRate(video.Value, "avg_frame_rate", out var averageRate) ||
+                Math.Abs(averageRate - expectedFramesPerSecond) >
+                Math.Max(1d, expectedFramesPerSecond * 0.08))
+            {
+                failure = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The average video cadence is {averageRate:0.##} FPS; expected {expectedFramesPerSecond} FPS.");
+                return false;
+            }
+
+            if (TryReadProbeLong(video.Value, "nb_frames", out var frameCount))
+            {
+                var expectedFrameCount = expectedDuration.TotalSeconds * expectedFramesPerSecond;
+                var frameCountTolerance = Math.Max(3d, expectedFramesPerSecond * 0.25);
+                if (Math.Abs(frameCount - expectedFrameCount) > frameCountTolerance)
+                {
+                    failure = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"The video contains {frameCount} frames; expected about {expectedFrameCount:0}.");
+                    return false;
+                }
+            }
+
+            if (!document.RootElement.TryGetProperty("format", out var format) ||
+                !TryReadProbeSeconds(format, "duration", out var containerDuration) ||
+                Math.Abs(containerDuration - expectedDuration.TotalSeconds) >
+                Math.Max(0.25, durationTolerance))
+            {
+                failure = "The MP4 container duration does not match the requested clip.";
+                return false;
+            }
+
+            if (audio is { } audioStream)
+            {
+                if (!TryReadProbeSeconds(audioStream, "start_time", out var audioStart) ||
+                    !TryReadProbeSeconds(audioStream, "duration", out var audioDuration))
+                {
+                    failure = "The audio timeline is missing start or duration metadata.";
+                    return false;
+                }
+
+                if (Math.Abs(audioStart) > 0.1 ||
+                    Math.Abs(audioDuration - videoDuration) > 0.25)
+                {
+                    failure = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Audio/video timing differs (audio start {audioStart:0.###}s, " +
+                        $"audio {audioDuration:0.###}s, video {videoDuration:0.###}s).");
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is JsonException or InvalidOperationException or FormatException)
+        {
+            failure = "The clip validator returned malformed metadata.";
+            return false;
+        }
+    }
+
+    private static bool TryReadProbeSeconds(
+        JsonElement element,
+        string propertyName,
+        out double value)
+    {
+        value = 0;
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number)
+        {
+            return property.TryGetDouble(out value) && double.IsFinite(value);
+        }
+
+        return property.ValueKind == JsonValueKind.String &&
+               double.TryParse(
+                   property.GetString(),
+                   NumberStyles.Float,
+                   CultureInfo.InvariantCulture,
+                   out value) &&
+               double.IsFinite(value);
+    }
+
+    private static bool TryReadProbeRate(
+        JsonElement element,
+        string propertyName,
+        out double value)
+    {
+        value = 0;
+        if (!element.TryGetProperty(propertyName, out var property) ||
+            property.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var text = property.GetString();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var slash = text.IndexOf('/');
+        if (slash < 0)
+        {
+            return double.TryParse(
+                       text,
+                       NumberStyles.Float,
+                       CultureInfo.InvariantCulture,
+                       out value) &&
+                   double.IsFinite(value) &&
+                   value > 0;
+        }
+
+        return double.TryParse(
+                   text.AsSpan(0, slash),
+                   NumberStyles.Float,
+                   CultureInfo.InvariantCulture,
+                   out var numerator) &&
+               double.TryParse(
+                   text.AsSpan(slash + 1),
+                   NumberStyles.Float,
+                   CultureInfo.InvariantCulture,
+                   out var denominator) &&
+               double.IsFinite(numerator) &&
+               double.IsFinite(denominator) &&
+               denominator != 0 &&
+               double.IsFinite(value = numerator / denominator) &&
+               value > 0;
+    }
+
+    private static bool TryReadProbeLong(
+        JsonElement element,
+        string propertyName,
+        out long value)
+    {
+        value = 0;
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number)
+        {
+            return property.TryGetInt64(out value) && value >= 0;
+        }
+
+        return property.ValueKind == JsonValueKind.String &&
+               long.TryParse(
+                   property.GetString(),
+                   NumberStyles.None,
+                   CultureInfo.InvariantCulture,
+                   out value) &&
+               value >= 0;
+    }
+
+    private static async Task ValidateExportAsync(
+        string ffprobePath,
+        string mediaPath,
+        TimeSpan expectedDuration,
+        int expectedFramesPerSecond,
+        bool expectedAudio,
+        CancellationToken cancellationToken)
+    {
+        using var process = CreateProcess(
+            ffprobePath,
+            BuildExportValidationArguments(mediaPath),
+            redirectStandardInput: false,
+            redirectStandardOutput: true);
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Windows could not start the clip validator.");
+        }
+
+        using var processJob = AttachAuxiliaryProcessLifetime(process);
+        _ = ProcessTuning.TryApplyLowImpactPriority(process);
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = ReadLastDiagnosticLineAsync(process.StandardError);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeout.Token);
+        try
+        {
+            await process.WaitForExitAsync(linkedCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            TryKill(process);
+            await WaitForExportTerminationAsync(process).ConfigureAwait(false);
+            _ = outputTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            _ = errorTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            throw new InvalidDataException("Clip validation timed out.");
+        }
+        catch
+        {
+            TryKill(process);
+            await WaitForExportTerminationAsync(process).ConfigureAwait(false);
+            _ = outputTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            _ = errorTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            throw;
+        }
+
+        var output = await outputTask.ConfigureAwait(false);
+        var error = await errorTask.ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidDataException(
+                string.IsNullOrWhiteSpace(error)
+                    ? "The generated clip could not be read back by ClipForge."
+                    : $"The generated clip could not be validated. {error}");
+        }
+
+        if (!TryValidateExportProbe(
+                output,
+                expectedDuration,
+                expectedFramesPerSecond,
+                expectedAudio,
+                out var failure))
+        {
+            throw new InvalidDataException(
+                $"ClipForge rejected a clip with a broken media timeline. {failure}");
+        }
+    }
+
     private static async Task RunExportProcessAsync(
         string executable,
         IReadOnlyList<string> arguments,
@@ -2179,19 +2688,38 @@ public sealed class ReplayBufferService : IAsyncDisposable
             throw new InvalidOperationException("Windows could not start the clip exporter.");
         }
 
+        using var processJob = AttachAuxiliaryProcessLifetime(process);
         _ = ProcessTuning.TryApplyLowImpactPriority(process);
 
         // FFmpeg can repeat warnings for every frame. Drain stderr continuously
         // so the process cannot block, but retain only the final bounded line
         // instead of growing an in-memory string for the whole export.
         var errorTask = ReadLastDiagnosticLineAsync(process.StandardError);
+        using var timeout = new CancellationTokenSource(ExportProcessMaximumRuntime);
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeout.Token);
         try
         {
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            await process.WaitForExitAsync(linkedCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            TryKill(process);
+            await WaitForExportTerminationAsync(process).ConfigureAwait(false);
+            _ = errorTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            throw new TimeoutException(
+                "The clip exporter exceeded its bounded runtime and was stopped.");
         }
         catch
         {
             TryKill(process);
+            await WaitForExportTerminationAsync(process).ConfigureAwait(false);
             _ = errorTask.ContinueWith(
                 task => _ = task.Exception,
                 CancellationToken.None,
@@ -2207,6 +2735,67 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 string.IsNullOrWhiteSpace(error)
                     ? "The capture engine could not assemble the clip."
                     : $"The capture engine could not assemble the clip. {error}");
+        }
+    }
+
+    private static async Task WaitForExportTerminationAsync(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                await process.WaitForExitAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or ObjectDisposedException or TimeoutException or
+                System.ComponentModel.Win32Exception)
+        {
+            // The process was already contained with an entire-tree kill. The
+            // partial remains hidden and best-effort cleanup runs after the
+            // protected segment snapshot is released.
+        }
+    }
+
+    private static CaptureProcessJob? AttachAuxiliaryProcessLifetime(Process process)
+    {
+        try
+        {
+            return CaptureProcessJob.Attach(process);
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            var processHasExited = false;
+            try
+            {
+                processHasExited = process.HasExited;
+            }
+            catch (Exception statusException) when (
+                statusException is InvalidOperationException or
+                    System.ComponentModel.Win32Exception)
+            {
+                // Preserve the original ownership failure below.
+            }
+
+            if (CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                    exception,
+                    processHasExited))
+            {
+                return null;
+            }
+
+            TryKill(process);
+            throw;
+        }
+        catch
+        {
+            // A helper that cannot be placed in a kill-on-close job must not be
+            // allowed to outlive ClipForge or retain protected replay segments.
+            TryKill(process);
+            throw;
         }
     }
 
@@ -2798,7 +3387,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private void ThrowIfDisposed() =>
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-    private readonly record struct BufferedSegment(string Path, long Length);
+    private readonly record struct BufferedSegment(
+        string Path,
+        long Length,
+        int SegmentNumber,
+        int GenerationId,
+        bool IsTrusted);
 }
 
 /// <summary>

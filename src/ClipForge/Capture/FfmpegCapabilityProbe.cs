@@ -5,6 +5,12 @@ namespace ClipForge.Capture;
 
 internal sealed record FfmpegProbeExecution(bool Succeeded, string? Diagnostic = null);
 
+internal readonly record struct FfmpegProbeCadenceObservation(
+    int FirstFrame,
+    TimeSpan FirstFrameElapsed,
+    int LastFrame,
+    TimeSpan LastFrameElapsed);
+
 internal interface IFfmpegProbeRunner
 {
     Task<FfmpegProbeExecution> RunAsync(
@@ -286,7 +292,7 @@ internal sealed class FfmpegCapabilityProbe
 
 internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
 {
-    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
     private const int MaximumDiagnosticLines = 12;
     private const int MaximumDiagnosticCharactersPerLine = 512;
 
@@ -300,7 +306,8 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             FileName = executable,
             UseShellExecute = false,
             CreateNoWindow = true,
-            RedirectStandardError = true
+            RedirectStandardError = true,
+            RedirectStandardOutput = true
         };
         foreach (var argument in arguments)
         {
@@ -308,6 +315,7 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         }
 
         using var process = new Process { StartInfo = startInfo };
+        var startedAt = Stopwatch.GetTimestamp();
         if (!process.Start())
         {
             return new FfmpegProbeExecution(false, "Windows could not start FFmpeg.");
@@ -315,6 +323,9 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
 
         _ = ProcessTuning.TryApplyLowImpactPriority(process);
         var diagnosticsTask = ReadDiagnosticTailAsync(process.StandardError);
+        var progressTask = ReadProgressObservationAsync(
+            process.StandardOutput,
+            startedAt);
         using var timeout = new CancellationTokenSource(ProbeTimeout);
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
@@ -341,12 +352,18 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
                     CancellationToken.None,
                     TaskContinuationOptions.OnlyOnFaulted,
                     TaskScheduler.Default);
+                _ = progressTask.ContinueWith(
+                    task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
                 return new FfmpegProbeExecution(
                     false,
                     "runtime probe timed out and could not be terminated promptly");
             }
 
             var timedOutDiagnostics = await diagnosticsTask.ConfigureAwait(false);
+            _ = await progressTask.ConfigureAwait(false);
             return new FfmpegProbeExecution(
                 false,
                 string.IsNullOrWhiteSpace(timedOutDiagnostics)
@@ -356,11 +373,181 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         catch
         {
             TryKill(process);
+            _ = diagnosticsTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            _ = progressTask.ContinueWith(
+                task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
             throw;
         }
 
         var diagnostics = await diagnosticsTask.ConfigureAwait(false);
-        return new FfmpegProbeExecution(process.ExitCode == 0, diagnostics);
+        var progress = await progressTask.ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            return new FfmpegProbeExecution(false, diagnostics);
+        }
+
+        return IsProbeCadenceAcceptable(arguments, progress, out var cadenceDiagnostic)
+            ? new FfmpegProbeExecution(true, diagnostics)
+            : new FfmpegProbeExecution(false, cadenceDiagnostic);
+    }
+
+    internal static bool IsProbeCadenceAcceptable(
+        IReadOnlyList<string> arguments,
+        FfmpegProbeCadenceObservation? observation,
+        out string diagnostic)
+    {
+        ArgumentNullException.ThrowIfNull(arguments);
+        diagnostic = string.Empty;
+        var graphicsFilter = arguments.FirstOrDefault(argument =>
+            argument.Contains("gfxcapture=", StringComparison.Ordinal) &&
+            argument.Contains(":resize_mode=scale", StringComparison.Ordinal));
+        if (graphicsFilter is null)
+        {
+            return true;
+        }
+
+        if (!TryReadOptionInteger(arguments, "-frames:v", out var requestedFrames) ||
+            !TryReadFilterInteger(graphicsFilter, "max_framerate=", out var requestedFramesPerSecond) ||
+            requestedFrames <= 0 ||
+            requestedFramesPerSecond <= 0)
+        {
+            diagnostic = "scaled graphics probe omitted its frame-count or frame-rate contract";
+            return false;
+        }
+
+        if (observation is not { } sample ||
+            sample.FirstFrame <= 0 ||
+            sample.LastFrame < requestedFrames ||
+            sample.LastFrame <= sample.FirstFrame ||
+            sample.LastFrameElapsed <= sample.FirstFrameElapsed)
+        {
+            diagnostic =
+                "scaled graphics probe did not report enough frame-progress samples to verify sustained cadence";
+            return false;
+        }
+
+        var observedFrameDelta = sample.LastFrame - sample.FirstFrame;
+        var minimumFrameDelta = Math.Min(
+            requestedFrames - 1,
+            Math.Max(2, requestedFramesPerSecond));
+        if (observedFrameDelta < minimumFrameDelta)
+        {
+            diagnostic =
+                "scaled graphics probe reported too short a frame-progress interval to verify sustained cadence";
+            return false;
+        }
+
+        var observedDuration = sample.LastFrameElapsed - sample.FirstFrameElapsed;
+        var observedFramesPerSecond =
+            observedFrameDelta / observedDuration.TotalSeconds;
+        var minimumFramesPerSecond = requestedFramesPerSecond * 0.85;
+        if (observedFramesPerSecond >= minimumFramesPerSecond)
+        {
+            return true;
+        }
+
+        diagnostic = string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"scaled graphics probe sustained {observedFramesPerSecond:0.##} FPS; " +
+            $"the required minimum is {minimumFramesPerSecond:0.##} FPS");
+        return false;
+    }
+
+    private static async Task<FfmpegProbeCadenceObservation?> ReadProgressObservationAsync(
+        StreamReader reader,
+        long processStartedAt)
+    {
+        int? firstFrame = null;
+        var firstFrameElapsed = TimeSpan.Zero;
+        var lastFrame = 0;
+        var lastFrameElapsed = TimeSpan.Zero;
+
+        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+        {
+            const string framePrefix = "frame=";
+            if (!line.StartsWith(framePrefix, StringComparison.Ordinal) ||
+                !int.TryParse(
+                    line.AsSpan(framePrefix.Length).Trim(),
+                    System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var frame) ||
+                frame <= 0 ||
+                frame <= lastFrame)
+            {
+                continue;
+            }
+
+            var elapsed = Stopwatch.GetElapsedTime(processStartedAt);
+            if (firstFrame is null)
+            {
+                firstFrame = frame;
+                firstFrameElapsed = elapsed;
+            }
+
+            lastFrame = frame;
+            lastFrameElapsed = elapsed;
+        }
+
+        return firstFrame is { } first
+            ? new FfmpegProbeCadenceObservation(
+                first,
+                firstFrameElapsed,
+                lastFrame,
+                lastFrameElapsed)
+            : null;
+    }
+
+    private static bool TryReadOptionInteger(
+        IReadOnlyList<string> arguments,
+        string option,
+        out int value)
+    {
+        value = 0;
+        for (var index = 0; index < arguments.Count - 1; index++)
+        {
+            if (arguments[index].Equals(option, StringComparison.Ordinal) &&
+                int.TryParse(
+                    arguments[index + 1],
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out value))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryReadFilterInteger(
+        string filter,
+        string marker,
+        out int value)
+    {
+        value = 0;
+        var start = filter.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            return false;
+        }
+
+        start += marker.Length;
+        var end = filter.IndexOf(':', start);
+        var text = end < 0
+            ? filter.AsSpan(start)
+            : filter.AsSpan(start, end - start);
+        return int.TryParse(
+            text,
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out value);
     }
 
     private static async Task<string> ReadDiagnosticTailAsync(StreamReader reader)

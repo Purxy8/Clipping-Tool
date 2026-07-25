@@ -79,6 +79,7 @@ try
             includeTrimAudio,
             GetOption(args, "--trim-source"),
             trimExecutionMode,
+            args.Contains("--aligned-trim", StringComparer.OrdinalIgnoreCase),
             timeout.Token);
         return 0;
     }
@@ -228,11 +229,19 @@ try
                 $"Capture CPU priority was {performance.Priority}; expected BelowNormal for every path.");
         }
 
-        if (performance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+        var activeStrategy = replay.LastCapturePlan?.Strategy
+            ?? throw new InvalidDataException("Capture strategy details were unavailable.");
+        var captureOutputRequiresScaling = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution).RequiresScaling;
+        var expectedGraphicsPriority = ProcessTuning.GetCaptureGraphicsPriority(
+            activeStrategy,
+            captureOutputRequiresScaling);
+        if (performance.GraphicsPriority != expectedGraphicsPriority)
         {
             throw new InvalidDataException(
                 $"Capture GPU priority was {performance.GraphicsPriority?.ToString() ?? "unavailable"}; " +
-                "expected BelowNormal.");
+                $"expected {expectedGraphicsPriority}.");
         }
 
         if (forceGdi && performance.Priority != ProcessPriorityClass.BelowNormal)
@@ -267,13 +276,17 @@ try
             using (var captureProcess = Process.GetProcessById(captureProcessId))
             {
                 captureProcess.PriorityClass = ProcessPriorityClass.Normal;
+                var injectedGraphicsPriority =
+                    expectedGraphicsPriority == GraphicsSchedulingPriorityClass.Normal
+                        ? GraphicsSchedulingPriorityClass.BelowNormal
+                        : GraphicsSchedulingPriorityClass.Normal;
                 if (!ProcessTuning.TryApplyGraphicsPriority(
                         captureProcess,
-                        GraphicsSchedulingPriorityClass.Normal) ||
+                        injectedGraphicsPriority) ||
                     !ProcessTuning.TryReadGraphicsPriority(
                         captureProcess,
                         out var driftedGraphicsPriority) ||
-                    driftedGraphicsPriority != GraphicsSchedulingPriorityClass.Normal)
+                    driftedGraphicsPriority != injectedGraphicsPriority)
                 {
                     throw new InvalidDataException(
                         "The priority-repair smoke could not create a controlled GPU-priority drift.");
@@ -281,13 +294,13 @@ try
             }
 
             Console.WriteLine(
-                "Injected a controlled Normal CPU/GPU priority drift; waiting for the 30s repair policy.");
+                "Injected a controlled CPU/GPU priority drift; waiting for the 30s repair policy.");
             await Task.Delay(TimeSpan.FromSeconds(32), timeout.Token);
             var repairedPerformance = await ReadPerformanceSampleAsync(replay, timeout.Token)
                 ?? throw new InvalidDataException(
                     "Capture process metrics were unavailable after the priority-repair interval.");
             if (repairedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
-                repairedPerformance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+                repairedPerformance.GraphicsPriority != expectedGraphicsPriority)
             {
                 throw new InvalidDataException(
                     $"Capture priority repair failed: CPU {repairedPerformance.Priority}, " +
@@ -312,7 +325,7 @@ try
                 ?? throw new InvalidDataException(
                     "Capture process metrics were unavailable after the live replay hold.");
             if (sustainedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
-                sustainedPerformance.GraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+                sustainedPerformance.GraphicsPriority != expectedGraphicsPriority)
             {
                 throw new InvalidDataException(
                     $"Sustained capture priority drifted to CPU {sustainedPerformance.Priority}, " +
@@ -388,11 +401,11 @@ try
                         !ProcessTuning.TryReadGraphicsPriority(
                             replacementProcess,
                             out var replacementGraphicsPriority) ||
-                        replacementGraphicsPriority != GraphicsSchedulingPriorityClass.BelowNormal)
+                        replacementGraphicsPriority != expectedGraphicsPriority)
                     {
                         throw new InvalidDataException(
                             $"Replacement process {replacementProcessId} did not inherit the " +
-                            "BelowNormal CPU/GPU capture policy.");
+                            $"expected capture priority policy.");
                     }
                 }
 
@@ -1346,6 +1359,7 @@ static async Task RunReplayConcurrentTrimSmokeAsync(
                 includeAudio: true,
                 seedPath,
                 ClipTrimExecutionMode.ReplayCoexisting,
+                alignedTrim: false,
                 cancellationToken)
             .ConfigureAwait(false);
         if (!replay.IsRunning || Volatile.Read(ref faulted) != 0)
@@ -1610,6 +1624,7 @@ static async Task RunTrimSmokeAsync(
     bool includeAudio,
     string? existingSourcePath,
     ClipTrimExecutionMode executionMode,
+    bool alignedTrim,
     CancellationToken cancellationToken)
 {
     var ffprobe = setup.FindProbeExecutable()
@@ -1646,9 +1661,15 @@ static async Task RunTrimSmokeAsync(
         .ConfigureAwait(false);
     var sourceMedia = await ReadMediaInfoAsync(ffprobe, sourcePath, cancellationToken)
         .ConfigureAwait(false);
+    var requestedStart = alignedTrim
+        ? TimeSpan.FromSeconds(2)
+        : TimeSpan.FromMilliseconds(1113);
+    var requestedEnd = alignedTrim
+        ? TimeSpan.FromSeconds(4)
+        : TimeSpan.FromMilliseconds(6287);
     if (!ClipTrimService.TryNormalizeRange(
-            TimeSpan.FromMilliseconds(1113),
-            TimeSpan.FromMilliseconds(6287),
+            requestedStart,
+            requestedEnd,
             TimeSpan.FromSeconds(sourceDuration),
             sourceMedia.NominalFrameRate,
             out var expectedRange,
@@ -1683,8 +1704,8 @@ static async Task RunTrimSmokeAsync(
     var trim = await new ClipTrimService(setup).TrimAsync(
             runDirectory,
             source,
-            TimeSpan.FromMilliseconds(1113),
-            TimeSpan.FromMilliseconds(6287),
+            requestedStart,
+            requestedEnd,
             executionMode,
             cancellationToken)
         .ConfigureAwait(false);

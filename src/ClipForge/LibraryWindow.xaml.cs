@@ -22,6 +22,7 @@ public partial class LibraryWindow : Window
     private const int InitialClipLimit = 100;
     private static readonly TimeSpan NormalPlayerTimerInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan TrimPreviewTimerInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan TrimSeekDebounceInterval = TimeSpan.FromMilliseconds(75);
     private static readonly LibraryFilterOption[] LibraryFilterOptions =
     [
         new(ClipLibraryFilter.All, "All clips"),
@@ -34,6 +35,7 @@ public partial class LibraryWindow : Window
     private readonly string _saveDirectory;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _playerTimer;
+    private readonly DispatcherTimer _trimSeekTimer;
     private readonly NativeWindowThemeService _nativeWindowThemeService;
     private readonly string? _initialPreferredPath;
     private readonly IReadOnlyList<ClipLibraryItem> _initialCachedClips;
@@ -75,6 +77,7 @@ public partial class LibraryWindow : Window
     private LibraryMediaOpenPlan? _pendingOpenPlan;
     private ClipLibraryFilter _activeFilter = ClipLibraryFilter.All;
     private ClipTrimExecutionMode _activeTrimExecutionMode = ClipTrimExecutionMode.Standard;
+    private TimeSpan? _pendingTrimSeekPosition;
     private string? _requestedPreferredPath;
 
     public LibraryWindow(
@@ -117,6 +120,11 @@ public partial class LibraryWindow : Window
             Interval = NormalPlayerTimerInterval
         };
         _playerTimer.Tick += PlayerTimer_Tick;
+        _trimSeekTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TrimSeekDebounceInterval
+        };
+        _trimSeekTimer.Tick += TrimSeekTimer_Tick;
 
         Loaded += LibraryWindow_Loaded;
         Activated += LibraryWindow_Activated;
@@ -187,6 +195,8 @@ public partial class LibraryWindow : Window
         lock (_refreshCancellationGate)
         {
             RefreshButton.IsEnabled = !isRunning &&
+                                      !IsCurrentClipRequestedForTrim() &&
+                                      !_isTrimMode &&
                                       !_isTrimInProgress &&
                                       !_isPresentationSuspended &&
                                       _activeRefreshCancellation is null &&
@@ -196,7 +206,9 @@ public partial class LibraryWindow : Window
 
         if (!isRunning)
         {
-            if (_isTrimInProgress ||
+            if (IsCurrentClipRequestedForTrim() ||
+                _isTrimMode ||
+                _isTrimInProgress ||
                 !_isLoaded ||
                 !IsVisible ||
                 !IsActive ||
@@ -260,14 +272,31 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        if (IsCurrentClipRequestedForTrim())
+        {
+            OpenClip(_currentClip!, autoplay: false);
+            TryBeginRequestedTrim();
+            UpdateTrimAvailability();
+            return;
+        }
+
+        if (_isTrimMode)
+        {
+            if (_sourceReleasedForBackground && _currentClip is { } trimClip)
+            {
+                OpenClip(
+                    trimClip,
+                    autoplay: false,
+                    preserveRestorePosition: true);
+            }
+
+            UpdateTrimAvailability();
+            return;
+        }
+
         if (_isReplayRunning)
         {
-            if (_beginTrimWhenReady && _currentClip is { } requestedClip)
-            {
-                OpenClip(requestedClip, autoplay: false);
-                TryBeginRequestedTrim();
-            }
-            else if (_sourceReleasedForBackground && _currentClip is { } releasedClip)
+            if (_sourceReleasedForBackground && _currentClip is { } releasedClip)
             {
                 // Keep the selected poster/card, but require a fresh Play click
                 // before recreating a WPF decoder during replay.
@@ -307,32 +336,67 @@ public partial class LibraryWindow : Window
         _requestedPreferredPath = clip.FullPath;
         _beginTrimWhenReady = true;
         _refreshPending = true;
-        if (_isLoaded && IsVisible && IsActive)
+        if (!_isLoaded)
         {
-            if (_isReplayRunning && !_isPresentationSuspended)
-            {
-                _suppressSelectionAutoplay = true;
-                try
-                {
-                    ClipList.SelectedItem = ClipList.Items
-                        .OfType<ClipLibraryItem>()
-                        .FirstOrDefault(item => item.FullPath.Equals(
-                            clip.FullPath,
-                            StringComparison.OrdinalIgnoreCase));
-                }
-                finally
-                {
-                    _suppressSelectionAutoplay = false;
-                }
+            return;
+        }
 
-                OpenClip(clip, autoplay: false);
-                TryBeginRequestedTrim();
-                return;
+        // This is an explicit identity-bound foreground action. Stop any
+        // discovery/thumbnail helper and keep its refresh pending until the
+        // trim editor closes instead of making the editor wait for a probe pass.
+        CancelRefreshForBackground();
+        RefreshButton.IsEnabled = false;
+        _suppressSelectionAutoplay = true;
+        try
+        {
+            ClipList.SelectedItem = ClipList.Items
+                .OfType<ClipLibraryItem>()
+                .FirstOrDefault(item => item.FullPath.Equals(
+                    clip.FullPath,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            _suppressSelectionAutoplay = false;
+        }
+
+        if (!ShouldOpenRequestedTrimDirectly(
+                _isLoaded,
+                IsVisible,
+                IsActive,
+                _isPresentationSuspended))
+        {
+            // Preserve the exact requested identity so activation or the end of
+            // a short capture-critical presentation can open it without first
+            // rebuilding the full library.
+            SelectClipWithoutOpening(clip);
+            return;
+        }
+
+        OpenClip(clip, autoplay: false);
+        if (_currentClip is null ||
+            !_currentClip.FullPath.Equals(clip.FullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            if (!_isReplayRunning)
+            {
+                _ = RefreshLibraryAsync(clip.FullPath);
             }
 
-            _ = RefreshLibraryAsync(clip.FullPath);
+            return;
         }
+
+        TryBeginRequestedTrim();
     }
+
+    internal static bool ShouldOpenRequestedTrimDirectly(
+        bool isLoaded,
+        bool isVisible,
+        bool isActive,
+        bool presentationSuspended) =>
+        isLoaded &&
+        isVisible &&
+        isActive &&
+        !presentationSuspended;
 
     private async void LibraryWindow_Loaded(object sender, RoutedEventArgs e)
     {
@@ -340,7 +404,7 @@ public partial class LibraryWindow : Window
         _isLoaded = true;
         if (_isReplayRunning)
         {
-            BindInitialCachedReplayClips();
+            BindInitialCachedClips(replayDeferred: true);
             _refreshPending = true;
             if (_isPresentationSuspended)
             {
@@ -357,6 +421,22 @@ public partial class LibraryWindow : Window
             EmptyLibraryState.Visibility = Visibility.Collapsed;
             LibraryStatusText.Text = "Capture is completing a short critical operation...";
             return;
+        }
+
+        if (_initialCachedClips.Count > 0)
+        {
+            // Paint already identity-validated cards immediately. The full
+            // discovery/probe pass continues below without leaving the window
+            // blank behind unrelated metadata and thumbnail helpers.
+            BindInitialCachedClips(replayDeferred: false);
+            if (_beginTrimWhenReady && _currentClip is not null)
+            {
+                // The explicit Main-window trim request already opened its
+                // identity-bound cached source. Do not tear that graph down with
+                // a second full refresh while MediaOpened is entering trim mode.
+                _refreshPending = true;
+                return;
+            }
         }
 
         await RefreshLibraryAsync(_initialPreferredPath);
@@ -397,7 +477,7 @@ public partial class LibraryWindow : Window
         if (ShouldSuppressAutomaticRefresh(
                 _isReplayRunning,
                 _isPresentationSuspended,
-                _isTrimInProgress))
+                IsTrimOwningLibraryWork))
         {
             _refreshPending = true;
             if (_isReplayRunning && !_isPresentationSuspended)
@@ -436,7 +516,7 @@ public partial class LibraryWindow : Window
             if (ShouldSuppressAutomaticRefresh(
                     _isReplayRunning,
                     _isPresentationSuspended,
-                    _isTrimInProgress))
+                    IsTrimOwningLibraryWork))
             {
                 _refreshPending = true;
                 return;
@@ -447,7 +527,7 @@ public partial class LibraryWindow : Window
                 count: InitialClipLimit,
                 includeThumbnails: true,
                 filter: _activeFilter,
-                thumbnailPolicy: ClipThumbnailPolicy.GenerateMissing,
+                thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
                 cancellationToken: refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
@@ -455,7 +535,7 @@ public partial class LibraryWindow : Window
                 ShouldSuppressAutomaticRefresh(
                     _isReplayRunning,
                     _isPresentationSuspended,
-                    _isTrimInProgress) ||
+                    IsTrimOwningLibraryWork) ||
                 !IsVisible ||
                 !IsActive)
             {
@@ -550,6 +630,60 @@ public partial class LibraryWindow : Window
             }
 
             _refreshPending = false;
+
+            var hasMissingThumbnails = clips.Any(clip => clip.ThumbnailPath is null);
+            if (hasMissingThumbnails && IsTrimOwningLibraryWork)
+            {
+                // The selected media graph is still opening for an explicit trim.
+                // Defer all thumbnail helpers until trim mode exits.
+                _refreshPending = true;
+            }
+            else if (hasMissingThumbnails)
+            {
+                var hydrated = await _clipLibraryService.HydrateThumbnailsAsync(
+                    _saveDirectory,
+                    clips,
+                    // The service already owns a 20-second total budget. Let it
+                    // advance beyond the first 12 cards while the fully bound
+                    // fallback gallery remains interactive.
+                    maximumMissingThumbnails: clips.Count,
+                    refreshCancellation.Token,
+                    preferredClipPath: _currentClip?.FullPath);
+                refreshCancellation.Token.ThrowIfCancellationRequested();
+                if (generation == Volatile.Read(ref _refreshGeneration) &&
+                    !ShouldSuppressAutomaticRefresh(
+                        _isReplayRunning,
+                        _isPresentationSuspended,
+                        IsTrimOwningLibraryWork) &&
+                    IsVisible &&
+                    IsActive)
+                {
+                    var selectedAfterHydration = _currentClip?.FullPath;
+                    ClipList.ItemsSource = hydrated;
+                    _suppressSelectionAutoplay = true;
+                    try
+                    {
+                        ClipList.SelectedItem = selectedAfterHydration is { Length: > 0 }
+                            ? hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
+                                selectedAfterHydration,
+                                StringComparison.OrdinalIgnoreCase))
+                            : hydrated.FirstOrDefault();
+                    }
+                    finally
+                    {
+                        _suppressSelectionAutoplay = false;
+                    }
+
+                    if (_currentClip is { } current &&
+                        hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
+                            current.FullPath,
+                            StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrent)
+                    {
+                        _currentClip = hydratedCurrent;
+                        PlayerPosterImage.DataContext = hydratedCurrent;
+                    }
+                }
+            }
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -583,6 +717,8 @@ public partial class LibraryWindow : Window
             {
                 RefreshButton.IsEnabled = !_isReplayRunning &&
                                           !_isClosing &&
+                                          !IsCurrentClipRequestedForTrim() &&
+                                          !_isTrimMode &&
                                           !_isTrimInProgress &&
                                           !_isPresentationSuspended &&
                                           IsVisible &&
@@ -789,7 +925,7 @@ public partial class LibraryWindow : Window
         _ => true
     };
 
-    private void BindInitialCachedReplayClips()
+    private void BindInitialCachedClips(bool replayDeferred)
     {
         var clips = _initialCachedClips
             .Where(clip => _activeFilter switch
@@ -844,8 +980,16 @@ public partial class LibraryWindow : Window
         }
 
         RefreshButton.IsEnabled = false;
-        LibraryFilterComboBox.IsEnabled = false;
-        SetReplayDeferredRefreshStatus();
+        LibraryFilterComboBox.IsEnabled = !replayDeferred;
+        if (replayDeferred)
+        {
+            SetReplayDeferredRefreshStatus();
+        }
+        else
+        {
+            LibraryStatusText.Text =
+                $"Showing {clips.Length} cached clip(s) while the full library refreshes...";
+        }
     }
 
     private void SetReplayDeferredRefreshStatus()
@@ -1482,6 +1626,19 @@ public partial class LibraryWindow : Window
         BeginTrimMode();
     }
 
+    private bool IsCurrentClipRequestedForTrim() =>
+        _beginTrimWhenReady &&
+        _currentClip is { } currentClip &&
+        (_requestedPreferredPath is null ||
+         currentClip.FullPath.Equals(
+             _requestedPreferredPath,
+             StringComparison.OrdinalIgnoreCase));
+
+    private bool IsTrimOwningLibraryWork =>
+        _isTrimMode ||
+        _isTrimInProgress ||
+        IsCurrentClipRequestedForTrim();
+
     internal static bool ShouldBeginRequestedTrim(
         bool requestPending,
         bool mediaReady,
@@ -1515,16 +1672,33 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        // Scrubbing and previewing must not compete with a still-running
+        // ffprobe/thumbnail pass. Cancellation marks the interrupted refresh as
+        // pending so Cancel/Save can resume it after the editor is finished.
+        CancelRefreshForBackground();
         _isTrimMode = true;
         _trimRangeInitialized = false;
         _isPreviewingTrim = false;
+        RefreshButton.IsEnabled = false;
         TrimEditorPanel.Visibility = Visibility.Visible;
         InitializeTrimRange(duration, preserveSelection: false);
         UpdateTrimAvailability();
         _ = TrimRangeSelector.FocusStartHandle();
     }
 
-    private void CancelTrimModeButton_Click(object sender, RoutedEventArgs e) => CancelTrimMode();
+    private void CancelTrimModeButton_Click(object sender, RoutedEventArgs e)
+    {
+        CancelTrimMode();
+        if (_refreshPending &&
+            !_isReplayRunning &&
+            !_isPresentationSuspended &&
+            !_isClosing &&
+            IsVisible &&
+            IsActive)
+        {
+            _ = RefreshLibraryAsync(_currentClip?.FullPath ?? _initialPreferredPath);
+        }
+    }
 
     private void CancelTrimMode()
     {
@@ -1533,6 +1707,7 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        CancelPendingTrimSeek();
         _isTrimMode = false;
         _isPreviewingTrim = false;
         _trimRangeInitialized = false;
@@ -1542,6 +1717,15 @@ public partial class LibraryWindow : Window
                                     !_isPresentationSuspended &&
                                     _currentClip is not null &&
                                     GetAttachedPlayer()?.Source is not null;
+        lock (_refreshCancellationGate)
+        {
+            RefreshButton.IsEnabled = !_isReplayRunning &&
+                                      !_isClosing &&
+                                      !_isPresentationSuspended &&
+                                      _activeRefreshCancellation is null &&
+                                      IsVisible &&
+                                      IsActive;
+        }
     }
 
     private void InitializeTrimRange(TimeSpan duration, bool preserveSelection)
@@ -1595,7 +1779,12 @@ public partial class LibraryWindow : Window
 
         player.Pause();
         SetPlaying(false);
-        SeekPlayerTo(GetTrimBoundaryPreviewPosition(e.Handle, e.LowerValue, e.UpperValue));
+        _pendingTrimSeekPosition = GetTrimBoundaryPreviewPosition(
+            e.Handle,
+            e.LowerValue,
+            e.UpperValue);
+        _trimSeekTimer.Stop();
+        _trimSeekTimer.Start();
     }
 
     private void TrimRangeSelector_RangeChangeCompleted(object? sender, TrimRangeChangedEventArgs e)
@@ -1606,7 +1795,30 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        CancelPendingTrimSeek();
         SeekPlayerTo(GetTrimBoundaryPreviewPosition(e.Handle, e.LowerValue, e.UpperValue));
+    }
+
+    private void TrimSeekTimer_Tick(object? sender, EventArgs e)
+    {
+        _trimSeekTimer.Stop();
+        var position = _pendingTrimSeekPosition;
+        _pendingTrimSeekPosition = null;
+        if (position is null ||
+            _isClosing ||
+            _isPresentationSuspended ||
+            GetAttachedPlayer()?.Source is null)
+        {
+            return;
+        }
+
+        SeekPlayerTo(position.Value);
+    }
+
+    private void CancelPendingTrimSeek()
+    {
+        _trimSeekTimer.Stop();
+        _pendingTrimSeekPosition = null;
     }
 
     private TimeSpan GetTrimBoundaryPreviewPosition(
@@ -1675,6 +1887,8 @@ public partial class LibraryWindow : Window
 
         player.Pause();
         _isPreviewingTrim = false;
+        CancelPendingTrimSeek();
+        CancelRefreshForBackground();
         ReleasePlayerSource(rememberPosition: false);
         SetControlsEnabled(false);
         SurfacePlayButton.Visibility = Visibility.Collapsed;
@@ -1716,14 +1930,11 @@ public partial class LibraryWindow : Window
                     ShowError(result.Message);
                 }
 
-                if (_refreshPending)
-                {
-                    await RefreshLibraryAsync(source.FullPath);
-                }
-                else
-                {
-                    OpenClip(source, autoplay: false);
-                }
+                // Keep the editor responsive and preserve its selected range.
+                // The cancelled library refresh remains pending until trim mode
+                // is closed; reopening this already validated source needs no
+                // discovery or thumbnail work.
+                OpenClip(source, autoplay: false);
 
                 return;
             }
@@ -1798,14 +2009,7 @@ public partial class LibraryWindow : Window
                 if (IsVisible && IsActive)
                 {
                     ShowError($"The trimmed clip could not be created. {exception.Message}");
-                    if (_refreshPending)
-                    {
-                        await RefreshLibraryAsync(source.FullPath);
-                    }
-                    else
-                    {
-                        OpenClip(source, autoplay: false);
-                    }
+                    OpenClip(source, autoplay: false);
                 }
                 else
                 {
@@ -1867,6 +2071,7 @@ public partial class LibraryWindow : Window
                                           !isBusy &&
                                           !_isPresentationSuspended;
         RefreshButton.IsEnabled = !_isReplayRunning &&
+                                  !_isTrimMode &&
                                   !isBusy &&
                                   !_isPresentationSuspended &&
                                   IsVisible &&
@@ -2087,9 +2292,31 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        if (IsCurrentClipRequestedForTrim())
+        {
+            OpenClip(_currentClip!, autoplay: false);
+            TryBeginRequestedTrim();
+            return;
+        }
+
+        if (_isTrimMode)
+        {
+            RefreshButton.IsEnabled = false;
+            if (_sourceReleasedForBackground && _currentClip is { } trimClip)
+            {
+                OpenClip(
+                    trimClip,
+                    autoplay: false,
+                    preserveRestorePosition: true);
+            }
+
+            return;
+        }
+
         lock (_refreshCancellationGate)
         {
             RefreshButton.IsEnabled = !_isReplayRunning &&
+                                      !_isTrimMode &&
                                       !_isTrimInProgress &&
                                       _activeRefreshCancellation is null;
         }
@@ -2161,6 +2388,7 @@ public partial class LibraryWindow : Window
 
     private void ReleasePlayerSource(bool rememberPosition)
     {
+        CancelPendingTrimSeek();
         _isMediaReady = false;
         _isMediaOpenDeferred = false;
         _playWhenOpened = false;
@@ -2266,6 +2494,8 @@ public partial class LibraryWindow : Window
         Closed -= LibraryWindow_Closed;
         _playerTimer.Stop();
         _playerTimer.Tick -= PlayerTimer_Tick;
+        _trimSeekTimer.Stop();
+        _trimSeekTimer.Tick -= TrimSeekTimer_Tick;
         _nativeWindowThemeService.Dispose();
         _lifetimeCancellation.Dispose();
     }

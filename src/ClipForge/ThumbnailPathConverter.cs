@@ -13,10 +13,12 @@ public sealed class ThumbnailPathConverter : IValueConverter
 {
     private const long MaximumThumbnailBytes = 16 * 1024 * 1024;
     private const int DecodePixelWidth = 640;
-    private const int MaximumCachedThumbnailKeys = 128;
+    private const int MaximumCachedThumbnailKeys = 48;
+    private const long MaximumCachedThumbnailPixels = 8L * 1024 * 1024;
     private static readonly object CacheGate = new();
     private static readonly Dictionary<ThumbnailCacheKey, CachedThumbnail> Cache = [];
     private static long _cacheAccessOrder;
+    private static long _cachedThumbnailPixels;
 
     public object? Convert(
         object? value,
@@ -87,18 +89,13 @@ public sealed class ThumbnailPathConverter : IValueConverter
     {
         lock (CacheGate)
         {
-            if (!Cache.TryGetValue(key, out var cached) ||
-                !cached.Reference.TryGetTarget(out thumbnail))
+            if (!Cache.TryGetValue(key, out var cached))
             {
-                if (cached.Reference is not null)
-                {
-                    Cache.Remove(key);
-                }
-
                 thumbnail = null;
                 return false;
             }
 
+            thumbnail = cached.Thumbnail;
             Cache[key] = cached with { LastAccessOrder = NextCacheAccessOrderLocked() };
             return true;
         }
@@ -108,26 +105,35 @@ public sealed class ThumbnailPathConverter : IValueConverter
     {
         lock (CacheGate)
         {
-            if (!Cache.ContainsKey(key) && Cache.Count >= MaximumCachedThumbnailKeys)
+            var pixelCount = checked((long)thumbnail.PixelWidth * thumbnail.PixelHeight);
+            if (pixelCount <= 0 || pixelCount > MaximumCachedThumbnailPixels)
             {
-                foreach (var staleKey in Cache
-                             .Where(entry => !entry.Value.Reference.TryGetTarget(out _))
-                             .Select(entry => entry.Key)
-                             .ToArray())
-                {
-                    Cache.Remove(staleKey);
-                }
+                return;
+            }
 
-                if (Cache.Count >= MaximumCachedThumbnailKeys)
-                {
-                    var oldestKey = Cache.MinBy(entry => entry.Value.LastAccessOrder).Key;
-                    Cache.Remove(oldestKey);
-                }
+            if (Cache.Remove(key, out var existing))
+            {
+                _cachedThumbnailPixels = Math.Max(
+                    0,
+                    _cachedThumbnailPixels - existing.PixelCount);
+            }
+
+            while (Cache.Count > 0 &&
+                   (Cache.Count >= MaximumCachedThumbnailKeys ||
+                    _cachedThumbnailPixels + pixelCount > MaximumCachedThumbnailPixels))
+            {
+                var oldest = Cache.MinBy(entry => entry.Value.LastAccessOrder);
+                Cache.Remove(oldest.Key);
+                _cachedThumbnailPixels = Math.Max(
+                    0,
+                    _cachedThumbnailPixels - oldest.Value.PixelCount);
             }
 
             Cache[key] = new CachedThumbnail(
-                new WeakReference<BitmapSource>(thumbnail),
-                NextCacheAccessOrderLocked());
+                thumbnail,
+                NextCacheAccessOrderLocked(),
+                pixelCount);
+            _cachedThumbnailPixels += pixelCount;
         }
     }
 
@@ -151,6 +157,7 @@ public sealed class ThumbnailPathConverter : IValueConverter
         long LastWriteTimeUtcTicks);
 
     private readonly record struct CachedThumbnail(
-        WeakReference<BitmapSource> Reference,
-        long LastAccessOrder);
+        BitmapSource Thumbnail,
+        long LastAccessOrder,
+        long PixelCount);
 }

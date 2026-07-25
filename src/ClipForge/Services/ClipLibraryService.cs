@@ -932,7 +932,8 @@ public sealed class ClipLibraryService
         "-protocol_whitelist", "file",
         "-f", "mov",
         "-select_streams", "v:0",
-        "-show_entries", "stream=codec_type:format=duration",
+        "-show_entries",
+        "stream=codec_type,start_time,duration,avg_frame_rate,r_frame_rate:format=duration",
         "-of", "json",
         clipPath
     ];
@@ -1016,9 +1017,19 @@ public sealed class ClipLibraryService
                 CommentHandling = JsonCommentHandling.Disallow,
                 MaxDepth = 16
             });
-            if (!document.RootElement.TryGetProperty("streams", out var streams) ||
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("streams", out var streams) ||
                 streams.ValueKind != JsonValueKind.Array ||
                 streams.GetArrayLength() == 0)
+            {
+                return ProbeOutcome.Invalid;
+            }
+
+            var video = streams[0];
+            if (video.ValueKind != JsonValueKind.Object ||
+                !video.TryGetProperty("codec_type", out var codecType) ||
+                codecType.ValueKind != JsonValueKind.String ||
+                !string.Equals(codecType.GetString(), "video", StringComparison.Ordinal))
             {
                 return ProbeOutcome.Invalid;
             }
@@ -1032,9 +1043,42 @@ public sealed class ClipLibraryService
                 duration = TimeSpan.FromSeconds(seconds);
             }
 
+            // Reject clips whose container is nominally long but whose video
+            // begins late or covers only part of that timeline. This catches
+            // capture-renewal corruption before WPF attempts playback or a
+            // thumbnail helper repeatedly seeks into a missing video range.
+            if (video.TryGetProperty("start_time", out var startElement) &&
+                (!TryReadNonnegativeSeconds(startElement, out var videoStart) ||
+                 videoStart > 0.25))
+            {
+                return ProbeOutcome.Invalid;
+            }
+
+            if (video.TryGetProperty("duration", out var videoDurationElement))
+            {
+                if (!TryReadPositiveSeconds(videoDurationElement, out var videoDuration) ||
+                    duration is { } containerDuration &&
+                    Math.Abs(containerDuration.TotalSeconds - videoDuration) > 0.5)
+                {
+                    return ProbeOutcome.Invalid;
+                }
+            }
+
+            if (video.TryGetProperty("avg_frame_rate", out var averageRateElement) &&
+                video.TryGetProperty("r_frame_rate", out var nominalRateElement))
+            {
+                if (!TryReadProbeRate(averageRateElement, out var averageRate) ||
+                    !TryReadProbeRate(nominalRateElement, out var nominalRate) ||
+                    Math.Abs(averageRate - nominalRate) > Math.Max(1, nominalRate * 0.10))
+                {
+                    return ProbeOutcome.Invalid;
+                }
+            }
+
             return new ProbeOutcome(ProbeState.Valid, duration);
         }
-        catch (JsonException)
+        catch (Exception exception) when (
+            exception is JsonException or InvalidOperationException)
         {
             return ProbeOutcome.Invalid;
         }
@@ -1067,6 +1111,68 @@ public sealed class ClipLibraryService
 
         seconds = 0;
         return false;
+    }
+
+    private static bool TryReadNonnegativeSeconds(JsonElement element, out double seconds)
+    {
+        var parsed = element.ValueKind switch
+        {
+            JsonValueKind.Number => element.TryGetDouble(out var number) ? number : double.NaN,
+            JsonValueKind.String => double.TryParse(
+                element.GetString(),
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var textNumber)
+                ? textNumber
+                : double.NaN,
+            _ => double.NaN
+        };
+
+        if (double.IsFinite(parsed) && parsed >= 0)
+        {
+            seconds = parsed;
+            return true;
+        }
+
+        seconds = 0;
+        return false;
+    }
+
+    private static bool TryReadProbeRate(JsonElement element, out double rate)
+    {
+        rate = 0;
+        if (element.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(element.GetString()))
+        {
+            return false;
+        }
+
+        var text = element.GetString()!;
+        var slash = text.IndexOf('/');
+        if (slash < 0)
+        {
+            return double.TryParse(
+                       text,
+                       NumberStyles.Float,
+                       CultureInfo.InvariantCulture,
+                       out rate) &&
+                   double.IsFinite(rate) &&
+                   rate > 0;
+        }
+
+        return double.TryParse(
+                   text.AsSpan(0, slash),
+                   NumberStyles.Float,
+                   CultureInfo.InvariantCulture,
+                   out var numerator) &&
+               double.TryParse(
+                   text.AsSpan(slash + 1),
+                   NumberStyles.Float,
+                   CultureInfo.InvariantCulture,
+                   out var denominator) &&
+               denominator > 0 &&
+               double.IsFinite(rate = numerator / denominator) &&
+               rate > 0;
     }
 
     private static DiscoveryResult? DiscoverSafeCandidates(
