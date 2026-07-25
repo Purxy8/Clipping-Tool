@@ -23,6 +23,10 @@ public partial class MainWindow : Window
 {
     private static readonly int[] FrameRateOptions = [30, 60];
     private static readonly int[] RecentClipCountOptions = [4, 8, 10, 15];
+    private static readonly TimeSpan AutoStartLibraryPreloadTimeout =
+        TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan CaptureSafeLibraryRecoveryRetryDelay =
+        TimeSpan.FromSeconds(30);
     private static readonly AppearanceTargetOption[] AppearanceTargetOptions =
     [
         new(AppearanceColorTarget.Background, "App background"),
@@ -48,6 +52,8 @@ public partial class MainWindow : Window
     private readonly SemaphoreSlim _captureCommandGate = new(1, 1);
     private readonly SemaphoreSlim _libraryRefreshGate = new(1, 1);
     private readonly object _libraryRefreshCancellationGate = new();
+    private readonly CaptureConfigurationChangeCoordinator _captureConfigurationChanges;
+    private readonly CaptureEngineVerificationCoordinator _engineVerification;
 
     private AppSettings _settings = new();
     private ReplayStateSnapshot _latestState = new(
@@ -61,6 +67,9 @@ public partial class MainWindow : Window
     private bool _engineReady;
     private bool _backgroundHintShown;
     private bool _libraryRefreshPending;
+    private bool _autoStartLibraryRecoveryPending;
+    private bool _captureSafeLibraryRecoveryRunning;
+    private DateTimeOffset _captureSafeLibraryRecoveryRetryNotBeforeUtc;
     private bool _captureCriticalPresentationActive;
     private bool _captureRestartInProgress;
     private bool _captureRecoveryQueued;
@@ -106,6 +115,13 @@ public partial class MainWindow : Window
     internal MainWindow(AppLaunchOptions launchOptions)
     {
         _launchOptions = launchOptions ?? throw new ArgumentNullException(nameof(launchOptions));
+        _captureConfigurationChanges = new CaptureConfigurationChangeCoordinator(
+            TimeSpan.FromMilliseconds(250),
+            ApplyCaptureConfigurationChangeAsync,
+            _lifetimeCancellation.Token);
+        _engineVerification = new CaptureEngineVerificationCoordinator(
+            () => _ffmpegSetupService.TryFindUsableToolPair(out _, out _),
+            _lifetimeCancellation.Token);
         _replayBufferService = new ReplayBufferService(_ffmpegSetupService);
         _clipLibraryService = new ClipLibraryService(_ffmpegSetupService);
         _clipTrimService = new ClipTrimService(_ffmpegSetupService);
@@ -155,7 +171,7 @@ public partial class MainWindow : Window
             _settings.RecentClipCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
             PopulateControls();
             EnsureSaveDirectory();
-            RefreshEngineState();
+            await RefreshEngineStateAsync(forceVerification: false);
             UpdateStorageText();
             InitializeUpdateControls();
 
@@ -426,7 +442,7 @@ public partial class MainWindow : Window
             await _ffmpegSetupService.DownloadAsync(progress, _lifetimeCancellation.Token);
             InstallProgressBar.Value = 100;
             InstallStatusText.Text = "Capture engine installed";
-            RefreshEngineState();
+            await RefreshEngineStateAsync(forceVerification: true);
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
@@ -538,6 +554,27 @@ public partial class MainWindow : Window
             return;
         }
 
+        try
+        {
+            await _captureConfigurationChanges.RequestAsync(restartRequired);
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Application shutdown superseded a pending configuration debounce.
+        }
+    }
+
+    private async Task ApplyCaptureConfigurationChangeAsync(bool restartRequired)
+    {
+        if (_isInitializing || _isClosing)
+        {
+            return;
+        }
+
+        // Read the controls only after the debounce. A rapid series of WPF
+        // SelectionChanged/Checked events therefore persists and applies the
+        // final UI state instead of restarting capture once per intermediate
+        // value.
         SyncSettingsFromControls();
         UpdateStorageText();
         await PersistSettingsAsync();
@@ -650,6 +687,37 @@ public partial class MainWindow : Window
         await startReplay();
     }
 
+    internal static async Task<bool> RunBoundedAutoStartPreloadAsync(
+        Func<CancellationToken, Task> preload,
+        TimeSpan timeout,
+        CancellationToken lifetimeToken)
+    {
+        ArgumentNullException.ThrowIfNull(preload);
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(timeout),
+                "The autostart preload timeout must be positive.");
+        }
+
+        using var preloadCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
+        preloadCancellation.CancelAfter(timeout);
+        try
+        {
+            await preload(preloadCancellation.Token);
+            return true;
+        }
+        catch (OperationCanceledException) when (
+            preloadCancellation.IsCancellationRequested &&
+            !lifetimeToken.IsCancellationRequested)
+        {
+            // Awaiting the preload above means its ffprobe/thumbnail cleanup has
+            // unwound before replay is allowed to start.
+            return false;
+        }
+    }
+
     private async Task PreloadClipLibraryBeforeAutoStartAsync()
     {
         if (_isClosing)
@@ -663,12 +731,25 @@ public partial class MainWindow : Window
             // Autostart must not wait up to the thumbnail-generation budget
             // before replay begins. Bind validated clips and any existing
             // posters now; missing posters hydrate when the window is active.
-            var snapshot = await _clipLibraryService.LoadAsync(
-                _settings.SaveDirectory,
-                count: requestedCount,
-                includeThumbnails: true,
-                thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
+            ClipLibrarySnapshot? snapshot = null;
+            var preloadCompleted = await RunBoundedAutoStartPreloadAsync(
+                async cancellationToken =>
+                {
+                    snapshot = await _clipLibraryService.LoadAsync(
+                        _settings.SaveDirectory,
+                        count: requestedCount,
+                        includeThumbnails: true,
+                        thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
+                        cancellationToken);
+                },
+                AutoStartLibraryPreloadTimeout,
                 _lifetimeCancellation.Token);
+            if (!preloadCompleted || snapshot is null)
+            {
+                _autoStartLibraryRecoveryPending = true;
+                _libraryRefreshPending = true;
+                return;
+            }
 
             _lifetimeCancellation.Token.ThrowIfCancellationRequested();
             if (_isClosing)
@@ -687,6 +768,7 @@ public partial class MainWindow : Window
             }
 
             _libraryRefreshPending = false;
+            _autoStartLibraryRecoveryPending = false;
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
@@ -696,6 +778,7 @@ public partial class MainWindow : Window
         {
             // Gallery preload is best effort and must never prevent replay from
             // starting. A normal full refresh remains queued for replay stop.
+            _autoStartLibraryRecoveryPending = true;
             _libraryRefreshPending = true;
         }
     }
@@ -1727,6 +1810,7 @@ public partial class MainWindow : Window
             ShowError(snapshot.Message);
         }
 
+        QueueCaptureSafeReadyLibraryRecovery();
         QueueRecentClipThumbnailHydration();
     }
 
@@ -1770,8 +1854,65 @@ public partial class MainWindow : Window
         missingThumbnailCountAfter > 0 &&
         missingThumbnailCountAfter < missingThumbnailCountBefore;
 
+    internal static bool CanRunCaptureSafeReadyLibraryRefresh(
+        bool isClosing,
+        bool isVisible,
+        bool isActive,
+        bool captureCritical,
+        bool replayServiceRunning,
+        ReplayStateSnapshot snapshot) =>
+        !isClosing &&
+        isVisible &&
+        isActive &&
+        !captureCritical &&
+        replayServiceRunning &&
+        snapshot.State == ReplayState.Ready;
+
+    internal static bool ShouldRecoverAutoStartLibraryDuringReady(
+        bool refreshPending,
+        int currentClipCount,
+        int requestedClipCount,
+        bool isClosing,
+        bool isVisible,
+        bool isActive,
+        bool captureCritical,
+        bool replayServiceRunning,
+        ReplayStateSnapshot snapshot) =>
+        refreshPending &&
+        currentClipCount >= 0 &&
+        requestedClipCount > 0 &&
+        currentClipCount < requestedClipCount &&
+        CanRunCaptureSafeReadyLibraryRefresh(
+            isClosing,
+            isVisible,
+            isActive,
+            captureCritical,
+            replayServiceRunning,
+            snapshot);
+
     private bool IsAutomaticLibraryWorkSuppressed =>
         ShouldSuppressAutomaticLibraryWork(
+            _captureCriticalPresentationActive,
+            _replayBufferService.IsRunning,
+            _latestState);
+
+    private bool IsCaptureSafeReadyLibraryRefreshAllowed =>
+        CanRunCaptureSafeReadyLibraryRefresh(
+            _isClosing,
+            IsVisible,
+            IsActive,
+            _captureCriticalPresentationActive,
+            _replayBufferService.IsRunning,
+            _latestState);
+
+    private bool ShouldQueueCaptureSafeReadyLibraryRecovery =>
+        ShouldRecoverAutoStartLibraryDuringReady(
+            _autoStartLibraryRecoveryPending,
+            RecentClipsItemsControl.Items.Count,
+            AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount),
+            _isClosing,
+            IsVisible,
+            IsActive,
             _captureCriticalPresentationActive,
             _replayBufferService.IsRunning,
             _latestState);
@@ -1959,9 +2100,18 @@ public partial class MainWindow : Window
             : "Save last clip";
     }
 
-    private void RefreshEngineState()
+    private async Task RefreshEngineStateAsync(bool forceVerification)
     {
-        _engineReady = _ffmpegSetupService.TryFindUsableToolPair(out _, out _);
+        var engineReady = await _engineVerification.VerifyAsync(
+            forceVerification,
+            _lifetimeCancellation.Token);
+        if (_isClosing)
+        {
+            return;
+        }
+
+        // Trust verification is complete before the UI can offer capture.
+        _engineReady = engineReady;
         InstallEnginePanel.Visibility = _engineReady ? Visibility.Collapsed : Visibility.Visible;
         BufferToggleButton.IsEnabled = _engineReady && !_isClosing;
     }
@@ -3074,7 +3224,9 @@ public partial class MainWindow : Window
             : "The clip could not be deleted. Close any app using it, then try again.");
     }
 
-    private async Task RefreshClipLibraryAsync(string? preferredPath = null)
+    private async Task RefreshClipLibraryAsync(
+        string? preferredPath = null,
+        bool allowCaptureSafeReadyRecovery = false)
     {
         if (_isClosing)
         {
@@ -3089,7 +3241,9 @@ public partial class MainWindow : Window
             _pendingLibraryPreferredPath = preferredPath;
         }
 
-        if (IsAutomaticLibraryWorkSuppressed)
+        if (IsAutomaticLibraryWorkSuppressed &&
+            !(allowCaptureSafeReadyRecovery &&
+              IsCaptureSafeReadyLibraryRefreshAllowed))
         {
             _libraryRefreshPending = true;
             QueueRecentClipThumbnailHydration();
@@ -3104,9 +3258,19 @@ public partial class MainWindow : Window
 
         var effectivePreferredPath = _pendingLibraryPreferredPath;
 
+        var requestedSaveDirectory = _settings.SaveDirectory;
         var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
         var refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             _lifetimeCancellation.Token);
+        if (allowCaptureSafeReadyRecovery)
+        {
+            // This is metadata/cached-poster recovery during live replay, not a
+            // normal Library browse. Keep its low-priority ffprobe lane bounded
+            // so an unusual filesystem or media file cannot compete with the
+            // foreground game indefinitely.
+            refreshCancellation.CancelAfter(AutoStartLibraryPreloadTimeout);
+        }
+
         lock (_libraryRefreshCancellationGate)
         {
             _activeRecentThumbnailHydrationCancellation?.Cancel();
@@ -3120,14 +3284,16 @@ public partial class MainWindow : Window
         {
             await _libraryRefreshGate.WaitAsync(refreshCancellation.Token);
             gateEntered = true;
-            if (IsAutomaticLibraryWorkSuppressed)
+            if (IsAutomaticLibraryWorkSuppressed &&
+                !(allowCaptureSafeReadyRecovery &&
+                  IsCaptureSafeReadyLibraryRefreshAllowed))
             {
                 _libraryRefreshPending = true;
                 return;
             }
 
             var snapshot = await _clipLibraryService.LoadAsync(
-                _settings.SaveDirectory,
+                requestedSaveDirectory,
                 count: requestedCount,
                 includeThumbnails: true,
                 // Bind validated cards immediately and move new JPEG work to
@@ -3136,7 +3302,16 @@ public partial class MainWindow : Window
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
-            if (IsAutomaticLibraryWorkSuppressed || !IsVisible || !IsActive)
+            if ((IsAutomaticLibraryWorkSuppressed &&
+                !(allowCaptureSafeReadyRecovery &&
+                   IsCaptureSafeReadyLibraryRefreshAllowed)) ||
+                !IsVisible ||
+                !IsActive ||
+                !requestedSaveDirectory.Equals(
+                    _settings.SaveDirectory,
+                    StringComparison.OrdinalIgnoreCase) ||
+                requestedCount !=
+                AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount))
             {
                 _libraryRefreshPending = true;
                 return;
@@ -3174,6 +3349,7 @@ public partial class MainWindow : Window
             }
 
             _libraryRefreshPending = false;
+            _autoStartLibraryRecoveryPending = false;
             if (effectivePreferredPath is not null &&
                 string.Equals(
                     _pendingLibraryPreferredPath,
@@ -3204,7 +3380,10 @@ public partial class MainWindow : Window
                 SelectClip(releasedClip, autoplay: false);
             }
 
-            ShowError($"The clip gallery could not be refreshed. {exception.Message}");
+            if (!allowCaptureSafeReadyRecovery)
+            {
+                ShowError($"The clip gallery could not be refreshed. {exception.Message}");
+            }
         }
         finally
         {
@@ -3817,7 +3996,14 @@ public partial class MainWindow : Window
 
         if (libraryRefreshRequired)
         {
-            _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
+            if (ShouldQueueCaptureSafeReadyLibraryRecovery)
+            {
+                QueueCaptureSafeReadyLibraryRecovery();
+            }
+            else
+            {
+                _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
+            }
         }
 
         QueueRecentClipThumbnailHydration();
@@ -3835,6 +4021,35 @@ public partial class MainWindow : Window
     {
         ReleasePlayerForBackground();
         CancelActiveLibraryRefreshForBackground();
+    }
+
+    private void QueueCaptureSafeReadyLibraryRecovery()
+    {
+        if (_captureSafeLibraryRecoveryRunning ||
+            !ShouldQueueCaptureSafeReadyLibraryRecovery ||
+            DateTimeOffset.UtcNow < _captureSafeLibraryRecoveryRetryNotBeforeUtc)
+        {
+            return;
+        }
+
+        _captureSafeLibraryRecoveryRunning = true;
+        _captureSafeLibraryRecoveryRetryNotBeforeUtc =
+            DateTimeOffset.UtcNow + CaptureSafeLibraryRecoveryRetryDelay;
+        _ = RunCaptureSafeReadyLibraryRecoveryAsync();
+    }
+
+    private async Task RunCaptureSafeReadyLibraryRecoveryAsync()
+    {
+        try
+        {
+            await RefreshClipLibraryAsync(
+                _pendingLibraryPreferredPath,
+                allowCaptureSafeReadyRecovery: true);
+        }
+        finally
+        {
+            _captureSafeLibraryRecoveryRunning = false;
+        }
     }
 
     private void QueueRecentClipThumbnailHydration()
@@ -4319,5 +4534,257 @@ public partial class MainWindow : Window
             Closing -= MainWindow_Closing;
             Close();
         }
+    }
+}
+
+/// <summary>
+/// Coalesces capture-setting UI bursts into one final asynchronous apply.
+/// Requests arriving after an apply has begun form one subsequent generation,
+/// so intermediate selections can never queue an unbounded restart backlog.
+/// </summary>
+internal sealed class CaptureConfigurationChangeCoordinator
+{
+    private readonly TimeSpan _debounceDelay;
+    private readonly Func<bool, Task> _apply;
+    private readonly CancellationToken _lifetimeToken;
+    private readonly object _gate = new();
+    private readonly List<PendingRequest> _pendingRequests = [];
+    private CancellationTokenSource? _activeDebounce;
+    private long _requestedGeneration;
+    private bool _restartRequired;
+    private bool _workerRunning;
+
+    internal CaptureConfigurationChangeCoordinator(
+        TimeSpan debounceDelay,
+        Func<bool, Task> apply,
+        CancellationToken lifetimeToken = default)
+    {
+        if (debounceDelay < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(debounceDelay),
+                "The capture-settings debounce cannot be negative.");
+        }
+
+        _debounceDelay = debounceDelay;
+        _apply = apply ?? throw new ArgumentNullException(nameof(apply));
+        _lifetimeToken = lifetimeToken;
+    }
+
+    internal Task RequestAsync(bool restartRequired)
+    {
+        Task completionTask;
+        var startWorker = false;
+        lock (_gate)
+        {
+            _lifetimeToken.ThrowIfCancellationRequested();
+            var generation = checked(++_requestedGeneration);
+            _restartRequired |= restartRequired;
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingRequests.Add(new PendingRequest(generation, completion));
+            _activeDebounce?.Cancel();
+            if (!_workerRunning)
+            {
+                _workerRunning = true;
+                startWorker = true;
+            }
+
+            completionTask = completion.Task;
+        }
+
+        // Start outside _gate because an async method executes synchronously
+        // until its first incomplete await and acquires the same gate to
+        // snapshot the requested generation.
+        if (startWorker)
+        {
+            _ = RunWorkerAsync();
+        }
+
+        return completionTask;
+    }
+
+    private async Task RunWorkerAsync()
+    {
+        while (true)
+        {
+            long generation;
+            CancellationTokenSource debounce;
+            lock (_gate)
+            {
+                generation = _requestedGeneration;
+                debounce = CancellationTokenSource.CreateLinkedTokenSource(
+                    _lifetimeToken);
+                _activeDebounce = debounce;
+            }
+
+            try
+            {
+                await Task.Delay(_debounceDelay, debounce.Token);
+            }
+            catch (OperationCanceledException) when (
+                debounce.IsCancellationRequested &&
+                !_lifetimeToken.IsCancellationRequested)
+            {
+                ClearAndDisposeDebounce(debounce);
+                continue;
+            }
+            catch (OperationCanceledException) when (_lifetimeToken.IsCancellationRequested)
+            {
+                ClearAndDisposeDebounce(debounce);
+                CompleteAllPending(
+                    new OperationCanceledException(_lifetimeToken));
+                return;
+            }
+
+            ClearAndDisposeDebounce(debounce);
+
+            bool applyRequiresRestart;
+            lock (_gate)
+            {
+                // A request can win the race after Task.Delay completes but
+                // before this lock. Debounce that newer generation instead of
+                // applying an already stale selection.
+                if (generation != _requestedGeneration)
+                {
+                    continue;
+                }
+
+                applyRequiresRestart = _restartRequired;
+                _restartRequired = false;
+            }
+
+            Exception? failure = null;
+            try
+            {
+                await _apply(applyRequiresRestart);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+
+            CompleteThroughGeneration(generation, failure);
+
+            lock (_gate)
+            {
+                if (generation != _requestedGeneration)
+                {
+                    continue;
+                }
+
+                _workerRunning = false;
+                return;
+            }
+        }
+    }
+
+    private void ClearAndDisposeDebounce(CancellationTokenSource debounce)
+    {
+        lock (_gate)
+        {
+            if (ReferenceEquals(_activeDebounce, debounce))
+            {
+                _activeDebounce = null;
+            }
+        }
+
+        debounce.Dispose();
+    }
+
+    private void CompleteThroughGeneration(long generation, Exception? failure)
+    {
+        List<TaskCompletionSource> completions;
+        lock (_gate)
+        {
+            completions = _pendingRequests
+                .Where(request => request.Generation <= generation)
+                .Select(request => request.Completion)
+                .ToList();
+            _pendingRequests.RemoveAll(request =>
+                request.Generation <= generation);
+        }
+
+        foreach (var completion in completions)
+        {
+            if (failure is null)
+            {
+                completion.TrySetResult();
+            }
+            else if (failure is OperationCanceledException)
+            {
+                completion.TrySetCanceled(_lifetimeToken);
+            }
+            else
+            {
+                completion.TrySetException(failure);
+            }
+        }
+    }
+
+    private void CompleteAllPending(OperationCanceledException cancellation)
+    {
+        List<TaskCompletionSource> completions;
+        lock (_gate)
+        {
+            completions = _pendingRequests
+                .Select(request => request.Completion)
+                .ToList();
+            _pendingRequests.Clear();
+            _workerRunning = false;
+        }
+
+        foreach (var completion in completions)
+        {
+            completion.TrySetCanceled(cancellation.CancellationToken);
+        }
+    }
+
+    private sealed record PendingRequest(
+        long Generation,
+        TaskCompletionSource Completion);
+}
+
+/// <summary>
+/// Runs the pinned FFmpeg/FFprobe trust check away from the WPF dispatcher and
+/// shares one in-flight result so startup and installation cannot hash the same
+/// tool pair concurrently.
+/// </summary>
+internal sealed class CaptureEngineVerificationCoordinator
+{
+    private readonly Func<bool> _verify;
+    private readonly CancellationToken _lifetimeToken;
+    private readonly object _gate = new();
+    private Task<bool>? _verification;
+
+    internal CaptureEngineVerificationCoordinator(
+        Func<bool> verify,
+        CancellationToken lifetimeToken = default)
+    {
+        _verify = verify ?? throw new ArgumentNullException(nameof(verify));
+        _lifetimeToken = lifetimeToken;
+    }
+
+    internal Task<bool> VerifyAsync(
+        bool forceVerification,
+        CancellationToken cancellationToken = default)
+    {
+        Task<bool> verification;
+        lock (_gate)
+        {
+            _lifetimeToken.ThrowIfCancellationRequested();
+            var shouldStart = _verification is null ||
+                              _verification.IsCanceled ||
+                              _verification.IsFaulted ||
+                              forceVerification && _verification.IsCompleted;
+            if (shouldStart)
+            {
+                _verification = Task.Run(_verify, _lifetimeToken);
+            }
+
+            verification = _verification!;
+        }
+
+        return verification.WaitAsync(cancellationToken);
     }
 }

@@ -4,6 +4,25 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed-preset WGC downscaling now runs and is runtime-probed with the same CFR contract at Normal CPU/GPU scheduling priority. Source/native, already-fitting presets, GDI, and non-scaling compatibility paths remain Below Normal. A temporary scaled-WGC probe miss now uses a short 15-second exponential retry backoff capped at one minute, so a running app can automatically promote from GDI when WGC recovers.
+- Replay-length changes no longer synchronously scan and delete a large ring on the WPF thread. State updates are constant-time, available duration clamps immediately, and pruning is capped at 64 deletion attempts per monitor tick. Trusted-retention and quarantined-file attempts have independent fair shares and mutation-safe cursors; trusted deletion is restricted to the oldest excess prefix and can never advance into the newest retained tail.
+- Recent clips reuse bounded short-lived negative probe results so one corrupt newest file cannot repeatedly consume the full helper budget and hide older valid cards. Cached posters now require a bounded real JPEG decode; corrupt files are removed and regenerated without retaining file handles or unbounded decode state.
+- Keyframe-aligned packet-copy trims retry through exact encoding when the copied output is unreadable or has an invalid timeline, not only when FFmpeg returns an error. Identity-bound source/output validation now uses normalized extended-length Windows paths, fixing safe trim and thumbnail operations when a generated staging path crosses the legacy 260-character boundary.
+- Rapid capture-setting changes are coalesced into one final apply/restart. Engine checksum verification is asynchronous and single-flight, while autostart's cached-library preload is bounded so replay startup cannot wait on a slow media probe. If that preload times out, an active foreground Main window can recover missing Recent cards during steady Ready through a two-second cached-poster/metadata-only refresh that is cancelled by focus loss or a capture transition.
+- FFmpeg capability probes now share the capture engine's kill-on-close ownership containment. Startup buffer maintenance runs off the WPF thread and can remove at most two strictly validated, inactive Windows-session replay roots older than 24 hours while failing closed for active, unknown, reparse, unexpected, or oversized roots. A durable direct-child cursor limits every launch to 65 enumerated and 64 fully inspected sibling roots while guaranteeing gradual progress across large stale sets.
+- Trim free-space checks now use the pinned output directory through the Windows volume API, including UNC shares and normalized extended-length local/UNC paths, instead of rejecting safe network roots through `DriveInfo`.
+
+### Verification
+
+- The deterministic suite passes 67/67 tests and Release builds complete with zero warnings or errors. The exhaustive synthetic resolution matrix passed 150/150 encodes across 15 source geometries, five presets, and both 30/60 FPS; six custom stretched 4:3 cases also passed.
+- Real desktop capture passed at 720p, 1080p, 1440p, 2160p-up-to-native, and Source at 60 FPS, plus representative 1080p/Source 30 FPS runs. The corrected 1080p/60 WGC/NVENC path produced 360 frames over 5.999 seconds with a 17 ms maximum packet gap, no identical run above 16.7 ms, approximately 0.1% normalized CPU, and about 107 MB working set.
+- A 60-second 1080p/60 system-audio-plus-microphone replay produced 3,600 frames over 60.016 seconds and committed in about 1.56 seconds after a further 60-second live hold. All configured 30-second through one-hour replay lengths passed deterministic duration/frame/A-V validation; exact, aligned packet-copy, concat, and nested long-path concurrent replay/trim smokes passed with no orphan partial/helper.
+- Scheduled 1080p/60 WGC renewal passed separate two- and six-replacement stress runs with system audio and microphone. Every PID and generation advanced exactly once, only the known quarantined generation heads were absent, the two-replacement save contained trusted media from both replacements, and the final motion clips remained 360/360 frames at 60.01 FPS with no identical run above 16.7 ms or orphan helper.
+- The prepared production payload opened the newest four valid cards with four decoded posters, played the selected clip in both Main and Library while remaining responsive, and removed exactly two eligible stale replay roots. Library exposed all 14 timeline-valid recordings and correctly rejected the pre-existing clip whose video starts 34.699 seconds into its 180-second container.
+- These checks cover the development PC and synthetic custom-resolution geometry. They do not replace a soak in the affected game, GPU driver, stretched internal resolution, overlay set, exclusive-fullscreen mode, and mixed-refresh monitor configuration.
+
 ## [1.9.0-beta.9] - 2026-07-25
 
 ### Release status

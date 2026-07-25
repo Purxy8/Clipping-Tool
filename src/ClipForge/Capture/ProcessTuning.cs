@@ -7,6 +7,7 @@ internal static class ProcessTuning
 {
     internal const ProcessPriorityClass CapturePriority = ProcessPriorityClass.BelowNormal;
     internal const ProcessPriorityClass HardwareCapturePriority = ProcessPriorityClass.BelowNormal;
+    internal const ProcessPriorityClass ScaledCapturePriority = ProcessPriorityClass.Normal;
     internal const ProcessPriorityClass AuxiliaryMediaPriority = ProcessPriorityClass.Idle;
     internal const GraphicsSchedulingPriorityClass CaptureGraphicsPriority =
         GraphicsSchedulingPriorityClass.BelowNormal;
@@ -22,7 +23,7 @@ internal static class ProcessTuning
         bool captureOutputRequiresScaling = false)
     {
         ArgumentNullException.ThrowIfNull(strategy);
-        var priority = GetCaptureCpuPriority(strategy);
+        var priority = GetCaptureCpuPriority(strategy, captureOutputRequiresScaling);
         var cpuPriorityApplied = TryApplyPriority(process, priority);
         var graphicsPriorityApplied = TryApplyGraphicsPriority(
             process,
@@ -38,7 +39,9 @@ internal static class ProcessTuning
         ArgumentNullException.ThrowIfNull(process);
         ArgumentNullException.ThrowIfNull(strategy);
 
-        var expectedCpuPriority = GetCaptureCpuPriority(strategy);
+        var expectedCpuPriority = GetCaptureCpuPriority(
+            strategy,
+            captureOutputRequiresScaling);
         var cpuPriorityApplied =
             (TryReadPriority(process, out var observedCpuPriority) &&
              observedCpuPriority == expectedCpuPriority) ||
@@ -55,6 +58,16 @@ internal static class ProcessTuning
 
     public static bool TryApplyAuxiliaryMediaPriority(Process process)
         => TryApplyPriority(process, AuxiliaryMediaPriority);
+
+    internal static bool TryApplyScaledGraphicsProbePriority(Process process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        var cpuPriorityApplied = TryApplyPriority(process, ScaledCapturePriority);
+        var graphicsPriorityApplied = TryApplyGraphicsPriority(
+            process,
+            ScaledCaptureGraphicsPriority);
+        return cpuPriorityApplied && graphicsPriorityApplied;
+    }
 
     internal static bool TryReadGraphicsPriority(
         Process process,
@@ -75,12 +88,28 @@ internal static class ProcessTuning
         }
     }
 
-    private static ProcessPriorityClass GetCaptureCpuPriority(VideoEncodingStrategy strategy) =>
-        strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
-        strategy.IsHardwareEncoder &&
-        !strategy.RequiresSystemMemoryTransfer
+    internal static ProcessPriorityClass GetCaptureCpuPriority(
+        VideoEncodingStrategy strategy,
+        bool captureOutputRequiresScaling)
+    {
+        ArgumentNullException.ThrowIfNull(strategy);
+        if (strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+            captureOutputRequiresScaling)
+        {
+            // gfxcapture's fixed-output resizer can fall below real-time cadence
+            // when Windows schedules its coordination thread at BelowNormal,
+            // even though measured CPU use is very small. Keep only this scaled
+            // WGC process at Normal; native Source and GDI continue yielding to
+            // the foreground game.
+            return ScaledCapturePriority;
+        }
+
+        return strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+               strategy.IsHardwareEncoder &&
+               !strategy.RequiresSystemMemoryTransfer
             ? HardwareCapturePriority
             : CapturePriority;
+    }
 
     internal static GraphicsSchedulingPriorityClass GetCaptureGraphicsPriority(
         VideoEncodingStrategy strategy,

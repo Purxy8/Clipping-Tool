@@ -6,6 +6,7 @@ using ClipForge.Controls;
 using ClipForge.Models;
 using ClipForge.Services;
 using ClipForge.Capture;
+using ClipForge.Testing;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -15,6 +16,9 @@ namespace ClipForge.Tests;
 internal static class Program
 {
     private const string CaptureJobCrashHelperArgument = "--capture-job-crash-helper";
+    private static readonly byte[] ValidTestJpegBytes = Convert.FromBase64String(
+        "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDvfh5458SaT4A8M2Nj4g1WzsrbTLWGC2t72SOOKNYlCoqhsKoAAAHAAooor8Sn8b9T8EzT/f8AEf45f+lM/9k=");
+    private const string ProbeJobCrashHelperArgument = "--probe-job-crash-helper";
 
     private static async Task<int> Main(string[] args)
     {
@@ -22,6 +26,11 @@ internal static class Program
             string.Equals(args[0], CaptureJobCrashHelperArgument, StringComparison.Ordinal))
         {
             return await RunCaptureJobCrashHelperAsync(args[1]).ConfigureAwait(false);
+        }
+        if (args.Length == 2 &&
+            string.Equals(args[0], ProbeJobCrashHelperArgument, StringComparison.Ordinal))
+        {
+            return await RunProbeJobCrashHelperAsync(args[1]).ConfigureAwait(false);
         }
 
         (string Name, Func<Task> Run)[] tests =
@@ -32,6 +41,8 @@ internal static class Program
             ("Windows autostart registration policy", TestStartupRegistrationAsync),
             ("Windows autostart replay decision", TestAutoStartReplayPolicyAsync),
             ("Replay presentation state policy", TestReplayPresentationStatePolicyAsync),
+            ("Capture settings change coalescing", TestCaptureSettingsChangeCoalescingAsync),
+            ("Capture engine verification scheduling", TestCaptureEngineVerificationSchedulingAsync),
             ("Hotkey gesture validation", TestHotkeyGesturesAsync),
             ("Storage estimate helpers", TestStorageEstimatorAsync),
             ("FFmpeg capture arguments", TestCaptureArgumentsAsync),
@@ -40,12 +51,18 @@ internal static class Program
             ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
             ("Capture recovery request gate", TestCaptureRecoveryRequestGateAsync),
             ("Scheduled capture refresh coordinator", TestScheduledCaptureRefreshCoordinatorAsync),
+            ("Renewal segment quarantine provenance", TestRenewalSegmentQuarantineProvenanceAsync),
+            ("Capture smoke argument propagation", TestCaptureSmokeArgumentPropagationAsync),
             ("Replay service concurrent disposal", TestReplayServiceConcurrentDisposalAsync),
+            ("Replay maintenance and bounded pruning", TestReplayMaintenanceAndBoundedPruningAsync),
             ("Capture runtime journal", TestCaptureRuntimeJournalAsync),
+            ("Capture runtime journal resource bounds", TestCaptureRuntimeJournalResourceBoundsAsync),
             ("Capture geometry matrix", TestCaptureGeometryMatrixAsync),
             ("Capture process job lifetime", TestCaptureProcessJobLifetimeAsync),
+            ("FFmpeg probe crash containment", TestFfmpegProbeCrashContainmentAsync),
             ("FFmpeg encoder strategies", TestEncoderStrategiesAsync),
             ("FFmpeg capability priority", TestEncoderCapabilityPriorityAsync),
+            ("FFmpeg degraded fallback cache", TestDegradedCapabilityCacheAsync),
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
             ("FFmpeg concat arguments", TestConcatArgumentsAsync),
             ("Replay export timeline validation", TestReplayExportTimelineValidationAsync),
@@ -73,12 +90,16 @@ internal static class Program
             ("Replay-safe thumbnail hydration", TestReplayThumbnailHydrationAsync),
             ("Clip classification and filtered discovery", TestClipClassificationAndFilteringAsync),
             ("Transactional clip trimming", TestClipTrimServiceAsync),
+            ("Trim free-space policy", TrimFreeSpacePolicyTests.RunAsync),
             ("Clip path and media process hardening", TestClipLibrarySecurityPolicyAsync),
+            ("Long-path pinned media validation", TestLongPathPinnedMediaValidationAsync),
             ("Race-resistant clip deletion", TestClipDeletionAsync),
             ("Thumbnail decoding releases cache files", TestThumbnailDecoderReleasesFileAsync),
+            ("Corrupt thumbnail cache regeneration", TestCorruptThumbnailRegenerationAsync),
             ("Clip library fail-closed probing", TestClipLibraryFailClosedAsync),
             ("Clip library probe budget", TestClipLibraryProbeBudgetAsync),
             ("Clip library probe result cache", TestClipLibraryProbeCacheAsync),
+            ("Clip library negative probe cache", TestClipLibraryNegativeProbeCacheAsync),
             ("Runtime local-data boundaries", TestRuntimeLocalDataBoundariesAsync),
             ("Clip library cancellation", TestClipLibraryCancellationAsync)
         ];
@@ -117,6 +138,136 @@ internal static class Program
             "Replay preset labels must be unique.");
 
         return Task.CompletedTask;
+    }
+
+    private static Task TestRenewalSegmentQuarantineProvenanceAsync()
+    {
+        var knownGenerationHeads = new HashSet<int> { 0, 3, 6 };
+        RenewalSegmentSequence.AssertMonotonicWithKnownQuarantinedHeads(
+            [1, 2, 4, 5, 7, 8],
+            knownGenerationHeads,
+            "in the deterministic renewal regression");
+
+        Assert.Throws<InvalidDataException>(
+            () => RenewalSegmentSequence.AssertMonotonicWithKnownQuarantinedHeads(
+                [1, 2, 5],
+                new HashSet<int> { 3 },
+                "with an unknown missing id"),
+            "A gap containing a non-quarantined segment id must fail renewal provenance.");
+        Assert.Throws<InvalidDataException>(
+            () => RenewalSegmentSequence.AssertMonotonicWithKnownQuarantinedHeads(
+                [1, 2, 2],
+                knownGenerationHeads,
+                "with a reused id"),
+            "A duplicate or reused segment id must fail renewal provenance.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestCaptureSmokeArgumentPropagationAsync()
+    {
+        var forwarded =
+            CaptureSmokeArgumentPolicy.GetInteractiveMatrixForwardedSwitches(
+                [
+                    "--wgc-matrix",
+                    "--FORCE-WGC",
+                    "--audio",
+                    "--print-probe-diagnostics",
+                    "--unknown-switch"
+                ]);
+
+        Assert.SequenceEqual(
+            ["--audio", "--force-wgc", "--print-probe-diagnostics"],
+            forwarded,
+            "The live matrix did not forward its WGC backend or diagnostic switches exactly.");
+        Assert.True(
+            !forwarded.Contains("--force-gdi", StringComparer.OrdinalIgnoreCase),
+            "The live matrix invented a fallback backend switch that was not requested.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestCaptureSettingsChangeCoalescingAsync()
+    {
+        var applyCount = 0;
+        var latestSelection = -1;
+        var appliedSelection = -1;
+        var appliedRestartRequired = false;
+        var coordinator = new CaptureConfigurationChangeCoordinator(
+            TimeSpan.FromMilliseconds(40),
+            restartRequired =>
+            {
+                Interlocked.Increment(ref applyCount);
+                appliedSelection = latestSelection;
+                appliedRestartRequired = restartRequired;
+                return Task.CompletedTask;
+            });
+
+        var requests = new List<Task>();
+        for (var selection = 0; selection < 50; selection++)
+        {
+            latestSelection = selection;
+            requests.Add(coordinator.RequestAsync(
+                restartRequired: selection == 17));
+            await Task.Delay(TimeSpan.FromMilliseconds(2)).ConfigureAwait(false);
+        }
+
+        await Task.WhenAll(requests)
+            .WaitAsync(TimeSpan.FromSeconds(5))
+            .ConfigureAwait(false);
+        Assert.Equal(
+            1,
+            applyCount,
+            "A rapid settings burst must execute only one final configuration apply.");
+        Assert.Equal(
+            49,
+            appliedSelection,
+            "The coalesced apply did not persist the final visible selection.");
+        Assert.True(
+            appliedRestartRequired,
+            "A restart-required change was lost while coalescing later selections.");
+    }
+
+    private static async Task TestCaptureEngineVerificationSchedulingAsync()
+    {
+        using var verificationStarted = new ManualResetEventSlim();
+        using var releaseVerification = new ManualResetEventSlim();
+        var callerThreadId = Environment.CurrentManagedThreadId;
+        var verificationThreadId = -1;
+        var verificationCount = 0;
+        var coordinator = new CaptureEngineVerificationCoordinator(() =>
+        {
+            verificationThreadId = Environment.CurrentManagedThreadId;
+            Interlocked.Increment(ref verificationCount);
+            verificationStarted.Set();
+            releaseVerification.Wait(TimeSpan.FromSeconds(5));
+            return true;
+        });
+
+        var first = coordinator.VerifyAsync(forceVerification: false);
+        Assert.True(
+            verificationStarted.Wait(TimeSpan.FromSeconds(2)),
+            "The background capture-engine verification did not start.");
+        Assert.True(
+            verificationThreadId != callerThreadId,
+            "Capture-engine trust verification ran inline on the caller/UI thread.");
+        Assert.True(
+            !first.IsCompleted,
+            "Engine readiness was published before trust verification completed.");
+
+        var concurrentRefresh = coordinator.VerifyAsync(forceVerification: true);
+        Assert.Equal(
+            1,
+            Volatile.Read(ref verificationCount),
+            "A concurrent refresh duplicated the in-flight FFmpeg hash pass.");
+        releaseVerification.Set();
+        Assert.True(
+            await first.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false) &&
+            await concurrentRefresh.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false),
+            "A successful trust verification did not publish engine readiness.");
+        Assert.Equal(
+            1,
+            verificationCount,
+            "Coalesced verification callers did not share one completed result.");
     }
 
     private static Task TestResolutionPresetsAsync()
@@ -339,6 +490,85 @@ internal static class Program
             });
         Assert.Equal(0, startupSteps.Count,
             "A normal launch must leave gallery refresh and manual replay startup on their existing paths.");
+
+        var preloadActive = 0;
+        var replayStarted = false;
+        var boundedStart = Stopwatch.StartNew();
+        await MainWindow.RunAutoStartReplaySequenceAsync(
+            shouldAutoStartReplay: true,
+            preloadClipLibrary: async () =>
+            {
+                var completed = await MainWindow.RunBoundedAutoStartPreloadAsync(
+                    async cancellationToken =>
+                    {
+                        Interlocked.Exchange(ref preloadActive, 1);
+                        try
+                        {
+                            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref preloadActive, 0);
+                        }
+                    },
+                    TimeSpan.FromMilliseconds(80),
+                    CancellationToken.None);
+                Assert.True(
+                    !completed,
+                    "A hung autostart library preload ignored its bounded timeout.");
+            },
+            startReplay: () =>
+            {
+                Assert.Equal(
+                    0,
+                    Volatile.Read(ref preloadActive),
+                    "Replay started while the cancelled library helper was still unwinding.");
+                replayStarted = true;
+                return Task.CompletedTask;
+            });
+        boundedStart.Stop();
+        Assert.True(
+            replayStarted && boundedStart.Elapsed < TimeSpan.FromSeconds(2),
+            "A hung cached-library preload held Windows autostart replay too long.");
+
+        var readySnapshot = CreateReplayStateSnapshot(ReplayState.Ready);
+        Assert.True(
+            MainWindow.ShouldRecoverAutoStartLibraryDuringReady(
+                refreshPending: true,
+                currentClipCount: 0,
+                requestedClipCount: 4,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                captureCritical: false,
+                replayServiceRunning: true,
+                snapshot: readySnapshot),
+            "A timed-out autostart preload could not recover its empty gallery after replay became Ready.");
+        Assert.True(
+            !MainWindow.ShouldRecoverAutoStartLibraryDuringReady(
+                refreshPending: true,
+                currentClipCount: 0,
+                requestedClipCount: 4,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                captureCritical: false,
+                replayServiceRunning: true,
+                snapshot: CreateReplayStateSnapshot(ReplayState.Buffering)),
+            "Gallery metadata recovery started while the replay engine was still buffering.");
+        Assert.True(
+            !MainWindow.ShouldRecoverAutoStartLibraryDuringReady(
+                refreshPending: true,
+                currentClipCount: 4,
+                requestedClipCount: 4,
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                captureCritical: false,
+                replayServiceRunning: true,
+                snapshot: readySnapshot),
+            "A complete cached gallery scheduled unnecessary capture-time discovery.");
     }
 
     private static Task TestReplayPresentationStatePolicyAsync()
@@ -1339,6 +1569,127 @@ internal static class Program
         return 0;
     }
 
+    private static async Task TestFfmpegProbeCrashContainmentAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var pipeName = $"ClipForge-ProbeJobCrash-{Guid.NewGuid():N}";
+        await using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.In,
+            maxNumberOfServerInstances: 1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+        using var helper = CreateProbeJobCrashHelperProcess(pipeName);
+        Assert.True(helper.Start(), "The isolated FFmpeg probe owner did not start.");
+
+        Process? ownedProbe = null;
+        try
+        {
+            using var connectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await server.WaitForConnectionAsync(connectionTimeout.Token).ConfigureAwait(false);
+            using var reader = new StreamReader(server, leaveOpen: true);
+            var processIdLine = await reader.ReadLineAsync(connectionTimeout.Token).ConfigureAwait(false);
+            Assert.True(
+                int.TryParse(processIdLine, CultureInfo.InvariantCulture, out var processId),
+                "The FFmpeg probe owner did not report its child process ID.");
+
+            ownedProbe = Process.GetProcessById(processId);
+            Assert.True(
+                string.Equals(ownedProbe.ProcessName, "PING", StringComparison.OrdinalIgnoreCase) &&
+                !ownedProbe.HasExited,
+                "The FFmpeg probe owner did not create the expected isolated process.");
+
+            // Kill only the probe owner. The child must exit because the
+            // FfmpegProbeRunner's Job Object handle closes with its process.
+            helper.Kill(entireProcessTree: false);
+            await helper.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            await ownedProbe.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Assert.True(
+                ownedProbe.HasExited,
+                "Abrupt ClipForge termination left an FFmpeg capability probe running.");
+        }
+        finally
+        {
+            if (!helper.HasExited)
+            {
+                helper.Kill(entireProcessTree: false);
+                await helper.WaitForExitAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+
+            if (ownedProbe is not null)
+            {
+                if (!ownedProbe.HasExited &&
+                    string.Equals(ownedProbe.ProcessName, "PING", StringComparison.OrdinalIgnoreCase))
+                {
+                    ownedProbe.Kill(entireProcessTree: true);
+                    await ownedProbe.WaitForExitAsync()
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                        .ConfigureAwait(false);
+                }
+
+                ownedProbe.Dispose();
+            }
+        }
+    }
+
+    private static Process CreateProbeJobCrashHelperProcess(string pipeName)
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The test executable path is unavailable.");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        if (string.Equals(
+                Path.GetFileNameWithoutExtension(executable),
+                "dotnet",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            startInfo.ArgumentList.Add(
+                System.Reflection.Assembly.GetEntryAssembly()?.Location
+                ?? throw new InvalidOperationException("The test assembly path is unavailable."));
+        }
+
+        startInfo.ArgumentList.Add(ProbeJobCrashHelperArgument);
+        startInfo.ArgumentList.Add(pipeName);
+        return new Process { StartInfo = startInfo };
+    }
+
+    private static async Task<int> RunProbeJobCrashHelperAsync(string pipeName)
+    {
+        var pingPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "ping.exe");
+        using var connectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var client = new NamedPipeClientStream(
+            ".",
+            pipeName,
+            PipeDirection.Out,
+            PipeOptions.Asynchronous);
+        await client.ConnectAsync(connectionTimeout.Token).ConfigureAwait(false);
+        await using var writer = new StreamWriter(client) { AutoFlush = true };
+        var runner = new FfmpegProbeRunner(processId =>
+            writer.WriteLine(processId.ToString(CultureInfo.InvariantCulture)));
+        var execution = await runner.RunAsync(
+                pingPath,
+                ["-t", "127.0.0.1"],
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        return execution.Succeeded ? 0 : 2;
+    }
+
     private static Task TestCaptureProgressParserAsync()
     {
         var parser = new CaptureProgressParser();
@@ -1994,6 +2345,48 @@ internal static class Program
         }
     }
 
+    private static async Task TestCaptureRuntimeJournalResourceBoundsAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            using var currentProcess = Process.GetCurrentProcess();
+            currentProcess.Refresh();
+            var initialHandleCount = currentProcess.HandleCount;
+            var journal = new CaptureRuntimeJournal(testDirectory);
+            for (var sample = 0; sample < 256; sample++)
+            {
+                journal.Record(
+                    "resource_stress_sample",
+                    backend: DesktopCaptureBackend.WindowsGraphicsCapture.ToString(),
+                    width: 1920,
+                    height: 1080,
+                    framesPerSecond: 60,
+                    captureCursor: false,
+                    detail: $"sample={sample}");
+            }
+
+            await journal.DisposeAsync().ConfigureAwait(false);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            currentProcess.Refresh();
+            var retainedHandles = currentProcess.HandleCount - initialHandleCount;
+            Assert.True(
+                retainedHandles <= 24,
+                $"Runtime journal sampling retained {retainedHandles} process handles after disposal.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
     private static async Task TestReplayServiceConcurrentDisposalAsync()
     {
         var testDirectory = CreateTestDirectory();
@@ -2020,6 +2413,476 @@ internal static class Program
             Assert.True(
                 rejectedAfterDispose,
                 "A fully disposed replay service accepted new lifecycle work.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestReplayMaintenanceAndBoundedPruningAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var maintenanceEntered = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseMaintenance = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            ReplayBufferService? service = null;
+            var construction = Task.Run(() =>
+            {
+                service = new ReplayBufferService(
+                    new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
+                    Path.Combine(testDirectory, "Async-Buffer"),
+                    async () =>
+                    {
+                        maintenanceEntered.TrySetResult();
+                        await releaseMaintenance.Task.ConfigureAwait(false);
+                    });
+            });
+
+            await maintenanceEntered.Task
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            var constructorReturnedBeforeCleanup = false;
+            try
+            {
+                await construction
+                    .WaitAsync(TimeSpan.FromMilliseconds(500))
+                    .ConfigureAwait(false);
+                constructorReturnedBeforeCleanup = true;
+            }
+            catch (TimeoutException)
+            {
+                // Release below so a regressed synchronous constructor cannot
+                // leave the test worker blocked after the assertion.
+            }
+            finally
+            {
+                releaseMaintenance.TrySetResult();
+            }
+
+            await construction.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            Assert.True(
+                constructorReturnedBeforeCleanup,
+                "ReplayBufferService construction blocked on slow stale-buffer maintenance.");
+            Assert.True(service is not null, "The replay maintenance test did not construct its service.");
+            await service!.WaitForInitialBufferMaintenanceAsync()
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false);
+            await service.DisposeAsync().ConfigureAwait(false);
+
+            var oneHourReady = new ReplayStateSnapshot(
+                ReplayState.Ready,
+                TimeSpan.FromHours(1),
+                TimeSpan.FromHours(1),
+                BufferBytes: 12_345,
+                Message: "ready");
+            var reduced = ReplayBufferService.BuildRetentionUpdateSnapshot(
+                oneHourReady,
+                TimeSpan.FromSeconds(30),
+                isRunning: true,
+                encoderDescription: "test encoder");
+            Assert.Equal(
+                TimeSpan.FromSeconds(30),
+                reduced.AvailableDuration,
+                "A 1h -> 30s retention update did not clamp available duration immediately.");
+            Assert.Equal(
+                TimeSpan.FromSeconds(30),
+                reduced.Retention,
+                "The O(1) retention snapshot retained the old replay length.");
+            Assert.Equal(
+                ReplayState.Ready,
+                reduced.State,
+                "A fully buffered reduced ring should remain ready while pruning catches up.");
+
+            var expanded = ReplayBufferService.BuildRetentionUpdateSnapshot(
+                reduced,
+                TimeSpan.FromHours(1),
+                isRunning: true,
+                encoderDescription: "test encoder");
+            Assert.Equal(
+                ReplayState.Buffering,
+                expanded.State,
+                "Increasing retention did not return the partially filled ring to Buffering.");
+
+            const int oneHourSegments = 1_800;
+            const int thirtySecondSegments = 15;
+            var remainingExcess = oneHourSegments - thirtySecondSegments;
+            var pruningTicks = 0;
+            while (remainingExcess > 0)
+            {
+                var attemptBudget = ReplayBufferService.CalculateSegmentDeleteAttemptBudget(
+                    thirtySecondSegments + remainingExcess,
+                    thirtySecondSegments,
+                    removableUntrustedCount: 0);
+                Assert.True(
+                    attemptBudget is > 0 and <=
+                    ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh,
+                    "A large retention reduction escaped the bounded delete-attempt policy.");
+                remainingExcess -= Math.Min(remainingExcess, attemptBudget);
+                pruningTicks++;
+            }
+
+            Assert.Equal(
+                28,
+                pruningTicks,
+                "A 1h -> 30s ring should be drained in bounded 64-file background batches.");
+            Assert.Equal(
+                ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh,
+                ReplayBufferService.CalculateSegmentDeleteAttemptBudget(
+                    trustedCompletedCount: thirtySecondSegments,
+                    maximumCompletedSegments: thirtySecondSegments,
+                    removableUntrustedCount: 10_000),
+                "A failed generation could schedule thousands of untrusted deletes in one refresh.");
+            var mixedDeleteBudgets =
+                ReplayBufferService.CalculateSegmentDeleteAttemptBudgets(
+                    trustedCompletedCount: thirtySecondSegments + 10_000,
+                    maximumCompletedSegments: thirtySecondSegments,
+                    removableUntrustedCount: 10_000);
+            Assert.Equal(
+                ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh / 2,
+                mixedDeleteBudgets.UntrustedAttempts,
+                "Mixed pruning did not reserve a bounded share for untrusted cleanup.");
+            Assert.Equal(
+                ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh / 2,
+                mixedDeleteBudgets.TrustedAttempts,
+                "Undeletable untrusted entries could still starve trusted retention pruning.");
+            Assert.Equal(
+                ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh,
+                mixedDeleteBudgets.UntrustedAttempts +
+                mixedDeleteBudgets.TrustedAttempts,
+                "Fair pruning exceeded or wasted its per-refresh delete-attempt bound.");
+
+            var skewedDeleteBudgets =
+                ReplayBufferService.CalculateSegmentDeleteAttemptBudgets(
+                    trustedCompletedCount: thirtySecondSegments + 1,
+                    maximumCompletedSegments: thirtySecondSegments,
+                    removableUntrustedCount: 10_000);
+            Assert.Equal(
+                1,
+                skewedDeleteBudgets.TrustedAttempts,
+                "The sole excess trusted segment did not receive a pruning attempt.");
+            Assert.Equal(
+                ReplayBufferService.MaximumSegmentDeleteAttemptsPerRefresh - 1,
+                skewedDeleteBudgets.UntrustedAttempts,
+                "Unused trusted capacity was not lent back to untrusted cleanup.");
+
+            var firstUntrustedPage = ReplayBufferService.BuildCyclicCandidatePage(
+                candidateCount: 80,
+                maximumAttempts: mixedDeleteBudgets.UntrustedAttempts,
+                startOffset: 0);
+            Assert.SequenceEqual(
+                Enumerable.Range(0, 32),
+                firstUntrustedPage.CandidateIndices,
+                "The first bounded untrusted cleanup page was not deterministic.");
+            Assert.Equal(
+                32,
+                firstUntrustedPage.NextOffset,
+                "The untrusted cleanup cursor did not advance past locked newest entries.");
+            var secondUntrustedPage = ReplayBufferService.BuildCyclicCandidatePage(
+                candidateCount: 80,
+                maximumAttempts: mixedDeleteBudgets.UntrustedAttempts,
+                startOffset: firstUntrustedPage.NextOffset);
+            Assert.SequenceEqual(
+                Enumerable.Range(32, 32),
+                secondUntrustedPage.CandidateIndices,
+                "A second tick retried the same locked untrusted page instead of progressing.");
+
+            var trustedCandidateIds = Enumerable.Range(100, 80).ToArray();
+            var firstTrustedStart =
+                ReplayBufferService.FindCyclicCandidateStartIndex(
+                    trustedCandidateIds,
+                    nextCandidateId: -1);
+            var firstTrustedPage = ReplayBufferService.BuildCyclicCandidatePage(
+                trustedCandidateIds.Length,
+                mixedDeleteBudgets.TrustedAttempts,
+                firstTrustedStart);
+            var nextTrustedSegmentId =
+                trustedCandidateIds[firstTrustedPage.NextOffset];
+            var secondTrustedStart =
+                ReplayBufferService.FindCyclicCandidateStartIndex(
+                    trustedCandidateIds,
+                    nextTrustedSegmentId);
+            Assert.Equal(
+                32,
+                secondTrustedStart,
+                "Thirty-two locked oldest trusted entries hid every newer excess segment.");
+            var afterSuccessfulFirstPage = trustedCandidateIds.Skip(32).ToArray();
+            Assert.Equal(
+                0,
+                ReplayBufferService.FindCyclicCandidateStartIndex(
+                    afterSuccessfulFirstPage,
+                    nextTrustedSegmentId),
+                "The trusted segment-ID cursor was not mutation-safe after earlier deletions.");
+            var retainedTailRegressionIds = Enumerable.Range(1, 47).ToArray();
+            var trustedExcessIds =
+                ReplayBufferService.SelectTrustedExcessSegmentNumbers(
+                    retainedTailRegressionIds,
+                    maximumCompletedSegments: 15);
+            Assert.SequenceEqual(
+                Enumerable.Range(1, 32),
+                trustedExcessIds,
+                "Trusted pruning did not restrict candidates to the oldest excess prefix.");
+            Assert.True(
+                !trustedExcessIds.Intersect(Enumerable.Range(33, 15)).Any(),
+                "A cyclic trusted cursor selected IDs from the newest retained tail.");
+
+            var firstRootInspectionPage =
+                ReplayBufferService.BuildCyclicCandidatePage(
+                    candidateCount: 130,
+                    maximumAttempts: 64,
+                    startOffset: 0);
+            Assert.Equal(
+                64,
+                firstRootInspectionPage.CandidateIndices.Length,
+                "Stale-root full inspections exceeded their per-run bound.");
+            var secondRootInspectionPage =
+                ReplayBufferService.BuildCyclicCandidatePage(
+                    candidateCount: 130,
+                    maximumAttempts: 64,
+                    startOffset: firstRootInspectionPage.NextOffset);
+            Assert.Equal(
+                64,
+                secondRootInspectionPage.CandidateIndices[0],
+                "The stale-root inspection cursor did not advance to the next bounded page.");
+
+            var bufferParent = Path.Combine(testDirectory, "Session-Buffer");
+            var currentRoot = Path.Combine(bufferParent, "WindowsSession-6");
+            Directory.CreateDirectory(currentRoot);
+            var utcNow = DateTime.UtcNow;
+
+            static string CreateWindowsSessionResidue(
+                string parent,
+                int sessionId,
+                DateTime lastWriteUtc,
+                string fileName = "segment-000000000.mkv")
+            {
+                var root = Path.Combine(parent, $"WindowsSession-{sessionId}");
+                var session = Path.Combine(root, $"session-20260725-{sessionId}");
+                Directory.CreateDirectory(session);
+                var file = Path.Combine(session, fileName);
+                File.WriteAllBytes(file, [1, 2, 3]);
+                File.SetLastWriteTimeUtc(file, lastWriteUtc);
+                Directory.SetLastWriteTimeUtc(session, lastWriteUtc);
+                Directory.SetLastWriteTimeUtc(root, lastWriteUtc);
+                return root;
+            }
+
+            var staleRoot = CreateWindowsSessionResidue(
+                bufferParent,
+                1,
+                utcNow - TimeSpan.FromDays(2));
+            var recentRoot = CreateWindowsSessionResidue(
+                bufferParent,
+                2,
+                utcNow - TimeSpan.FromHours(2));
+            var activeRoot = CreateWindowsSessionResidue(
+                bufferParent,
+                3,
+                utcNow - TimeSpan.FromDays(2));
+            var unexpectedRoot = CreateWindowsSessionResidue(
+                bufferParent,
+                4,
+                utcNow - TimeSpan.FromDays(2),
+                fileName: "unexpected.bin");
+
+            Assert.True(
+                !ReplayBufferService.IsSafeWindowsSessionBufferRootPath(
+                    bufferParent,
+                    Path.Combine(bufferParent, "WindowsSession-5"),
+                    FileAttributes.Directory | FileAttributes.ReparsePoint),
+                "Inactive-session cleanup accepted a reparse-point root.");
+            Assert.Equal(
+                0,
+                ReplayBufferService.CleanupInactiveWindowsSessionBufferRoots(
+                    bufferParent,
+                    currentRoot,
+                    utcNow,
+                    new HashSet<int>(),
+                    ownershipEstablished: false),
+                "Session cleanup did not fail closed when process ownership was unknown.");
+            Assert.True(
+                Directory.Exists(staleRoot),
+                "Fail-closed ownership cleanup removed inactive capture data.");
+
+            Assert.Equal(
+                1,
+                ReplayBufferService.CleanupInactiveWindowsSessionBufferRoots(
+                    bufferParent,
+                    currentRoot,
+                    utcNow,
+                    new HashSet<int> { 3 },
+                    ownershipEstablished: true),
+                "Exactly one old, inactive, strictly validated Windows session should be removed.");
+            Assert.True(
+                !Directory.Exists(staleRoot) &&
+                Directory.Exists(recentRoot) &&
+                Directory.Exists(activeRoot) &&
+                Directory.Exists(unexpectedRoot),
+                "Inactive-session cleanup crossed its age, active-owner, or content boundary.");
+
+            var boundedRootA = CreateWindowsSessionResidue(
+                bufferParent,
+                10,
+                utcNow - TimeSpan.FromDays(5));
+            var boundedRootB = CreateWindowsSessionResidue(
+                bufferParent,
+                11,
+                utcNow - TimeSpan.FromDays(4));
+            var boundedRootC = CreateWindowsSessionResidue(
+                bufferParent,
+                12,
+                utcNow - TimeSpan.FromDays(3));
+            Assert.Equal(
+                2,
+                ReplayBufferService.CleanupInactiveWindowsSessionBufferRoots(
+                    bufferParent,
+                    currentRoot,
+                    utcNow,
+                    new HashSet<int> { 3 },
+                    ownershipEstablished: true),
+                "One maintenance pass exceeded its Windows-session root deletion bound.");
+            Assert.True(
+                !Directory.Exists(boundedRootA) &&
+                !Directory.Exists(boundedRootB) &&
+                Directory.Exists(boundedRootC),
+                "Bounded cleanup did not remove the oldest eligible roots first.");
+
+            var selectionParent = Path.Combine(
+                testDirectory,
+                "Session-Selection-Buffer");
+            var selectionCurrent = Path.Combine(
+                selectionParent,
+                "WindowsSession-9999");
+            Directory.CreateDirectory(selectionCurrent);
+            var blockerPaths = new List<string>();
+            var activeBlockerIds = new HashSet<int>();
+            for (var index = 0; index < 6; index++)
+            {
+                var activeSessionId = 10_000 + index;
+                activeBlockerIds.Add(activeSessionId);
+                blockerPaths.Add(CreateWindowsSessionResidue(
+                    selectionParent,
+                    activeSessionId,
+                    utcNow - TimeSpan.FromDays(10 + index)));
+                blockerPaths.Add(CreateWindowsSessionResidue(
+                    selectionParent,
+                    11_000 + index,
+                    utcNow - TimeSpan.FromHours(1)));
+                blockerPaths.Add(CreateWindowsSessionResidue(
+                    selectionParent,
+                    12_000 + index,
+                    utcNow - TimeSpan.FromDays(10 + index),
+                    fileName: "unexpected.bin"));
+            }
+
+            var hiddenEligibleOldest = CreateWindowsSessionResidue(
+                selectionParent,
+                13_000,
+                utcNow - TimeSpan.FromDays(6));
+            var hiddenEligibleSecond = CreateWindowsSessionResidue(
+                selectionParent,
+                13_001,
+                utcNow - TimeSpan.FromDays(5));
+            var deliberatelyHostileOrder = blockerPaths
+                .Concat([hiddenEligibleSecond, hiddenEligibleOldest])
+                .ToArray();
+            var selectionScan =
+                ReplayBufferService.SelectInactiveWindowsSessionBufferRootCandidates(
+                    Path.GetFullPath(selectionParent),
+                    Path.GetFullPath(selectionCurrent),
+                    utcNow,
+                    activeBlockerIds,
+                    scanSuffix: string.Empty,
+                    candidatePaths: deliberatelyHostileOrder);
+            Assert.SequenceEqual(
+                [hiddenEligibleOldest, hiddenEligibleSecond],
+                selectionScan.Candidates.Select(candidate => candidate.Path),
+                "Active, recent, or unsafe first entries hid later stale safe roots, " +
+                "or eligible roots were not sorted before the candidate limit.");
+
+            var durableParent = Path.Combine(
+                testDirectory,
+                "Session-Durable-Buffer");
+            var durableCurrent = Path.Combine(
+                durableParent,
+                "WindowsSession-39998");
+            Directory.CreateDirectory(durableCurrent);
+            var unsafeDurableRoots = new List<string>();
+            for (var index = 0; index < 70; index++)
+            {
+                unsafeDurableRoots.Add(CreateWindowsSessionResidue(
+                    durableParent,
+                    20_000 + index,
+                    utcNow - TimeSpan.FromDays(10),
+                    fileName: "unexpected.bin"));
+            }
+
+            var durableEligible = CreateWindowsSessionResidue(
+                durableParent,
+                29_999,
+                utcNow - TimeSpan.FromDays(10));
+            var enumeratedForBoundedScan = 0;
+            IEnumerable<string> CountedDurableCandidates()
+            {
+                foreach (var path in unsafeDurableRoots.Append(durableEligible))
+                {
+                    enumeratedForBoundedScan++;
+                    yield return path;
+                }
+            }
+
+            var boundedScan =
+                ReplayBufferService.SelectInactiveWindowsSessionBufferRootCandidates(
+                    Path.GetFullPath(durableParent),
+                    Path.GetFullPath(durableCurrent),
+                    utcNow,
+                    new HashSet<int>(),
+                    scanSuffix: string.Empty,
+                    candidatePaths: CountedDurableCandidates());
+            Assert.Equal(
+                65,
+                enumeratedForBoundedScan,
+                "A stale-root startup scan enumerated beyond its bounded overflow sentinel.");
+            Assert.Equal(
+                65,
+                boundedScan.EnumeratedCount,
+                "The stale-root scan reported an incorrect bounded enumeration count.");
+            Assert.True(
+                boundedScan.InspectedCount <= 64,
+                "A stale-root startup scan exceeded 64 full tree inspections.");
+            Assert.Equal(
+                "0",
+                boundedScan.NextSuffix,
+                "An overflowing root bucket did not durably descend to its first suffix page.");
+
+            var durableRemoved = false;
+            for (var simulatedStart = 0;
+                 simulatedStart < 12 && !durableRemoved;
+                 simulatedStart++)
+            {
+                _ = ReplayBufferService.CleanupInactiveWindowsSessionBufferRoots(
+                    durableParent,
+                    durableCurrent,
+                    utcNow,
+                    new HashSet<int>(),
+                    ownershipEstablished: true);
+                durableRemoved = !Directory.Exists(durableEligible);
+            }
+
+            Assert.True(
+                durableRemoved,
+                "More than 64 unsafe siblings hid a later safe stale root across simulated starts.");
+            Assert.Equal(
+                "10",
+                ReplayBufferService.AdvanceWindowsSessionCleanupSuffix("00"),
+                "The durable suffix cursor did not advance between child buckets.");
+            Assert.Equal(
+                string.Empty,
+                ReplayBufferService.AdvanceWindowsSessionCleanupSuffix("99"),
+                "The durable suffix cursor did not ascend and wrap after the final child bucket.");
         }
         finally
         {
@@ -2403,7 +3266,11 @@ internal static class Program
         Assert.ContainsSequence(
             graphicsQsvProbe,
             "-vf",
-            "setpts=PTS-STARTPTS",
+            "setpts=PTS-STARTPTS");
+        Assert.ContainsSequence(
+            graphicsQsvProbe,
+            "-fps_mode", "cfr",
+            "-r", configuration.FramesPerSecond.ToString(CultureInfo.InvariantCulture),
             "-frames:v",
             (configuration.FramesPerSecond * FfmpegArgumentBuilder.ScaledGraphicsProbeSeconds)
                 .ToString(CultureInfo.InvariantCulture),
@@ -2450,6 +3317,8 @@ internal static class Program
             "Capture processes should yield CPU time to the foreground game.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.HardwareCapturePriority,
             "Direct WGC/NVENC capture must also yield CPU time to the foreground game.");
+        Assert.Equal(ProcessPriorityClass.Normal, ProcessTuning.ScaledCapturePriority,
+            "Scaled WGC must keep enough CPU scheduling priority to sustain its D3D resize cadence.");
         Assert.Equal(
             GraphicsSchedulingPriorityClass.BelowNormal,
             ProcessTuning.CaptureGraphicsPriority,
@@ -2457,6 +3326,24 @@ internal static class Program
         var wgcStrategy = new VideoEncodingStrategy(
             VideoEncoderKind.NvidiaNvenc,
             DesktopCaptureBackend.WindowsGraphicsCapture);
+        Assert.Equal(
+            ProcessPriorityClass.Normal,
+            ProcessTuning.GetCaptureCpuPriority(
+                wgcStrategy,
+                captureOutputRequiresScaling: true),
+            "Scaled WGC must not be starved by a BelowNormal coordination thread.");
+        Assert.Equal(
+            ProcessPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureCpuPriority(
+                wgcStrategy,
+                captureOutputRequiresScaling: false),
+            "Native Source WGC should retain the low-impact CPU policy.");
+        Assert.Equal(
+            ProcessPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureCpuPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: true),
+            "GDI capture must not opt into the scaled WGC CPU policy.");
         Assert.Equal(
             GraphicsSchedulingPriorityClass.Normal,
             ProcessTuning.GetCaptureGraphicsPriority(
@@ -2615,6 +3502,268 @@ internal static class Program
             6,
             hybridTransferRunner.CallCount,
             "The probe should test the later encoder's transfer path before accepting the earlier GDI fallback.");
+
+        var recoveredGraphicsCapture = false;
+        var transientRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isTransfer = arguments.Any(argument =>
+                argument.Contains("hwdownload", StringComparison.Ordinal));
+            return encoderName == "h264_nvenc" &&
+                   (!isGraphicsCapture ||
+                    recoveredGraphicsCapture && !isTransfer);
+        });
+        var transientUtcNow = new DateTimeOffset(
+            2026,
+            7,
+            25,
+            10,
+            0,
+            0,
+            TimeSpan.Zero);
+        var transientProbe = new FfmpegCapabilityProbe(
+            transientRunner,
+            degradedCacheInitialDuration: TimeSpan.FromSeconds(10),
+            degradedCacheMaximumDuration: TimeSpan.FromSeconds(40),
+            getUtcNow: () => transientUtcNow);
+        var degradedResult = await transientProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.Gdi,
+            degradedResult.Strategy.CaptureBackend,
+            "A transient WGC failure should initially retain the verified hardware GDI fallback.");
+        var degradedProbeCalls = transientRunner.CallCount;
+
+        recoveredGraphicsCapture = true;
+        var cachedDegradedResult = await transientProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.Gdi,
+            cachedDegradedResult.Strategy.CaptureBackend,
+            "A rapid replay restart should reuse the short-lived degraded result.");
+        Assert.Equal(
+            degradedProbeCalls,
+            transientRunner.CallCount,
+            "An unexpired degraded result repeated the expensive capability probes.");
+
+        transientUtcNow += TimeSpan.FromSeconds(11);
+        var recoveredResult = await transientProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.WindowsGraphicsCapture,
+            recoveredResult.Strategy.CaptureBackend,
+            "An expired degraded result must be re-probed so transient WGC failures recover.");
+        Assert.True(
+            transientRunner.CallCount > degradedProbeCalls,
+            "An expired degraded GDI result was incorrectly retained.");
+
+        var recoveredProbeCalls = transientRunner.CallCount;
+        var cachedRecoveredResult = await transientProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            recoveredResult.Strategy,
+            cachedRecoveredResult.Strategy,
+            "A recovered WGC strategy changed when read from the positive cache.");
+        Assert.Equal(
+            recoveredProbeCalls,
+            transientRunner.CallCount,
+            "A verified WGC recovery should be cached after the transient failure clears.");
+    }
+
+    private static async Task TestDegradedCapabilityCacheAsync()
+    {
+        var configuration = CreateCaptureConfiguration(monitorIndex: 1);
+        var utcNow = new DateTimeOffset(
+            2026,
+            7,
+            25,
+            11,
+            0,
+            0,
+            TimeSpan.Zero);
+        var graphicsCaptureRecovered = false;
+        var runner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isTransfer = arguments.Any(argument =>
+                argument.Contains("hwdownload", StringComparison.Ordinal));
+            return encoderName == "h264_nvenc" &&
+                   (!isGraphicsCapture ||
+                    graphicsCaptureRecovered && !isTransfer);
+        });
+        var probe = new FfmpegCapabilityProbe(
+            runner,
+            degradedCacheInitialDuration: TimeSpan.FromSeconds(10),
+            degradedCacheMaximumDuration: TimeSpan.FromSeconds(20),
+            getUtcNow: () => utcNow);
+
+        var first = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.Gdi,
+            first.Strategy.CaptureBackend,
+            "The permanent-fallback regression must begin on GDI.");
+        var firstProbeCalls = runner.CallCount;
+
+        var rapidRestart = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            first.Strategy,
+            rapidRestart.Strategy,
+            "A rapid replay restart changed the cached degraded strategy.");
+        Assert.Equal(
+            firstProbeCalls,
+            runner.CallCount,
+            "A rapid replay restart repeated the full permanent-fallback probe latency.");
+
+        var differentConfiguration = CreateCaptureConfiguration(monitorIndex: 2);
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            differentConfiguration,
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > firstProbeCalls,
+            "A degraded result leaked across distinct capture-configuration cache keys.");
+
+        utcNow += TimeSpan.FromSeconds(10);
+        var beforeSecondProbe = runner.CallCount;
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > beforeSecondProbe,
+            "The initial degraded-cache TTL did not expire.");
+        var secondProbeCalls = runner.CallCount;
+
+        utcNow += TimeSpan.FromSeconds(19);
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            secondProbeCalls,
+            runner.CallCount,
+            "The second degraded selection did not apply its bounded backoff.");
+
+        utcNow += TimeSpan.FromSeconds(1);
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > secondProbeCalls,
+            "The backed-off degraded cache did not expire.");
+        var maximumBackoffProbeCalls = runner.CallCount;
+
+        graphicsCaptureRecovered = true;
+        utcNow += TimeSpan.FromSeconds(19);
+        var beforeMaximumExpiry = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.Gdi,
+            beforeMaximumExpiry.Strategy.CaptureBackend,
+            "A recovery should wait only until the active bounded fallback TTL expires.");
+        Assert.Equal(
+            maximumBackoffProbeCalls,
+            runner.CallCount,
+            "The maximum degraded backoff expired too early.");
+
+        utcNow += TimeSpan.FromSeconds(1);
+        var recovered = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            DesktopCaptureBackend.WindowsGraphicsCapture,
+            recovered.Strategy.CaptureBackend,
+            "A transiently recovered WGC path was not selected after the maximum fallback TTL.");
+        Assert.True(
+            runner.CallCount > maximumBackoffProbeCalls,
+            "Recovery after degraded-cache expiry did not run a fresh capability probe.");
+
+        var recoveredProbeCalls = runner.CallCount;
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            recoveredProbeCalls,
+            runner.CallCount,
+            "A verified WGC recovery was not promoted to the stable positive cache.");
+
+        var blockingRunner = new BlockingProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            return encoderName == "h264_nvenc" && !isGraphicsCapture;
+        });
+        var singleFlightProbe = new FfmpegCapabilityProbe(
+            blockingRunner,
+            degradedCacheInitialDuration: TimeSpan.FromSeconds(10),
+            degradedCacheMaximumDuration: TimeSpan.FromSeconds(20),
+            getUtcNow: () => utcNow);
+        var firstCaller = singleFlightProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        await blockingRunner.FirstInvocationStarted.Task
+            .WaitAsync(TimeSpan.FromSeconds(2))
+            .ConfigureAwait(false);
+        var concurrentCaller = singleFlightProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        using var cancelledWaiterSource = new CancellationTokenSource();
+        var cancelledWaiter = singleFlightProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            cancelledWaiterSource.Token);
+        cancelledWaiterSource.Cancel();
+        var cancellationObserved = false;
+        try
+        {
+            _ = await cancelledWaiter.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            cancellationObserved = true;
+        }
+
+        Assert.True(
+            cancellationObserved,
+            "Cancelling one capability-cache waiter did not release it from the single-flight gate.");
+        blockingRunner.Release();
+        var concurrentResults = await Task.WhenAll(firstCaller, concurrentCaller)
+            .WaitAsync(TimeSpan.FromSeconds(2))
+            .ConfigureAwait(false);
+        Assert.True(
+            concurrentResults.All(result =>
+                result.Strategy.CaptureBackend == DesktopCaptureBackend.Gdi),
+            "Concurrent capability callers observed different degraded strategies.");
+        Assert.Equal(
+            5,
+            blockingRunner.CallCount,
+            "Concurrent callers launched more than one permanent-fallback probe flight.");
     }
 
     private static Task TestCaptureDiagnosticPriorityAsync()
@@ -2678,7 +3827,20 @@ internal static class Program
             configuration,
             CancellationToken.None);
         Assert.Equal(result.Strategy, cachedResult.Strategy, "A cached probe changed strategy.");
-        Assert.Equal(completedProbeCalls, runner.CallCount, "A completed capability probe should be cached.");
+        if (expectedBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
+        {
+            Assert.Equal(
+                completedProbeCalls,
+                runner.CallCount,
+                "A verified WGC capability probe should be cached.");
+        }
+        else
+        {
+            Assert.Equal(
+                completedProbeCalls,
+                runner.CallCount,
+                "A rapid replay restart should reuse the short-lived degraded capability result.");
+        }
     }
 
     private static string? GetArgumentAfter(IReadOnlyList<string> arguments, string option)
@@ -4514,6 +5676,77 @@ internal static class Program
                 !fastCopyRetryArguments[1].Contains("copy", StringComparer.Ordinal),
                 "The exact fallback retained packet-copy arguments.");
 
+            var invalidFastCopyRunner = new FakeTrimMediaProcessRunner
+            {
+                ReturnInvalidFirstTrimOutputMetadata = true
+            };
+            var invalidFastCopyService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                invalidFastCopyRunner);
+            var invalidFastCopy = await invalidFastCopyService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(6),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                ClipTrimStatus.Succeeded,
+                invalidFastCopy.Status,
+                "A packet copy with invalid output metadata should retry through exact encoding.");
+            Assert.Equal(
+                2,
+                invalidFastCopyRunner.TrimRunCount,
+                "Invalid packet-copy output should launch exactly one encoded retry.");
+            Assert.True(
+                invalidFastCopy.OutputPath is not null &&
+                File.Exists(invalidFastCopy.OutputPath),
+                "The exact fallback did not commit its validated trim.");
+            Assert.SequenceEqual(
+                new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 },
+                File.ReadAllBytes(sourcePath),
+                "Recovering from invalid packet-copy output changed the source bytes.");
+            Assert.True(
+                !EnumerateTrimPartials(clipsDirectory).Any(),
+                "The invalid packet-copy fallback left a partial output behind.");
+
+            var failedFastCopyFallbackRunner = new FakeTrimMediaProcessRunner
+            {
+                FailTrim = true
+            };
+            var failedFastCopyFallbackService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                failedFastCopyFallbackRunner);
+            var failedFastCopyFallback = await failedFastCopyFallbackService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(6),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                ClipTrimStatus.EncodingFailed,
+                failedFastCopyFallback.Status,
+                "A failed packet copy and failed exact retry should return EncodingFailed.");
+            Assert.Equal(
+                2,
+                failedFastCopyFallbackRunner.TrimRunCount,
+                "A failed packet-copy fallback must stop after one exact retry.");
+            Assert.True(
+                failedFastCopyFallback.Diagnostic?.Contains(
+                    "scripted encoding failure",
+                    StringComparison.Ordinal) == true,
+                "The final exact-encode failure diagnostic was not preserved.");
+            Assert.SequenceEqual(
+                new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 },
+                File.ReadAllBytes(sourcePath),
+                "A double trim failure changed the source bytes.");
+            Assert.True(
+                !EnumerateTrimPartials(clipsDirectory).Any(),
+                "A failed packet copy and exact retry left a partial output behind.");
+
             var missingKeyframeRunner = new FakeTrimMediaProcessRunner
             {
                 HasRequestedKeyframe = false,
@@ -4821,6 +6054,91 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static async Task TestLongPathPinnedMediaValidationAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var longRoot = testDirectory;
+        try
+        {
+            const int targetRootLength = 215;
+            while (longRoot.Length + 41 < targetRootLength)
+            {
+                longRoot = Path.Combine(
+                    longRoot,
+                    $"nested-{Guid.NewGuid():N}");
+            }
+            var finalComponentLength = targetRootLength - longRoot.Length - 1;
+            Assert.True(
+                finalComponentLength > 0,
+                "The test temp root was unexpectedly too long for the MAX_PATH regression setup.");
+            longRoot = Path.Combine(
+                longRoot,
+                new string('x', finalComponentLength));
+
+            Directory.CreateDirectory(longRoot);
+            var sourcePath = Path.Combine(
+                longRoot,
+                "Clip_2026-07-25_04-00-00.mp4");
+            await File.WriteAllBytesAsync(sourcePath, [1, 2, 3, 4])
+                .ConfigureAwait(false);
+            Assert.True(
+                sourcePath.Length < 260,
+                "The long-path regression source should remain below the legacy MAX_PATH boundary.");
+            Assert.True(
+                ClipLibraryService.TryGetCurrentFileIdentity(sourcePath, out var identity),
+                "The long-path regression source did not receive a stable file identity.");
+
+            var sourceInfo = new FileInfo(sourcePath);
+            var source = new ClipLibraryItem(
+                sourceInfo.Name,
+                sourceInfo.FullName,
+                new DateTimeOffset(
+                    DateTime.SpecifyKind(sourceInfo.LastWriteTimeUtc, DateTimeKind.Utc)),
+                sourceInfo.Length,
+                TimeSpan.FromSeconds(1))
+            {
+                FileIdentity = identity,
+                Kind = ClipKind.Original
+            };
+            using var pinnedSource = ClipLibraryService.TryOpenPinnedClipReadContext(
+                longRoot,
+                source);
+            Assert.True(
+                pinnedSource is not null,
+                "A safe source below MAX_PATH could not pin its long save root.");
+
+            var stagingPath = Path.Combine(
+                longRoot,
+                $".clipforge-trim-{Guid.NewGuid():N}.partial.mp4");
+            Assert.True(
+                stagingPath.Length > 260,
+                "The validation target must cross MAX_PATH to exercise extended Win32 paths.");
+            await File.WriteAllBytesAsync(stagingPath, [5, 6, 7, 8])
+                .ConfigureAwait(false);
+
+            Assert.True(
+                ClipLibraryService.TryValidatePinnedDirectChildFile(
+                    pinnedSource!,
+                    stagingPath,
+                    out var resolvedPath,
+                    out var length,
+                    out var diagnostic),
+                $"A safe non-empty trim staging file above MAX_PATH was rejected: {diagnostic}.");
+            Assert.Equal(
+                Path.GetFullPath(stagingPath),
+                resolvedPath,
+                "Long-path handle validation did not return the normalized DOS path.");
+            Assert.Equal(
+                4L,
+                length,
+                "Long-path handle validation returned the wrong file length.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
     private static async Task TestClipDeletionAsync()
     {
         var testDirectory = CreateTestDirectory();
@@ -4887,7 +6205,7 @@ internal static class Program
                 expectedLegacyName,
                 Path.GetFileName(legacyThumbnailPath),
                 "The legacy key must remain byte-compatible with ClipForge v1.2 path/size/mtime hashing.");
-            await File.WriteAllBytesAsync(thumbnailPath, [0xFF, 0xD8, 0xFF, 0xFF, 0xD9]).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(thumbnailPath, ValidTestJpegBytes).ConfigureAwait(false);
             await File.WriteAllBytesAsync(legacyThumbnailPath, [0xFF, 0xD8, 0xFF, 0xFF, 0xD9]).ConfigureAwait(false);
             clip = clip with { ThumbnailPath = thumbnailPath };
 
@@ -5183,6 +6501,102 @@ internal static class Program
         }
     }
 
+    private static async Task TestCorruptThumbnailRegenerationAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var cacheDirectory = Path.Combine(testDirectory, "Cache");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(cacheDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffmpegPath = Path.Combine(toolsDirectory, "ffmpeg.exe");
+            await File.WriteAllBytesAsync(ffmpegPath, [0x4D, 0x5A]).ConfigureAwait(false);
+            var clipPath = Path.Combine(clipsDirectory, "Clip_2026-07-13_14-00-00.mp4");
+            await File.WriteAllBytesAsync(clipPath, [1, 2, 3, 4]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(
+                clipPath,
+                new DateTime(2026, 7, 13, 14, 0, 0, DateTimeKind.Utc));
+            Assert.True(
+                ClipLibraryService.TryCreateKnownOutputItem(
+                    clipsDirectory,
+                    clipPath,
+                    TimeSpan.FromSeconds(4),
+                    out var knownClip) &&
+                knownClip is not null,
+                "The thumbnail regeneration test clip should receive a stable identity.");
+
+            var decodeValidationCount = 0;
+            var runner = new FakeClipMediaProcessRunner();
+            var service = new ClipLibraryService(
+                () => ffmpegPath,
+                () => null,
+                runner,
+                cacheDirectory,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1),
+                validateThumbnailDecode: path =>
+                {
+                    decodeValidationCount++;
+                    return ClipLibraryService.TryDecodeThumbnailForValidation(path);
+                });
+            var thumbnailPath = service.GetDeterministicThumbnailPath(knownClip!);
+            byte[] fakeJpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9];
+            await File.WriteAllBytesAsync(thumbnailPath, fakeJpeg).ConfigureAwait(false);
+            Assert.True(
+                !ClipLibraryService.TryDecodeThumbnailForValidation(thumbnailPath),
+                "SOI/EOI marker bytes alone must not qualify as a decodable cached thumbnail.");
+
+            var regenerated = await service.GetThumbnailAsync(
+                    clipsDirectory,
+                    knownClip!)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                thumbnailPath,
+                regenerated,
+                "A corrupt deterministic cache entry should be replaced by one valid FFmpeg output.");
+            Assert.Equal(
+                1,
+                runner.ThumbnailRunCount,
+                "A corrupt cached thumbnail should launch exactly one regeneration helper.");
+            Assert.True(
+                ClipLibraryService.TryDecodeThumbnailForValidation(thumbnailPath),
+                "The regenerated thumbnail must pass a bounded real JPEG decode.");
+            Assert.Equal(
+                3,
+                decodeValidationCount,
+                "The corrupt target, staging output, and committed target should each be decoded once.");
+
+            var reused = await service.GetThumbnailAsync(
+                    clipsDirectory,
+                    knownClip!)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                thumbnailPath,
+                reused,
+                "An unchanged regenerated thumbnail should be reused.");
+            Assert.Equal(
+                1,
+                runner.ThumbnailRunCount,
+                "A valid unchanged cache hit must not repeat FFmpeg generation.");
+            Assert.Equal(
+                3,
+                decodeValidationCount,
+                "A path/length/mtime-validated cache hit must not repeat JPEG decoding.");
+
+            File.Delete(thumbnailPath);
+            Assert.True(
+                !File.Exists(thumbnailPath),
+                "Thumbnail validation must release its file handle immediately.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
     private static Task RunOnStaThreadAsync(Action action)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -5323,6 +6737,196 @@ internal static class Program
                 3,
                 runner.Invocations.Count,
                 "Changing a clip's metadata must invalidate only that clip's cached probe result.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestClipLibraryNegativeProbeCacheAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        var clipsDirectory = Path.Combine(testDirectory, "Clips");
+        var toolsDirectory = Path.Combine(testDirectory, "Tools");
+        try
+        {
+            Directory.CreateDirectory(clipsDirectory);
+            Directory.CreateDirectory(toolsDirectory);
+            var ffprobePath = Path.Combine(toolsDirectory, "ffprobe.exe");
+            await File.WriteAllBytesAsync(ffprobePath, [0x4D, 0x5A]).ConfigureAwait(false);
+
+            string[] invalidNames =
+            [
+                "Clip_2026-07-13_12-00-03.mp4",
+                "Clip_2026-07-13_12-00-02.mp4",
+                "Clip_2026-07-13_12-00-01.mp4"
+            ];
+            var validName = "Clip_2026-07-13_12-00-00.mp4";
+            foreach (var name in invalidNames.Append(validName))
+            {
+                var path = Path.Combine(clipsDirectory, name);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]).ConfigureAwait(false);
+                File.SetLastWriteTimeUtc(
+                    path,
+                    DateTime.SpecifyKind(
+                        DateTime.ParseExact(
+                            name.AsSpan(5, 19),
+                            "yyyy-MM-dd_HH-mm-ss",
+                            CultureInfo.InvariantCulture),
+                        DateTimeKind.Utc));
+            }
+
+            var utcNow = new DateTimeOffset(
+                2026,
+                7,
+                13,
+                12,
+                1,
+                0,
+                TimeSpan.Zero);
+            var runner = new FakeClipMediaProcessRunner
+            {
+                BlockFirstProbeFileName = invalidNames[2]
+            };
+            foreach (var name in invalidNames)
+            {
+                runner.RejectedProbeFileNames.Add(name);
+            }
+
+            var service = new ClipLibraryService(
+                () => null,
+                () => ffprobePath,
+                runner,
+                Path.Combine(testDirectory, "Cache"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1),
+                maximumTotalProbeDuration: TimeSpan.FromMilliseconds(100),
+                invalidProbeCacheDuration: TimeSpan.FromSeconds(30),
+                getUtcNow: () => utcNow);
+
+            var first = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                0,
+                first.Count,
+                "The first bounded pass should stop while a bad newest candidate owns the probe budget.");
+
+            var second = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                validName,
+                second.Single().FileName,
+                "Short-lived negative results should let an immediate refresh reach an older valid clip.");
+            Assert.Equal(
+                1,
+                runner.GetProbeInvocationCount(invalidNames[0]),
+                "An unchanged corrupt clip must not be re-probed by an immediate refresh.");
+            Assert.Equal(
+                1,
+                runner.GetProbeInvocationCount(invalidNames[1]),
+                "Each unchanged negative result should consume no more than one helper run within the TTL.");
+
+            var helperRunsAfterRecovery = runner.Invocations.Count;
+            for (var refresh = 0; refresh < 50; refresh++)
+            {
+                var repeated = await service.GetRecentClipsAsync(
+                        clipsDirectory,
+                        count: 1,
+                        includeThumbnails: false)
+                    .ConfigureAwait(false);
+                Assert.Equal(
+                    validName,
+                    repeated.Single().FileName,
+                    "A long sequence of unchanged refreshes should keep reaching the cached valid clip.");
+            }
+
+            Assert.Equal(
+                helperRunsAfterRecovery,
+                runner.Invocations.Count,
+                "Repeated long-use refreshes must not respawn probes for cached valid or negative results.");
+
+            runner.RejectedProbeFileNames.Remove(invalidNames[0]);
+            var beforeExpiry = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                validName,
+                beforeExpiry.Single().FileName,
+                "A transiently recovered clip should remain fail-closed only for the bounded negative-cache TTL.");
+            Assert.Equal(
+                1,
+                runner.GetProbeInvocationCount(invalidNames[0]),
+                "The negative result must be reused before its TTL expires.");
+
+            utcNow += TimeSpan.FromSeconds(31);
+            var afterExpiry = await service.GetRecentClipsAsync(
+                    clipsDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                invalidNames[0],
+                afterExpiry.Single().FileName,
+                "An expired negative result must be re-probed so transient failures recover.");
+            Assert.Equal(
+                2,
+                runner.GetProbeInvocationCount(invalidNames[0]),
+                "The negative cache must retry an unchanged clip after its TTL.");
+
+            var changedDirectory = Path.Combine(testDirectory, "Changed");
+            Directory.CreateDirectory(changedDirectory);
+            var changedName = "Clip_2026-07-13_13-00-00.mp4";
+            var changedPath = Path.Combine(changedDirectory, changedName);
+            await File.WriteAllBytesAsync(changedPath, [4, 5, 6]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(
+                changedPath,
+                new DateTime(2026, 7, 13, 13, 0, 0, DateTimeKind.Utc));
+
+            var changedRunner = new FakeClipMediaProcessRunner();
+            changedRunner.RejectedProbeFileNames.Add(changedName);
+            var changedService = new ClipLibraryService(
+                () => null,
+                () => ffprobePath,
+                changedRunner,
+                Path.Combine(testDirectory, "Changed-Cache"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1),
+                invalidProbeCacheDuration: TimeSpan.FromSeconds(30),
+                getUtcNow: () => utcNow);
+            var initiallyInvalid = await changedService.GetRecentClipsAsync(
+                    changedDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(0, initiallyInvalid.Count, "The scripted changed clip should initially fail closed.");
+
+            await File.WriteAllBytesAsync(changedPath, [4, 5, 6, 7]).ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(
+                changedPath,
+                new DateTime(2026, 7, 13, 13, 0, 1, DateTimeKind.Utc));
+            changedRunner.RejectedProbeFileNames.Remove(changedName);
+            var afterIdentityChange = await changedService.GetRecentClipsAsync(
+                    changedDirectory,
+                    count: 1,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                changedName,
+                afterIdentityChange.Single().FileName,
+                "A file identity or metadata change must bypass an unexpired negative result.");
+            Assert.Equal(
+                2,
+                changedRunner.GetProbeInvocationCount(changedName),
+                "Changed media must receive a fresh validation immediately.");
         }
         finally
         {
@@ -5516,9 +7120,12 @@ internal static class Program
                              new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
                              cleanupRoot))
             {
+                await replay.WaitForInitialBufferMaintenanceAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(false);
                 Assert.True(
                     !Directory.Exists(abandonedSession),
-                    "Abandoned screen/audio replay data must be purged when the service starts.");
+                    "Abandoned screen/audio replay data must be purged before capture starts.");
             }
 
             var legacyRoot = Path.Combine(testDirectory, "LegacyBuffer");
@@ -5711,6 +7318,35 @@ internal static class Program
         }
     }
 
+    private sealed class BlockingProbeRunner(
+        Func<IReadOnlyList<string>, bool> succeeds) : IFfmpegProbeRunner
+    {
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _callCount;
+
+        public TaskCompletionSource FirstInvocationStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public void Release() => _release.TrySetResult();
+
+        public async Task<FfmpegProbeExecution> RunAsync(
+            string executable,
+            IReadOnlyList<string> arguments,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _ = Interlocked.Increment(ref _callCount);
+            FirstInvocationStarted.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return succeeds(arguments)
+                ? new FfmpegProbeExecution(true)
+                : new FfmpegProbeExecution(false, "scripted unavailable capability");
+        }
+    }
+
     private sealed class FakeTrimMediaProcessRunner : IClipMediaProcessRunner
     {
         private double _lastTrimDurationSeconds = 1;
@@ -5725,6 +7361,8 @@ internal static class Program
         public bool FailFirstTrimOnly { get; init; }
 
         public bool ReturnInvalidOutputMetadata { get; init; }
+
+        public bool ReturnInvalidFirstTrimOutputMetadata { get; init; }
 
         public bool WaitForTrimCancellation { get; init; }
 
@@ -5777,6 +7415,11 @@ internal static class Program
                     ? ReturnInvalidOutputMetadata ? 99 : _lastTrimDurationSeconds
                     : 10;
                 var durationText = duration.ToString("0.######", CultureInfo.InvariantCulture);
+                var startTime = isTrimPartial &&
+                                ReturnInvalidFirstTrimOutputMetadata &&
+                                TrimRunCount == 1
+                    ? "34.699"
+                    : "0";
                 var averageFrameRate = isTrimPartial
                     ? OutputAverageFrameRate
                     : SourceAverageFrameRate;
@@ -5785,6 +7428,7 @@ internal static class Program
                     : SourceNominalFrameRate;
                 var output =
                     $"{{\"streams\":[{{\"codec_type\":\"video\",\"width\":1280,\"height\":720," +
+                    $"\"start_time\":\"{startTime}\"," +
                     $"\"avg_frame_rate\":\"{averageFrameRate}\",\"r_frame_rate\":\"{nominalFrameRate}\"," +
                     $"\"duration\":\"{durationText}\"}}," +
                     $"{{\"codec_type\":\"audio\",\"duration\":\"{durationText}\"}}]," +
@@ -5852,7 +7496,7 @@ internal static class Program
 
         public bool PauseThumbnailGeneration { get; init; }
 
-        public bool RejectAllProbes { get; init; }
+        public bool RejectAllProbes { get; set; }
 
         public bool TimeOutAllProbes { get; init; }
 
@@ -5860,10 +7504,21 @@ internal static class Program
 
         public string? ProbeOutput { get; init; }
 
+        public string? BlockFirstProbeFileName { get; init; }
+
+        public HashSet<string> RejectedProbeFileNames { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private Dictionary<string, int> ProbeInvocationCounts { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
         public Action<IReadOnlyList<string>>? BeforeThumbnailWrite { get; init; }
 
         public void ReleaseThumbnailGeneration() =>
             _releaseThumbnailGeneration.TrySetResult();
+
+        public int GetProbeInvocationCount(string fileName) =>
+            ProbeInvocationCounts.GetValueOrDefault(fileName);
 
         public async Task<ClipMediaProcessResult> RunAsync(
             string executablePath,
@@ -5877,9 +7532,18 @@ internal static class Program
 
             if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
             {
+                var clipName = Path.GetFileName(arguments[^1]);
+                var invocationCount = ProbeInvocationCounts.GetValueOrDefault(clipName) + 1;
+                ProbeInvocationCounts[clipName] = invocationCount;
                 if (ProbeDelay > TimeSpan.Zero)
                 {
                     await Task.Delay(ProbeDelay, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (invocationCount == 1 &&
+                    clipName.Equals(BlockFirstProbeFileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
                 }
 
                 if (TimeOutAllProbes)
@@ -5887,7 +7551,9 @@ internal static class Program
                     return new ClipMediaProcessResult(-1, string.Empty, string.Empty, true);
                 }
 
-                return RejectAllProbes || Path.GetFileName(arguments[^1]).Equals(
+                return RejectAllProbes ||
+                       RejectedProbeFileNames.Contains(clipName) ||
+                       clipName.Equals(
                         "Clip_2026-01-03_01-00-00.mp4",
                         StringComparison.OrdinalIgnoreCase)
                     ? new ClipMediaProcessResult(1, string.Empty, "invalid media", false)
@@ -5912,7 +7578,7 @@ internal static class Program
             var outputPath = arguments[^1];
             await File.WriteAllBytesAsync(
                     outputPath,
-                    [0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9],
+                    ValidTestJpegBytes,
                     cancellationToken)
                 .ConfigureAwait(false);
             return new ClipMediaProcessResult(0, string.Empty, string.Empty, false);

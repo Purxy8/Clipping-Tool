@@ -29,6 +29,7 @@ public sealed class ClipTrimService
     private readonly Func<string?> _findFfmpeg;
     private readonly Func<string?> _findFfprobe;
     private readonly IClipMediaProcessRunner _processRunner;
+    private readonly IClipTrimFreeSpaceProvider _freeSpaceProvider;
     private readonly SemaphoreSlim _trimGate = new(1, 1);
     private readonly Dictionary<EncoderCacheKey, VideoEncodingStrategy> _encoderCache = [];
     private int _replayBlockingTrimWork;
@@ -58,13 +59,28 @@ public sealed class ClipTrimService
         Func<string?> findFfmpeg,
         Func<string?> findFfprobe,
         IClipMediaProcessRunner processRunner)
+        : this(
+            findFfmpeg,
+            findFfprobe,
+            processRunner,
+            WindowsClipTrimFreeSpaceProvider.Instance)
+    {
+    }
+
+    internal ClipTrimService(
+        Func<string?> findFfmpeg,
+        Func<string?> findFfprobe,
+        IClipMediaProcessRunner processRunner,
+        IClipTrimFreeSpaceProvider freeSpaceProvider)
     {
         ArgumentNullException.ThrowIfNull(findFfmpeg);
         ArgumentNullException.ThrowIfNull(findFfprobe);
         ArgumentNullException.ThrowIfNull(processRunner);
+        ArgumentNullException.ThrowIfNull(freeSpaceProvider);
         _findFfmpeg = findFfmpeg;
         _findFfprobe = findFfprobe;
         _processRunner = processRunner;
+        _freeSpaceProvider = freeSpaceProvider;
     }
 
     public async Task<ClipTrimResult> TrimAsync(
@@ -278,7 +294,8 @@ public sealed class ClipTrimService
                 pinnedSource.RootDirectoryPath,
                 source,
                 sourceMetadata.Value,
-                range.Duration))
+                range.Duration,
+                _freeSpaceProvider))
         {
             return new ClipTrimResult(
                 ClipTrimStatus.InsufficientSpace,
@@ -303,150 +320,137 @@ public sealed class ClipTrimService
                     sourceMetadata.Value.NominalFramesPerSecond,
                     cancellationToken)
                 .ConfigureAwait(false);
-        var encoder = useFastStreamCopy
-            ? VideoEncodingStrategy.SoftwareGdi
-            : await SelectEncoderAsync(
-                    ffmpegPath,
-                    sourceMetadata.Value.Width,
-                    sourceMetadata.Value.Height,
-                    framesPerSecond,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
         string? stagingPath = CreateUniqueStagingPath(pinnedSource.RootDirectoryPath);
         try
         {
             var timeout = CalculateTrimTimeout(range.Duration);
-            var execution = await RunTrimAttemptAsync(
-                    ffmpegPath,
-                    pinnedSource.MediaPath,
-                    stagingPath,
-                    range,
-                    sourceMetadata.Value.HasAudio,
-                    framesPerSecond,
-                    encoder,
-                    executionMode,
-                    useFastStreamCopy,
-                    timeout,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (!execution.Succeeded &&
-                !execution.TimedOut &&
-                useFastStreamCopy)
+            ClipMediaProcessResult execution;
+            string validatedStagingPath;
+            while (true)
             {
-                // Packet copy is an optimization, not a reliability boundary.
-                // A source can still reject copy after its keyframe probe (for
-                // example because of an unexpected stream/container detail), so
-                // retry the same exact range through the normal verified encoder
-                // path before reporting a user-visible failure.
-                TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
-                useFastStreamCopy = false;
-                encoder = await SelectEncoderAsync(
-                        ffmpegPath,
-                        sourceMetadata.Value.Width,
-                        sourceMetadata.Value.Height,
-                        framesPerSecond,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                execution = await RunTrimAttemptAsync(
-                        ffmpegPath,
-                        pinnedSource.MediaPath,
-                        stagingPath,
-                        range,
-                        sourceMetadata.Value.HasAudio,
-                        framesPerSecond,
-                        encoder,
-                        executionMode,
-                        useFastStreamCopy: false,
-                        timeout,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
-            if (!execution.Succeeded &&
-                !execution.TimedOut &&
-                encoder.IsHardwareEncoder)
-            {
-                TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
-                var software = VideoEncodingStrategy.SoftwareGdi;
-                if (executionMode == ClipTrimExecutionMode.Standard)
+                if (useFastStreamCopy)
                 {
-                    CacheEncoder(
-                        BuildEncoderCacheKey(
+                    execution = await RunTrimAttemptAsync(
                             ffmpegPath,
-                            sourceMetadata.Value.Width,
-                            sourceMetadata.Value.Height,
-                            framesPerSecond),
-                        software);
+                            pinnedSource.MediaPath,
+                            stagingPath,
+                            range,
+                            sourceMetadata.Value.HasAudio,
+                            framesPerSecond,
+                            VideoEncodingStrategy.SoftwareGdi,
+                            executionMode,
+                            useFastStreamCopy: true,
+                            timeout,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    execution = await RunEncodedTrimWithFallbackAsync(
+                            ffmpegPath,
+                            pinnedSource,
+                            stagingPath,
+                            range,
+                            sourceMetadata.Value,
+                            framesPerSecond,
+                            executionMode,
+                            timeout,
+                            cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
-                execution = await RunTrimAttemptAsync(
-                        ffmpegPath,
-                        pinnedSource.MediaPath,
+                if (!execution.Succeeded)
+                {
+                    if (useFastStreamCopy && !execution.TimedOut)
+                    {
+                        // Packet copy is an optimization, not a reliability
+                        // boundary. Retry a normal exact encode after cleaning
+                        // the failed partial, but never retry cancellation or a
+                        // bounded helper timeout.
+                        TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
+                        useFastStreamCopy = false;
+                        continue;
+                    }
+
+                    return new ClipTrimResult(
+                        ClipTrimStatus.EncodingFailed,
+                        null,
+                        execution.TimedOut
+                            ? "Trimming took too long and was stopped. The original clip was not changed."
+                            : "The media engine could not encode the selected range.")
+                    {
+                        Diagnostic = SanitizeDiagnostic(execution.StandardError)
+                    };
+                }
+
+                if (!ClipLibraryService.TryValidatePinnedDirectChildFile(
+                        pinnedSource,
                         stagingPath,
-                        range,
-                        sourceMetadata.Value.HasAudio,
-                        framesPerSecond,
-                        software,
-                        executionMode,
-                        useFastStreamCopy: false,
-                        timeout,
+                        out validatedStagingPath,
+                        out _,
+                        out var initialValidationDiagnostic))
+                {
+                    if (useFastStreamCopy &&
+                        initialValidationDiagnostic.Failure is
+                            PinnedDirectChildValidationFailure.OpenFailed or
+                            PinnedDirectChildValidationFailure.EmptyOrDeleting)
+                    {
+                        TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
+                        useFastStreamCopy = false;
+                        continue;
+                    }
+
+                    return new ClipTrimResult(
+                        ClipTrimStatus.OutputValidationFailed,
+                        null,
+                        "The media engine produced an unsafe or empty output file.")
+                    {
+                        Diagnostic = $"{initialValidationDiagnostic}; " +
+                                     SanitizeDiagnostic(execution.StandardError)
+                    };
+                }
+
+                var outputMetadata = await ProbeMediaAsync(
+                        ffprobePath,
+                        validatedStagingPath,
+                        ProbeTimeout,
                         cancellationToken)
                     .ConfigureAwait(false);
-            }
-
-            if (!execution.Succeeded)
-            {
-                return new ClipTrimResult(
-                    ClipTrimStatus.EncodingFailed,
-                    null,
-                    execution.TimedOut
-                        ? "Trimming took too long and was stopped. The original clip was not changed."
-                        : "The media engine could not encode the selected range.");
-            }
-
-            if (!ClipLibraryService.TryValidatePinnedDirectChildFile(
-                    pinnedSource,
-                    stagingPath,
-                    out var validatedStagingPath,
-                    out _,
-                    out var initialValidationDiagnostic))
-            {
-                return new ClipTrimResult(
-                    ClipTrimStatus.OutputValidationFailed,
-                    null,
-                    "The media engine produced an unsafe or empty output file.")
+                if (outputMetadata is null)
                 {
-                    Diagnostic = $"{initialValidationDiagnostic}; " +
-                                 SanitizeDiagnostic(execution.StandardError)
-                };
-            }
+                    if (useFastStreamCopy)
+                    {
+                        TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
+                        useFastStreamCopy = false;
+                        continue;
+                    }
 
-            var outputMetadata = await ProbeMediaAsync(
-                    ffprobePath,
-                    validatedStagingPath,
-                    ProbeTimeout,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (outputMetadata is null)
-            {
-                return new ClipTrimResult(
-                    ClipTrimStatus.OutputValidationFailed,
-                    null,
-                    "The generated MP4 could not be read back by ClipForge's media validator.");
-            }
+                    return new ClipTrimResult(
+                        ClipTrimStatus.OutputValidationFailed,
+                        null,
+                        "The generated MP4 could not be read back by ClipForge's media validator.");
+                }
 
-            if (!TryValidateExpectedOutput(
-                    outputMetadata.Value,
-                    range.Duration,
-                    sourceMetadata.Value,
-                    out var validationFailure))
-            {
-                return new ClipTrimResult(
-                    ClipTrimStatus.OutputValidationFailed,
-                    null,
-                    $"The generated MP4 failed ClipForge's media validation. {validationFailure}");
+                if (!TryValidateExpectedOutput(
+                        outputMetadata.Value,
+                        range.Duration,
+                        sourceMetadata.Value,
+                        out var validationFailure))
+                {
+                    if (useFastStreamCopy)
+                    {
+                        TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
+                        useFastStreamCopy = false;
+                        continue;
+                    }
+
+                    return new ClipTrimResult(
+                        ClipTrimStatus.OutputValidationFailed,
+                        null,
+                        $"The generated MP4 failed ClipForge's media validation. {validationFailure}");
+                }
+
+                break;
             }
 
             if (!ClipLibraryService.TryValidatePinnedDirectChildFile(
@@ -520,6 +524,72 @@ public sealed class ClipTrimService
                 timeout,
                 cancellationToken,
                 ClipMediaProcessPriority.Interactive)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<ClipMediaProcessResult> RunEncodedTrimWithFallbackAsync(
+        string ffmpegPath,
+        ClipLibraryService.PinnedClipReadContext pinnedSource,
+        string outputPath,
+        ClipTrimRange range,
+        TrimMediaMetadata sourceMetadata,
+        int framesPerSecond,
+        ClipTrimExecutionMode executionMode,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var encoder = await SelectEncoderAsync(
+                ffmpegPath,
+                sourceMetadata.Width,
+                sourceMetadata.Height,
+                framesPerSecond,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var execution = await RunTrimAttemptAsync(
+                ffmpegPath,
+                pinnedSource.MediaPath,
+                outputPath,
+                range,
+                sourceMetadata.HasAudio,
+                framesPerSecond,
+                encoder,
+                executionMode,
+                useFastStreamCopy: false,
+                timeout,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (execution.Succeeded ||
+            execution.TimedOut ||
+            !encoder.IsHardwareEncoder)
+        {
+            return execution;
+        }
+
+        TryDeleteStagingFile(pinnedSource.RootDirectoryPath, outputPath);
+        var software = VideoEncodingStrategy.SoftwareGdi;
+        if (executionMode == ClipTrimExecutionMode.Standard)
+        {
+            CacheEncoder(
+                BuildEncoderCacheKey(
+                    ffmpegPath,
+                    sourceMetadata.Width,
+                    sourceMetadata.Height,
+                    framesPerSecond),
+                software);
+        }
+
+        return await RunTrimAttemptAsync(
+                ffmpegPath,
+                pinnedSource.MediaPath,
+                outputPath,
+                range,
+                sourceMetadata.HasAudio,
+                framesPerSecond,
+                software,
+                executionMode,
+                useFastStreamCopy: false,
+                timeout,
+                cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -748,7 +818,7 @@ public sealed class ClipTrimService
         "-v", "error",
         "-protocol_whitelist", "file",
         "-f", "mov",
-        "-show_entries", "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,duration:format=duration",
+        "-show_entries", "stream=codec_type,width,height,start_time,avg_frame_rate,r_frame_rate,duration:format=duration",
         "-of", "json",
         mediaPath
     ];
@@ -832,13 +902,21 @@ public sealed class ClipTrimService
                 return null;
             }
 
+            var videoStartSeconds = 0d;
+            if (video.TryGetProperty("start_time", out var videoStart) &&
+                !TryReadNonnegativeDouble(videoStart, out videoStartSeconds))
+            {
+                return null;
+            }
+
             return new TrimMediaMetadata(
                 TimeSpan.FromSeconds(durationSeconds),
                 width,
                 height,
                 framesPerSecond,
                 nominalFramesPerSecond,
-                hasAudio);
+                hasAudio,
+                videoStartSeconds);
         }
         catch (Exception exception) when (exception is JsonException or OverflowException or FormatException)
         {
@@ -946,6 +1024,14 @@ public sealed class ClipTrimService
             return false;
         }
 
+        if (output.VideoStartSeconds > 0.25)
+        {
+            failure = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Video starts at {output.VideoStartSeconds:0.###}s instead of the beginning of the trimmed file.");
+            return false;
+        }
+
         // avg_frame_rate is selection-local for timestamp-variable captures and
         // legitimately changes when a short range is re-encoded. r_frame_rate is
         // the stable nominal cadence that the capture and encoder promise.
@@ -977,30 +1063,58 @@ public sealed class ClipTrimService
         string rootDirectory,
         ClipLibraryItem source,
         TrimMediaMetadata metadata,
-        TimeSpan trimDuration)
+        TimeSpan trimDuration,
+        IClipTrimFreeSpaceProvider freeSpaceProvider) =>
+        HasSufficientWorkingSpace(
+            rootDirectory,
+            source.FileSizeBytes,
+            metadata.Duration,
+            metadata.Width,
+            metadata.Height,
+            metadata.FramesPerSecond,
+            trimDuration,
+            freeSpaceProvider);
+
+    internal static bool HasSufficientWorkingSpace(
+        string rootDirectory,
+        long sourceFileSizeBytes,
+        TimeSpan sourceDuration,
+        int width,
+        int height,
+        double framesPerSecond,
+        TimeSpan trimDuration,
+        IClipTrimFreeSpaceProvider freeSpaceProvider)
     {
+        ArgumentNullException.ThrowIfNull(freeSpaceProvider);
         try
         {
-            var driveRoot = Path.GetPathRoot(rootDirectory);
-            if (string.IsNullOrWhiteSpace(driveRoot))
+            if (string.IsNullOrWhiteSpace(rootDirectory))
             {
                 return false;
             }
 
             var sourceRatio = Math.Clamp(
-                trimDuration.TotalSeconds / metadata.Duration.TotalSeconds,
+                trimDuration.TotalSeconds / sourceDuration.TotalSeconds,
                 0,
                 1);
-            var proportionalBytes = source.FileSizeBytes * sourceRatio * 2;
-            var estimatedVideoBytes = metadata.Width *
-                                      (double)metadata.Height *
-                                      metadata.FramesPerSecond *
+            var proportionalBytes = sourceFileSizeBytes * sourceRatio * 2;
+            var estimatedVideoBytes = width *
+                                      (double)height *
+                                      framesPerSecond *
                                       0.20 / 8 *
                                       trimDuration.TotalSeconds;
             var required = Math.Max(proportionalBytes, estimatedVideoBytes) + MinimumWorkingFreeBytes;
-            return double.IsFinite(required) &&
-                   required < long.MaxValue &&
-                   new DriveInfo(driveRoot).AvailableFreeSpace >= (long)Math.Ceiling(required);
+            if (!double.IsFinite(required) ||
+                required < 0 ||
+                required >= long.MaxValue ||
+                !freeSpaceProvider.TryGetAvailableFreeBytes(
+                    rootDirectory,
+                    out var availableFreeBytes))
+            {
+                return false;
+            }
+
+            return availableFreeBytes >= (ulong)Math.Ceiling(required);
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or ArgumentException or SecurityException)
@@ -1127,7 +1241,8 @@ public sealed class ClipTrimService
         int Height,
         double FramesPerSecond,
         double NominalFramesPerSecond,
-        bool HasAudio);
+        bool HasAudio,
+        double VideoStartSeconds);
 
     private readonly record struct EncoderCacheKey(
         string FfmpegPath,

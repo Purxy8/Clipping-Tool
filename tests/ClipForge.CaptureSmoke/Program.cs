@@ -5,6 +5,7 @@ using System.Text.Json;
 using ClipForge.Capture;
 using ClipForge.Models;
 using ClipForge.Services;
+using ClipForge.Testing;
 
 try
 {
@@ -13,7 +14,18 @@ try
     artifactRoot = Path.GetFullPath(artifactRoot);
     Directory.CreateDirectory(artifactRoot);
 
-    using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+    var requestedRealSaveSeconds = int.TryParse(
+        GetOption(args, "--save-seconds"),
+        NumberStyles.None,
+        CultureInfo.InvariantCulture,
+        out var parsedRealSaveSeconds)
+        ? parsedRealSaveSeconds
+        : 6;
+    var runTimeout = TimeSpan.FromMinutes(Math.Clamp(
+        (int)Math.Ceiling(Math.Max(0, requestedRealSaveSeconds) / 60d) + 5,
+        10,
+        70));
+    using var timeout = new CancellationTokenSource(runTimeout);
     var setup = new FfmpegSetupService(Path.Combine(artifactRoot, "ffmpeg"));
     var ffmpeg = setup.FindExecutable();
     if (ffmpeg is null)
@@ -45,6 +57,16 @@ try
             artifactRoot,
             args.Contains("--matrix-exhaustive", StringComparer.OrdinalIgnoreCase),
             GetOption(args, "--matrix-fps"),
+            timeout.Token);
+        return 0;
+    }
+
+    if (args.Contains("--length-matrix", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunReplayLengthMatrixAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
             timeout.Token);
         return 0;
     }
@@ -124,6 +146,11 @@ try
         ? ParseRenewalCount(GetOption(args, "--renew-count"))
         : 0;
     var forceGdi = args.Contains("--force-gdi", StringComparer.OrdinalIgnoreCase);
+    var forceWgc = args.Contains("--force-wgc", StringComparer.OrdinalIgnoreCase);
+    if (forceGdi && forceWgc)
+    {
+        throw new ArgumentException("--force-gdi and --force-wgc are mutually exclusive.");
+    }
     if (verifyRenewal && forceGdi)
     {
         throw new ArgumentException("--renew requires the Windows Graphics Capture path.");
@@ -147,16 +174,36 @@ try
     {
         throw new ArgumentOutOfRangeException(nameof(framesPerSecond), "Smoke-test FPS must be 30 or 60.");
     }
+    if (requestedRealSaveSeconds is < 2 or > 3600)
+    {
+        throw new ArgumentOutOfRangeException(
+            nameof(requestedRealSaveSeconds),
+            "--save-seconds must be an integer between 2 and 3600.");
+    }
+    if (verifyPruning && requestedRealSaveSeconds > 6)
+    {
+        throw new ArgumentException(
+            "--prune uses a six-second ring and cannot be combined with --save-seconds above 6.");
+    }
+    var requestedSaveDuration = TimeSpan.FromSeconds(requestedRealSaveSeconds);
 
     var mode = includeMicrophone
         ? includeSystemAudio ? "mixed-audio" : "microphone"
         : includeSystemAudio ? "audio" : "video";
-    var backendLabel = forceGdi ? "-forced-gdi" : string.Empty;
-    var runLabel = $"{mode}-{resolution.Id}-{framesPerSecond}fps{backendLabel}";
+    var backendLabel = forceGdi
+        ? "-forced-gdi"
+        : forceWgc
+            ? "-forced-wgc"
+            : string.Empty;
+    var saveLabel = requestedRealSaveSeconds == 6
+        ? string.Empty
+        : $"-save{requestedRealSaveSeconds}s";
+    var runLabel = $"{mode}-{resolution.Id}-{framesPerSecond}fps{backendLabel}{saveLabel}";
     var clipDirectory = Path.Combine(artifactRoot, $"clips-{runLabel}");
     var bufferDirectory = Path.Combine(artifactRoot, $"buffer-{runLabel}");
     var renewalReportPath = Path.Combine(artifactRoot, $"renewal-{runLabel}.json");
     var renewalReports = new List<RenewalSmokeReport>();
+    var knownQuarantinedGenerationHeads = new HashSet<int>();
     Directory.CreateDirectory(clipDirectory);
 
     var configuration = new CaptureConfiguration(
@@ -166,8 +213,12 @@ try
         verifyPruning
             ? TimeSpan.FromSeconds(6)
             : verifyRenewal
-                ? TimeSpan.FromMinutes(5)
-                : TimeSpan.FromSeconds(30),
+                ? requestedSaveDuration > TimeSpan.FromMinutes(5)
+                    ? requestedSaveDuration
+                    : TimeSpan.FromMinutes(5)
+                : requestedSaveDuration > TimeSpan.FromSeconds(30)
+                    ? requestedSaveDuration
+                    : TimeSpan.FromSeconds(30),
         false,
         includeSystemAudio,
         includeSystemAudio ? outputs.FirstOrDefault(device => device.IsDefault) ?? outputs[0] : null,
@@ -187,6 +238,27 @@ try
         };
         Console.WriteLine($"Forcing fallback smoke path: {captureStrategyOverride.Description}");
     }
+    else if (forceWgc)
+    {
+        var verifiedSelection = await new FfmpegCapabilityProbe()
+            .SelectAsync(ffmpeg, configuration, timeout.Token)
+            .ConfigureAwait(false);
+        captureStrategyOverride = verifiedSelection.Strategy with
+        {
+            CaptureBackend = DesktopCaptureBackend.WindowsGraphicsCapture,
+            RequiresSystemMemoryTransfer = !verifiedSelection.Strategy.IsHardwareEncoder
+        };
+        Console.WriteLine(
+            $"Forcing WGC smoke path after probe diagnostics: {verifiedSelection.Diagnostics}");
+    }
+    else if (args.Contains("--print-probe-diagnostics", StringComparer.OrdinalIgnoreCase))
+    {
+        var verifiedSelection = await new FfmpegCapabilityProbe()
+            .SelectAsync(ffmpeg, configuration, timeout.Token)
+            .ConfigureAwait(false);
+        captureStrategyOverride = verifiedSelection.Strategy;
+        Console.WriteLine($"Capability probe diagnostics: {verifiedSelection.Diagnostics}");
+    }
 
     await using var replay = captureStrategyOverride is null
         ? new ReplayBufferService(setup, bufferDirectory)
@@ -199,7 +271,7 @@ try
         {
             buffered.TrySetException(new InvalidOperationException(state.Message ?? "Capture faulted."));
         }
-        else if (state.AvailableDuration >= TimeSpan.FromSeconds(6))
+        else if (state.AvailableDuration >= requestedSaveDuration)
         {
             buffered.TrySetResult();
         }
@@ -220,23 +292,40 @@ try
         }
 
         await replay.StartAsync(configuration, timeout.Token);
-        Console.WriteLine($"Capture strategy: {replay.ActiveEncoderDescription ?? "unknown"}");
-        var performance = await ReadPerformanceSampleAsync(replay, timeout.Token)
-            ?? throw new InvalidDataException("Capture process metrics were unavailable during the smoke test.");
-        if (performance.Priority != ProcessPriorityClass.BelowNormal)
+        if (verifyRenewal)
         {
-            throw new InvalidDataException(
-                $"Capture CPU priority was {performance.Priority}; expected BelowNormal for every path.");
+            var initialGeneration = replay.ReadCaptureGenerationSnapshotForTesting();
+            if (initialGeneration.GenerationId <= 0 ||
+                initialGeneration.QuarantinedHeadSegmentNumber < 0)
+            {
+                throw new InvalidDataException(
+                    "The initial capture-generation provenance was unavailable.");
+            }
+
+            knownQuarantinedGenerationHeads.Add(
+                initialGeneration.QuarantinedHeadSegmentNumber);
         }
 
+        Console.WriteLine($"Capture strategy: {replay.ActiveEncoderDescription ?? "unknown"}");
         var activeStrategy = replay.LastCapturePlan?.Strategy
             ?? throw new InvalidDataException("Capture strategy details were unavailable.");
         var captureOutputRequiresScaling = CaptureGeometry.ResolveOutputSize(
             configuration.Display,
             configuration.Resolution).RequiresScaling;
+        var expectedCpuPriority = ProcessTuning.GetCaptureCpuPriority(
+            activeStrategy,
+            captureOutputRequiresScaling);
         var expectedGraphicsPriority = ProcessTuning.GetCaptureGraphicsPriority(
             activeStrategy,
             captureOutputRequiresScaling);
+        var performance = await ReadPerformanceSampleAsync(replay, timeout.Token)
+            ?? throw new InvalidDataException("Capture process metrics were unavailable during the smoke test.");
+        if (performance.Priority != expectedCpuPriority)
+        {
+            throw new InvalidDataException(
+                $"Capture CPU priority was {performance.Priority}; expected {expectedCpuPriority}.");
+        }
+
         if (performance.GraphicsPriority != expectedGraphicsPriority)
         {
             throw new InvalidDataException(
@@ -267,7 +356,9 @@ try
             $"working set {performance.WorkingSetBytes / (1024d * 1024d):0.0} MB, " +
             $"CPU priority {performance.Priority}, GPU priority {performance.GraphicsPriority}, " +
             $"encoder {replay.ActiveEncoderDescription ?? "unknown"}");
-        await buffered.Task.WaitAsync(TimeSpan.FromSeconds(30), timeout.Token);
+        await buffered.Task.WaitAsync(
+            TimeSpan.FromSeconds(Math.Clamp(requestedRealSaveSeconds + 20, 30, 3660)),
+            timeout.Token);
         if (args.Contains("--priority-repair", StringComparer.OrdinalIgnoreCase))
         {
             var captureProcessId = replay.CaptureProcessId
@@ -275,7 +366,10 @@ try
                     "The capture process id was unavailable for the priority-repair test.");
             using (var captureProcess = Process.GetProcessById(captureProcessId))
             {
-                captureProcess.PriorityClass = ProcessPriorityClass.Normal;
+                captureProcess.PriorityClass =
+                    expectedCpuPriority == ProcessPriorityClass.Normal
+                        ? ProcessPriorityClass.BelowNormal
+                        : ProcessPriorityClass.Normal;
                 var injectedGraphicsPriority =
                     expectedGraphicsPriority == GraphicsSchedulingPriorityClass.Normal
                         ? GraphicsSchedulingPriorityClass.BelowNormal
@@ -299,7 +393,7 @@ try
             var repairedPerformance = await ReadPerformanceSampleAsync(replay, timeout.Token)
                 ?? throw new InvalidDataException(
                     "Capture process metrics were unavailable after the priority-repair interval.");
-            if (repairedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
+            if (repairedPerformance.Priority != expectedCpuPriority ||
                 repairedPerformance.GraphicsPriority != expectedGraphicsPriority)
             {
                 throw new InvalidDataException(
@@ -324,7 +418,7 @@ try
             var sustainedPerformance = await ReadPerformanceSampleAsync(replay, timeout.Token)
                 ?? throw new InvalidDataException(
                     "Capture process metrics were unavailable after the live replay hold.");
-            if (sustainedPerformance.Priority != ProcessPriorityClass.BelowNormal ||
+            if (sustainedPerformance.Priority != expectedCpuPriority ||
                 sustainedPerformance.GraphicsPriority != expectedGraphicsPriority)
             {
                 throw new InvalidDataException(
@@ -351,7 +445,14 @@ try
                         "The replay ring did not contain enough completed segments to verify renewal retention.");
                 }
 
-                AssertContiguousSegmentIds(beforeRenewal, $"before renewal {renewalIndex}");
+                var generationBeforeRenewal =
+                    replay.ReadCaptureGenerationSnapshotForTesting();
+                knownQuarantinedGenerationHeads.Add(
+                    generationBeforeRenewal.QuarantinedHeadSegmentNumber);
+                AssertValidSegmentSequence(
+                    beforeRenewal,
+                    knownQuarantinedGenerationHeads,
+                    $"before renewal {renewalIndex}");
                 var previousTail = beforeRenewal[^1];
                 var retainedBeforeRenewal = beforeRenewal
                     .Take(beforeRenewal.Count - 1)
@@ -397,7 +498,7 @@ try
 
                 using (var replacementProcess = Process.GetProcessById(replacementProcessId))
                 {
-                    if (replacementProcess.PriorityClass != ProcessPriorityClass.BelowNormal ||
+                    if (replacementProcess.PriorityClass != expectedCpuPriority ||
                         !ProcessTuning.TryReadGraphicsPriority(
                             replacementProcess,
                             out var replacementGraphicsPriority) ||
@@ -416,26 +517,49 @@ try
                         $"WGC renewal {renewalIndex} left no segment in the replay ring.");
                 }
 
-                AssertContiguousSegmentIds(
+                var replacementGeneration =
+                    replay.ReadCaptureGenerationSnapshotForTesting();
+                if (replacementGeneration.GenerationId !=
+                    generationBeforeRenewal.GenerationId + 1 ||
+                    replacementGeneration.QuarantinedHeadSegmentNumber < 0)
+                {
+                    throw new InvalidDataException(
+                        $"WGC renewal {renewalIndex} published invalid generation provenance: " +
+                        $"{generationBeforeRenewal.GenerationId} -> " +
+                        $"{replacementGeneration.GenerationId}, head " +
+                        $"{replacementGeneration.QuarantinedHeadSegmentNumber}.");
+                }
+
+                var quarantinedHeadSegmentId =
+                    replacementGeneration.QuarantinedHeadSegmentNumber;
+                knownQuarantinedGenerationHeads.Add(quarantinedHeadSegmentId);
+                AssertValidSegmentSequence(
                     immediatelyAfterRenewal,
+                    knownQuarantinedGenerationHeads,
                     $"immediately after renewal {renewalIndex}");
-                var replacementFirstSegmentId = immediatelyAfterRenewal[^1].Id;
-                if (replacementFirstSegmentId <= lastRetainedSegmentId)
+                if (quarantinedHeadSegmentId <= lastRetainedSegmentId)
                 {
                     throw new InvalidDataException(
                         $"WGC renewal {renewalIndex} reset or reused completed segment ids: " +
-                        $"last retained {lastRetainedSegmentId}, replacement {replacementFirstSegmentId}.");
+                        $"last retained {lastRetainedSegmentId}, quarantined generation head " +
+                        $"{quarantinedHeadSegmentId}.");
                 }
 
-                var rollover = await WaitForCompletedReplacementSegmentAsync(
+                var replacementFirstTrustedSegmentId =
+                    checked(quarantinedHeadSegmentId + 1);
+                var expectedSuccessorSegmentId =
+                    checked(quarantinedHeadSegmentId + 2);
+                var rollover = await WaitForCompletedTrustedReplacementSegmentAsync(
                     bufferDirectory,
-                    replacementFirstSegmentId,
+                    replacementFirstTrustedSegmentId,
+                    expectedSuccessorSegmentId,
                     timeout.Token);
-                AssertContiguousSegmentIds(
+                AssertValidSegmentSequence(
                     rollover.Segments,
+                    knownQuarantinedGenerationHeads,
                     $"after replacement segment rollover {renewalIndex}");
                 var completedReplacement = rollover.Segments.Single(segment =>
-                    segment.Id == replacementFirstSegmentId);
+                    segment.Id == replacementFirstTrustedSegmentId);
                 if (completedReplacement.Length <= 0)
                 {
                     throw new InvalidDataException(
@@ -443,14 +567,14 @@ try
                 }
 
                 var priorVersionOfReplacementSegment = beforeRenewal.FirstOrDefault(segment =>
-                    segment.Id == replacementFirstSegmentId);
+                    segment.Id == replacementFirstTrustedSegmentId);
                 if (priorVersionOfReplacementSegment is not null &&
                     priorVersionOfReplacementSegment.Length == completedReplacement.Length &&
                     priorVersionOfReplacementSegment.LastWriteTimeUtc >= completedReplacement.LastWriteTimeUtc)
                 {
                     throw new InvalidDataException(
                         $"Replacement process {replacementProcessId} did not rewrite segment " +
-                        $"{replacementFirstSegmentId} before its successor appeared.");
+                        $"{replacementFirstTrustedSegmentId} before its successor appeared.");
                 }
 
                 if (retainedBeforeRenewal.Any(segment => !File.Exists(segment.Path)))
@@ -471,9 +595,7 @@ try
                         $"The retired FFmpeg process {previousProcessId} remained alive after WGC renewal {renewalIndex}.");
                 }
 
-                var successorSegmentId = rollover.Segments
-                    .Where(segment => segment.Id > replacementFirstSegmentId)
-                    .Min(segment => segment.Id);
+                var successorSegmentId = expectedSuccessorSegmentId;
                 using var hostMetrics = Process.GetCurrentProcess();
                 hostMetrics.Refresh();
                 using var replacementMetrics = Process.GetProcessById(replacementProcessId);
@@ -489,7 +611,9 @@ try
                     previousTail.LastWriteTimeUtc,
                     retainedBeforeRenewal.Length,
                     lastRetainedSegmentId,
-                    replacementFirstSegmentId,
+                    replacementGeneration.GenerationId,
+                    quarantinedHeadSegmentId,
+                    replacementFirstTrustedSegmentId,
                     completedReplacement.Path,
                     completedReplacement.Length,
                     completedReplacement.LastWriteTimeUtc,
@@ -511,8 +635,11 @@ try
                     $"{replacementProcessId}; API restart window " +
                     $"{refreshRequestedUtc:O} .. {refreshCompletedUtc:O} " +
                     $"({refreshTimer.Elapsed.TotalMilliseconds:0.0} ms); retained " +
-                    $"{retainedBeforeRenewal.Length} completed segment(s); replacement segment " +
-                    $"{replacementFirstSegmentId} completed before segment {successorSegmentId} appeared; " +
+                    $"{retainedBeforeRenewal.Length} completed segment(s); generation " +
+                    $"{replacementGeneration.GenerationId} quarantined head " +
+                    $"{quarantinedHeadSegmentId}; first trusted segment " +
+                    $"{replacementFirstTrustedSegmentId} completed before segment " +
+                    $"{successorSegmentId} appeared; " +
                     $"host handles {hostMetrics.HandleCount}, FFmpeg handles {replacementMetrics.HandleCount}.");
             }
 
@@ -582,14 +709,17 @@ try
         if (renewalReports.Count == 2)
         {
             var ringBeforeSave = ReadSegmentSnapshots(bufferDirectory);
-            AssertContiguousSegmentIds(ringBeforeSave, "before the cross-renewal save");
+            AssertValidSegmentSequence(
+                ringBeforeSave,
+                knownQuarantinedGenerationHeads,
+                "before the cross-renewal save");
             var completedForSixSecondSave = ringBeforeSave
                 .Take(Math.Max(0, ringBeforeSave.Count - 1))
                 .TakeLast(3)
                 .Select(segment => segment.Id)
                 .ToArray();
             var replacementSegmentIds = renewalReports
-                .Select(report => report.ReplacementFirstSegmentId)
+                .Select(report => report.ReplacementFirstTrustedSegmentId)
                 .ToArray();
             if (replacementSegmentIds.Any(id => !completedForSixSecondSave.Contains(id)))
             {
@@ -605,7 +735,15 @@ try
                 $"({string.Join(", ", replacementSegmentIds)}).");
         }
 
-        clipPath = await replay.SaveClipAsync(TimeSpan.FromSeconds(6), clipDirectory, timeout.Token);
+        var saveTimer = Stopwatch.StartNew();
+        clipPath = await replay.SaveClipAsync(
+            requestedSaveDuration,
+            clipDirectory,
+            timeout.Token);
+        saveTimer.Stop();
+        Console.WriteLine(
+            $"Replay save latency: {saveTimer.Elapsed.TotalMilliseconds:0.0} ms " +
+            $"for {requestedRealSaveSeconds}s.");
     }
     finally
     {
@@ -617,9 +755,12 @@ try
 
     var ffprobe = Path.Combine(Path.GetDirectoryName(ffmpeg)!, "ffprobe.exe");
     var duration = await ReadDurationAsync(ffprobe, clipPath, timeout.Token);
-    if (duration is < 5 or > 8)
+    if (Math.Abs(duration - requestedRealSaveSeconds) >
+        Math.Max(0.25, 3d / framesPerSecond))
     {
-        throw new InvalidDataException($"Saved clip duration was {duration:0.###} seconds; expected about 6 seconds.");
+        throw new InvalidDataException(
+            $"Saved clip duration was {duration:0.###} seconds; " +
+            $"expected about {requestedRealSaveSeconds} seconds.");
     }
 
     var mediaInfo = await ReadMediaInfoAsync(ffprobe, clipPath, timeout.Token);
@@ -789,24 +930,19 @@ static int ParseSegmentId(string fileName)
     return id;
 }
 
-static void AssertContiguousSegmentIds(
+static void AssertValidSegmentSequence(
     IReadOnlyList<SegmentSnapshot> segments,
+    IReadOnlySet<int> knownQuarantinedGenerationHeads,
     string phase)
-{
-    for (var index = 1; index < segments.Count; index++)
-    {
-        if (segments[index].Id != segments[index - 1].Id + 1)
-        {
-            throw new InvalidDataException(
-                $"Replay segment ids were not contiguous {phase}: " +
-                $"{segments[index - 1].Id} -> {segments[index].Id}.");
-        }
-    }
-}
+    => RenewalSegmentSequence.AssertMonotonicWithKnownQuarantinedHeads(
+        segments.Select(segment => segment.Id).ToArray(),
+        knownQuarantinedGenerationHeads,
+        phase);
 
-static async Task<ReplacementSegmentRollover> WaitForCompletedReplacementSegmentAsync(
+static async Task<ReplacementSegmentRollover> WaitForCompletedTrustedReplacementSegmentAsync(
     string bufferDirectory,
-    int replacementFirstSegmentId,
+    int replacementFirstTrustedSegmentId,
+    int expectedSuccessorSegmentId,
     CancellationToken cancellationToken)
 {
     var timer = Stopwatch.StartNew();
@@ -814,8 +950,8 @@ static async Task<ReplacementSegmentRollover> WaitForCompletedReplacementSegment
     {
         cancellationToken.ThrowIfCancellationRequested();
         var segments = ReadSegmentSnapshots(bufferDirectory);
-        if (segments.Any(segment => segment.Id == replacementFirstSegmentId) &&
-            segments.Any(segment => segment.Id > replacementFirstSegmentId))
+        if (segments.Any(segment => segment.Id == replacementFirstTrustedSegmentId) &&
+            segments.Any(segment => segment.Id == expectedSuccessorSegmentId))
         {
             return new ReplacementSegmentRollover(
                 segments,
@@ -826,7 +962,8 @@ static async Task<ReplacementSegmentRollover> WaitForCompletedReplacementSegment
     }
 
     throw new InvalidDataException(
-        $"Replacement segment {replacementFirstSegmentId} did not complete within 10 seconds.");
+        $"Trusted replacement segment {replacementFirstTrustedSegmentId} did not complete " +
+        $"before expected successor {expectedSuccessorSegmentId} within 10 seconds.");
 }
 
 static Task WriteRenewalReportAsync(
@@ -837,7 +974,7 @@ static Task WriteRenewalReportAsync(
     HostResourceSample? settledHostResources = null)
 {
     var artifact = new RenewalSmokeArtifact(
-        SchemaVersion: 3,
+        SchemaVersion: 4,
         GeneratedUtc: DateTimeOffset.UtcNow,
         RunLabel: runLabel,
         RenewalCount: renewals.Count,
@@ -1206,21 +1343,22 @@ static async Task RunInteractiveCaptureMatrixAsync(
             startInfo.ArgumentList.Add(value);
         }
 
-        foreach (var switchName in new[]
-                 {
-                     "--audio", "--microphone", "--force-gdi", "--prune", "--motion-validation"
-                 })
+        foreach (var switchName in
+                 CaptureSmokeArgumentPolicy.GetInteractiveMatrixForwardedSwitches(
+                     arguments))
         {
-            if (arguments.Contains(switchName, StringComparer.OrdinalIgnoreCase))
-            {
-                startInfo.ArgumentList.Add(switchName);
-            }
+            startInfo.ArgumentList.Add(switchName);
         }
 
         if (GetOption(arguments, "--countdown") is { } countdown)
         {
             startInfo.ArgumentList.Add("--countdown");
             startInfo.ArgumentList.Add(countdown);
+        }
+        if (GetOption(arguments, "--save-seconds") is { } saveSeconds)
+        {
+            startInfo.ArgumentList.Add("--save-seconds");
+            startInfo.ArgumentList.Add(saveSeconds);
         }
 
         Console.WriteLine($"Starting live capture case {resolution.Id}...");
@@ -1617,6 +1755,191 @@ static async Task RunConcatTimingSmokeAsync(
         $"A/V delta {avDurationDelta * 1000:0.###} ms, monotonic audio DTS.");
 }
 
+static async Task RunReplayLengthMatrixAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    CancellationToken cancellationToken)
+{
+    const int framesPerSecond = 60;
+    const int width = 320;
+    const int height = 180;
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException(
+            "The verified FFprobe tool is unavailable for replay-length matrix smoke.");
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"length-matrix-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(runDirectory);
+    var processRunner = new ClipMediaProcessRunner();
+    var seedPath = Path.Combine(runDirectory, "segment-seed.mkv");
+    IReadOnlyList<string> generationArguments =
+    [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "lavfi",
+        "-i", $"color=c=black:s={width}x{height}:r={framesPerSecond}:d=2",
+        "-f", "lavfi",
+        "-i", "anullsrc=r=48000:cl=stereo:d=2",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "35",
+        "-pix_fmt", "yuv420p",
+        "-g", (framesPerSecond * FfmpegArgumentBuilder.SegmentSeconds)
+            .ToString(CultureInfo.InvariantCulture),
+        "-keyint_min", (framesPerSecond * FfmpegArgumentBuilder.SegmentSeconds)
+            .ToString(CultureInfo.InvariantCulture),
+        "-sc_threshold", "0",
+        "-bf", "0",
+        "-c:a", "aac",
+        "-b:a", "32k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-shortest",
+        "-f", "matroska",
+        "-y",
+        seedPath
+    ];
+    var generated = await processRunner.RunAsync(
+            ffmpeg,
+            generationArguments,
+            TimeSpan.FromMinutes(2),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!generated.Succeeded ||
+        !File.Exists(seedPath) ||
+        new FileInfo(seedPath).Length == 0)
+    {
+        throw new InvalidDataException(
+            $"Synthetic replay-length seed generation failed: {generated.StandardError.Trim()}");
+    }
+
+    var results = new List<ReplayLengthMatrixResult>(ReplayLengthOption.All.Count);
+    foreach (var replayLength in ReplayLengthOption.All)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var seconds = checked((int)replayLength.Duration.TotalSeconds);
+        if (seconds % FfmpegArgumentBuilder.SegmentSeconds != 0)
+        {
+            throw new InvalidDataException(
+                $"Replay preset '{replayLength.Label}' is not aligned to the segment cadence.");
+        }
+
+        var segmentCount = seconds / FfmpegArgumentBuilder.SegmentSeconds;
+        var caseDirectory = Path.Combine(runDirectory, $"{seconds:D4}-seconds");
+        Directory.CreateDirectory(caseDirectory);
+        var manifestPath = Path.Combine(caseDirectory, "manifest.txt");
+        await File.WriteAllLinesAsync(
+                manifestPath,
+                ReplayBufferService.BuildConcatManifestLines(
+                    Enumerable.Repeat(seedPath, segmentCount)),
+                cancellationToken)
+            .ConfigureAwait(false);
+        var outputPath = Path.Combine(
+            caseDirectory,
+            $"Clip_2026-07-13_17-00-00_{seconds:D4}s.mp4");
+
+        var exportTimer = Stopwatch.StartNew();
+        var concat = await processRunner.RunAsync(
+                ffmpeg,
+                FfmpegArgumentBuilder.BuildConcatArguments(
+                    manifestPath,
+                    outputPath,
+                    TimeSpan.Zero,
+                    replayLength.Duration),
+                TimeSpan.FromMinutes(3),
+                cancellationToken)
+            .ConfigureAwait(false);
+        exportTimer.Stop();
+        if (!concat.Succeeded ||
+            !File.Exists(outputPath) ||
+            new FileInfo(outputPath).Length == 0)
+        {
+            throw new InvalidDataException(
+                $"Replay-length export failed for {replayLength.Label}: " +
+                concat.StandardError.Trim());
+        }
+
+        // This seed is deliberately tiny, so a remux that takes tens of seconds
+        // indicates process/timeline overhead rather than unavoidable disk
+        // throughput for a user's real high-bitrate clip.
+        if (exportTimer.Elapsed > TimeSpan.FromSeconds(30))
+        {
+            throw new InvalidDataException(
+                $"Replay-length export for {replayLength.Label} took " +
+                $"{exportTimer.Elapsed.TotalSeconds:0.###}s; expected below 30s.");
+        }
+
+        var validationTimer = Stopwatch.StartNew();
+        var duration = await ReadDurationAsync(ffprobe, outputPath, cancellationToken)
+            .ConfigureAwait(false);
+        var media = await ReadMediaInfoAsync(ffprobe, outputPath, cancellationToken)
+            .ConfigureAwait(false);
+        validationTimer.Stop();
+        var expectedFrames = checked((long)seconds * framesPerSecond);
+        var durationTolerance = 0.15;
+        if (Math.Abs(duration - seconds) > durationTolerance ||
+            media.Width != width ||
+            media.Height != height ||
+            Math.Abs(media.AverageFrameRate - framesPerSecond) > 0.1 ||
+            Math.Abs(media.FrameCount - expectedFrames) > 2 ||
+            media.AudioStreamCount != 1 ||
+            !double.IsFinite(media.VideoDuration) ||
+            !double.IsFinite(media.AudioDuration) ||
+            Math.Abs(media.VideoDuration - media.AudioDuration) > 0.1)
+        {
+            throw new InvalidDataException(
+                $"Replay-length validation failed for {replayLength.Label}: " +
+                $"container {duration:0.###}s, video {media.VideoDuration:0.###}s, " +
+                $"audio {media.AudioDuration:0.###}s, {media.Width}x{media.Height}, " +
+                $"{media.AverageFrameRate:0.###} FPS, {media.FrameCount} frames, " +
+                $"{media.AudioStreamCount} audio stream(s).");
+        }
+
+        var outputBytes = new FileInfo(outputPath).Length;
+        var result = new ReplayLengthMatrixResult(
+            replayLength.Label,
+            seconds,
+            segmentCount,
+            media.FrameCount,
+            duration,
+            Math.Abs(media.VideoDuration - media.AudioDuration) * 1000,
+            exportTimer.Elapsed.TotalMilliseconds,
+            validationTimer.Elapsed.TotalMilliseconds,
+            outputBytes);
+        results.Add(result);
+        Console.WriteLine(
+            $"PASS length {replayLength.Label}: {segmentCount} segments, " +
+            $"{media.FrameCount} frames/{duration:0.###}s, " +
+            $"save {exportTimer.Elapsed.TotalMilliseconds:0.0}ms " +
+            $"({seconds / Math.Max(0.001, exportTimer.Elapsed.TotalSeconds):0.0}x realtime), " +
+            $"validate {validationTimer.Elapsed.TotalMilliseconds:0.0}ms, " +
+            $"{outputBytes:N0} bytes, A/V delta {result.AudioVideoDeltaMilliseconds:0.###}ms.");
+    }
+
+    var reportPath = Path.Combine(runDirectory, "length-matrix-report.json");
+    await File.WriteAllTextAsync(
+            reportPath,
+            JsonSerializer.Serialize(
+                new ReplayLengthMatrixArtifact(
+                    SchemaVersion: 1,
+                    GeneratedUtc: DateTimeOffset.UtcNow,
+                    FramesPerSecond: framesPerSecond,
+                    Width: width,
+                    Height: height,
+                    Results: results),
+                new JsonSerializerOptions { WriteIndented = true }),
+            cancellationToken)
+        .ConfigureAwait(false);
+    Console.WriteLine(
+        $"PASS replay-length matrix: {results.Count}/{ReplayLengthOption.All.Count} presets. " +
+        $"Report: {reportPath}");
+}
+
 static async Task RunTrimSmokeAsync(
     FfmpegSetupService setup,
     string ffmpeg,
@@ -1701,7 +2024,10 @@ static async Task RunTrimSmokeAsync(
     }
 
     var baselineHelpers = SnapshotMediaHelperProcessIds(ffmpeg, ffprobe);
-    var trim = await new ClipTrimService(setup).TrimAsync(
+    var trim = await new ClipTrimService(
+            setup,
+            new TrimSmokeMediaProcessRunner())
+        .TrimAsync(
             runDirectory,
             source,
             requestedStart,
@@ -2281,7 +2607,9 @@ internal sealed record RenewalSmokeReport(
     DateTimeOffset PreviousTailLastWriteTimeUtc,
     int RetainedCompletedSegmentCount,
     int LastRetainedSegmentId,
-    int ReplacementFirstSegmentId,
+    int ReplacementGenerationId,
+    int QuarantinedHeadSegmentId,
+    int ReplacementFirstTrustedSegmentId,
     string ReplacementCompletedSegmentPath,
     long ReplacementCompletedSegmentBytes,
     DateTimeOffset ReplacementCompletedSegmentLastWriteTimeUtc,
@@ -2311,12 +2639,68 @@ internal sealed record ResolutionMatrixCase(
     ResolutionOption Resolution,
     CaptureOutputSize Output);
 
+internal sealed record ReplayLengthMatrixResult(
+    string Label,
+    int DurationSeconds,
+    int SegmentCount,
+    long FrameCount,
+    double ContainerDurationSeconds,
+    double AudioVideoDeltaMilliseconds,
+    double ExportMilliseconds,
+    double ValidationMilliseconds,
+    long OutputBytes);
+
+internal sealed record ReplayLengthMatrixArtifact(
+    int SchemaVersion,
+    DateTimeOffset GeneratedUtc,
+    int FramesPerSecond,
+    int Width,
+    int Height,
+    IReadOnlyList<ReplayLengthMatrixResult> Results);
+
 internal sealed record FrameMotionStats(
     int TotalFrames,
     int DuplicateTransitions,
     int MaximumIdenticalRunFrames,
     double DuplicateRatio,
     double MaximumIdenticalDurationMilliseconds);
+
+internal sealed class TrimSmokeMediaProcessRunner : IClipMediaProcessRunner
+{
+    private readonly ClipMediaProcessRunner _inner = new();
+
+    public async Task<ClipMediaProcessResult> RunAsync(
+        string executablePath,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout,
+        CancellationToken cancellationToken,
+        ClipMediaProcessPriority priority = ClipMediaProcessPriority.Background)
+    {
+        var result = await _inner.RunAsync(
+                executablePath,
+                arguments,
+                timeout,
+                cancellationToken,
+                priority)
+            .ConfigureAwait(false);
+        if (arguments.Count > 0 &&
+            Path.GetFileName(arguments[^1]).StartsWith(
+                ".clipforge-trim-",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var outputPath = arguments[^1];
+            var outputLength = File.Exists(outputPath)
+                ? new FileInfo(outputPath).Length
+                : -1;
+            Console.WriteLine(
+                $"Trim helper: exit {result.ExitCode}, timed out {result.TimedOut}, " +
+                $"output bytes {outputLength}, diagnostic " +
+                $"{(string.IsNullOrWhiteSpace(result.StandardError) ? "<none>" : result.StandardError.Trim())}");
+        }
+
+        return result;
+    }
+}
 
 internal sealed record MediaInfo(
     int Width,

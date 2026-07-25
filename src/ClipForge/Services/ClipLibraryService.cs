@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Windows.Media.Imaging;
 using ClipForge.Models;
 using Microsoft.Win32.SafeHandles;
 
@@ -24,6 +25,7 @@ public sealed class ClipLibraryService
     private const int MinimumProbeCandidates = 20;
     private const int ProbeCandidatesPerRequestedClip = 4;
     private const int MaximumProbeCacheEntries = 512;
+    private const int MaximumThumbnailValidationCacheEntries = 256;
     private const long MaximumThumbnailBytes = 16 * 1024 * 1024;
     private const uint GenericRead = 0x80000000;
     private const uint DeleteAccess = 0x00010000;
@@ -38,7 +40,9 @@ public sealed class ClipLibraryService
         RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
     private static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan DefaultThumbnailTimeout = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan MaximumTotalProbeDuration = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DefaultMaximumTotalProbeDuration = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DefaultInvalidProbeCacheDuration = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan InvalidThumbnailValidationCacheDuration = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MaximumTotalThumbnailDuration = TimeSpan.FromSeconds(20);
 
     private readonly Func<string?> _findFfmpeg;
@@ -48,10 +52,18 @@ public sealed class ClipLibraryService
     private readonly SemaphoreSlim _thumbnailGate = new(1, 1);
     private readonly object _probeCacheGate = new();
     private readonly Dictionary<ProbeCacheKey, CachedProbe> _probeCache = [];
+    private readonly object _thumbnailValidationCacheGate = new();
+    private readonly Dictionary<ThumbnailValidationCacheKey, CachedThumbnailValidation>
+        _thumbnailValidationCache = [];
     private readonly string _thumbnailCacheDirectory;
     private readonly TimeSpan _probeTimeout;
     private readonly TimeSpan _thumbnailTimeout;
+    private readonly TimeSpan _maximumTotalProbeDuration;
+    private readonly TimeSpan _invalidProbeCacheDuration;
+    private readonly Func<DateTimeOffset> _getUtcNow;
+    private readonly Func<string, bool> _validateThumbnailDecode;
     private long _probeCacheAccessOrder;
+    private long _thumbnailValidationCacheAccessOrder;
 
     public ClipLibraryService(
         FfmpegSetupService ffmpegSetupService,
@@ -70,14 +82,22 @@ public sealed class ClipLibraryService
         IClipMediaProcessRunner processRunner,
         string thumbnailCacheDirectory,
         TimeSpan probeTimeout,
-        TimeSpan thumbnailTimeout)
+        TimeSpan thumbnailTimeout,
+        TimeSpan? maximumTotalProbeDuration = null,
+        TimeSpan? invalidProbeCacheDuration = null,
+        Func<DateTimeOffset>? getUtcNow = null,
+        Func<string, bool>? validateThumbnailDecode = null)
         : this(
             ffmpegSetupService.FindExecutable,
             ffmpegSetupService.FindProbeExecutable,
             processRunner,
             thumbnailCacheDirectory,
             probeTimeout,
-            thumbnailTimeout)
+            thumbnailTimeout,
+            maximumTotalProbeDuration,
+            invalidProbeCacheDuration,
+            getUtcNow,
+            validateThumbnailDecode)
     {
     }
 
@@ -87,7 +107,11 @@ public sealed class ClipLibraryService
         IClipMediaProcessRunner processRunner,
         string thumbnailCacheDirectory,
         TimeSpan probeTimeout,
-        TimeSpan thumbnailTimeout)
+        TimeSpan thumbnailTimeout,
+        TimeSpan? maximumTotalProbeDuration = null,
+        TimeSpan? invalidProbeCacheDuration = null,
+        Func<DateTimeOffset>? getUtcNow = null,
+        Func<string, bool>? validateThumbnailDecode = null)
     {
         ArgumentNullException.ThrowIfNull(findFfmpeg);
         ArgumentNullException.ThrowIfNull(findFfprobe);
@@ -109,6 +133,22 @@ public sealed class ClipLibraryService
             throw new ArgumentOutOfRangeException(nameof(thumbnailTimeout));
         }
 
+        var totalProbeDuration = maximumTotalProbeDuration ??
+                                 DefaultMaximumTotalProbeDuration;
+        if (totalProbeDuration <= TimeSpan.Zero ||
+            totalProbeDuration > TimeSpan.FromMinutes(2))
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumTotalProbeDuration));
+        }
+
+        var invalidCacheDuration = invalidProbeCacheDuration ??
+                                   DefaultInvalidProbeCacheDuration;
+        if (invalidCacheDuration <= TimeSpan.Zero ||
+            invalidCacheDuration > TimeSpan.FromMinutes(5))
+        {
+            throw new ArgumentOutOfRangeException(nameof(invalidProbeCacheDuration));
+        }
+
         _findFfmpeg = findFfmpeg;
         _findFfprobe = findFfprobe;
         _processRunner = processRunner;
@@ -116,6 +156,11 @@ public sealed class ClipLibraryService
             Path.GetFullPath(thumbnailCacheDirectory));
         _probeTimeout = probeTimeout;
         _thumbnailTimeout = thumbnailTimeout;
+        _maximumTotalProbeDuration = totalProbeDuration;
+        _invalidProbeCacheDuration = invalidCacheDuration;
+        _getUtcNow = getUtcNow ?? (() => DateTimeOffset.UtcNow);
+        _validateThumbnailDecode =
+            validateThumbnailDecode ?? TryDecodeThumbnailForValidation;
     }
 
     public static string GetDefaultThumbnailCacheDirectory() =>
@@ -201,7 +246,7 @@ public sealed class ClipLibraryService
 
         var clips = new List<ClipLibraryItem>(count);
         using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        probeBudget.CancelAfter(MaximumTotalProbeDuration);
+        probeBudget.CancelAfter(_maximumTotalProbeDuration);
         var maximumProbes = Math.Min(
             discovery.Candidates.Count,
             Math.Max(MinimumProbeCandidates, checked(count * ProbeCandidatesPerRequestedClip)));
@@ -223,7 +268,7 @@ public sealed class ClipLibraryService
                 identity,
                 candidate.Length,
                 candidate.LastWriteTimeUtc.Ticks);
-            var cacheHit = TryGetCachedValidProbe(cacheKey, out var probe);
+            var cacheHit = TryGetCachedProbe(cacheKey, out var probe);
             if (!cacheHit && probeAttempts >= maximumProbes)
             {
                 break;
@@ -379,7 +424,7 @@ public sealed class ClipLibraryService
         await _probeExecutionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (TryGetCachedValidProbe(cacheKey, out var cached))
+            if (TryGetCachedProbe(cacheKey, out var cached))
             {
                 return cached;
             }
@@ -389,11 +434,6 @@ public sealed class ClipLibraryService
                     candidate.FullPath,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (probe.State != ProbeState.Valid)
-            {
-                return probe;
-            }
-
             // Re-open the candidate after ffprobe exits. Cache the result only
             // when the exact file identity and metadata are still unchanged.
             if (!TryGetCurrentFileIdentity(candidate, out var currentIdentity) ||
@@ -402,7 +442,7 @@ public sealed class ClipLibraryService
                 return ProbeOutcome.Invalid;
             }
 
-            CacheValidProbe(cacheKey, probe);
+            CacheProbe(cacheKey, probe);
             return probe;
         }
         finally
@@ -411,12 +451,20 @@ public sealed class ClipLibraryService
         }
     }
 
-    private bool TryGetCachedValidProbe(ProbeCacheKey key, out ProbeOutcome probe)
+    private bool TryGetCachedProbe(ProbeCacheKey key, out ProbeOutcome probe)
     {
         lock (_probeCacheGate)
         {
             if (!_probeCache.TryGetValue(key, out var cached))
             {
+                probe = ProbeOutcome.Invalid;
+                return false;
+            }
+
+            if (cached.ExpiresAtUtc is { } expiresAtUtc &&
+                expiresAtUtc <= _getUtcNow())
+            {
+                _probeCache.Remove(key);
                 probe = ProbeOutcome.Invalid;
                 return false;
             }
@@ -427,13 +475,8 @@ public sealed class ClipLibraryService
         }
     }
 
-    private void CacheValidProbe(ProbeCacheKey key, ProbeOutcome probe)
+    private void CacheProbe(ProbeCacheKey key, ProbeOutcome probe)
     {
-        if (probe.State != ProbeState.Valid)
-        {
-            return;
-        }
-
         lock (_probeCacheGate)
         {
             if (!_probeCache.ContainsKey(key) && _probeCache.Count >= MaximumProbeCacheEntries)
@@ -442,7 +485,12 @@ public sealed class ClipLibraryService
                 _probeCache.Remove(oldestKey);
             }
 
-            _probeCache[key] = new CachedProbe(probe, NextProbeCacheAccessOrderLocked());
+            _probeCache[key] = new CachedProbe(
+                probe,
+                NextProbeCacheAccessOrderLocked(),
+                probe.State == ProbeState.Invalid
+                    ? _getUtcNow() + _invalidProbeCacheDuration
+                    : null);
         }
     }
 
@@ -597,7 +645,7 @@ public sealed class ClipLibraryService
         }
 
         using var handle = CreateFileW(
-            validatedPath,
+            ToExtendedLengthPath(validatedPath),
             DeleteAccess | FileReadAttributes,
             FileShare.Read | FileShare.Write,
             IntPtr.Zero,
@@ -640,7 +688,7 @@ public sealed class ClipLibraryService
         var currentPath = GetDeterministicThumbnailPath(clip);
         var legacyPath = GetLegacyThumbnailPath(clip);
         using var cacheDirectoryHandle = CreateFileW(
-            _thumbnailCacheDirectory,
+            ToExtendedLengthPath(_thumbnailCacheDirectory),
             GenericRead,
             FileShare.Read | FileShare.Write,
             IntPtr.Zero,
@@ -664,7 +712,7 @@ public sealed class ClipLibraryService
         string thumbnailPath)
     {
         using var thumbnailHandle = CreateFileW(
-            thumbnailPath,
+            ToExtendedLengthPath(thumbnailPath),
             DeleteAccess | FileReadAttributes,
             FileShare.Read | FileShare.Write,
             IntPtr.Zero,
@@ -814,7 +862,8 @@ public sealed class ClipLibraryService
                 return null;
             }
 
-            if (!result.Succeeded || !IsUsableThumbnail(stagingPath))
+            if (!result.Succeeded ||
+                !IsUsableThumbnail(stagingPath, cacheValidation: false))
             {
                 return null;
             }
@@ -831,6 +880,7 @@ public sealed class ClipLibraryService
             {
                 File.Move(stagingPath, thumbnailPath, overwrite: false);
                 stagingPath = null;
+                InvalidateThumbnailValidationPath(thumbnailPath);
             }
             catch (IOException) when (IsUsableThumbnail(thumbnailPath))
             {
@@ -1295,7 +1345,7 @@ public sealed class ClipLibraryService
             }
 
             cacheDirectoryHandle = CreateFileW(
-                _thumbnailCacheDirectory,
+                ToExtendedLengthPath(_thumbnailCacheDirectory),
                 GenericRead,
                 FileShare.Read | FileShare.Write,
                 IntPtr.Zero,
@@ -1368,7 +1418,7 @@ public sealed class ClipLibraryService
             }
 
             rootHandle = CreateFileW(
-                rootDirectory,
+                ToExtendedLengthPath(rootDirectory),
                 GenericRead,
                 FileShare.Read | FileShare.Write,
                 IntPtr.Zero,
@@ -1382,7 +1432,7 @@ public sealed class ClipLibraryService
             }
 
             clipHandle = CreateFileW(
-                fullPath,
+                ToExtendedLengthPath(fullPath),
                 GenericRead,
                 FileShare.Read,
                 IntPtr.Zero,
@@ -1437,7 +1487,7 @@ public sealed class ClipLibraryService
         }
 
         using var handle = CreateFileW(
-            candidatePath,
+            ToExtendedLengthPath(candidatePath),
             GenericRead,
             FileShare.Read,
             IntPtr.Zero,
@@ -1545,7 +1595,7 @@ public sealed class ClipLibraryService
     {
         identity = default;
         using var handle = CreateFileW(
-            candidate.FullPath,
+            ToExtendedLengthPath(candidate.FullPath),
             FileReadAttributes,
             FileShare.Read | FileShare.Write | FileShare.Delete,
             IntPtr.Zero,
@@ -1761,6 +1811,20 @@ public sealed class ClipLibraryService
         return null;
     }
 
+    internal static string ToExtendedLengthPath(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        var fullPath = Path.GetFullPath(path);
+        if (fullPath.StartsWith(@"\\?\", StringComparison.Ordinal))
+        {
+            return fullPath;
+        }
+
+        return fullPath.StartsWith(@"\\", StringComparison.Ordinal)
+            ? @"\\?\UNC\" + fullPath[2..]
+            : @"\\?\" + fullPath;
+    }
+
     private static string? TryGetSafeRootDirectory(string saveDirectory)
     {
         if (string.IsNullOrWhiteSpace(saveDirectory) || !Path.IsPathFullyQualified(saveDirectory))
@@ -1863,7 +1927,9 @@ public sealed class ClipLibraryService
             clip.RecordedAtUtc.UtcDateTime));
     }
 
-    private static bool IsUsableThumbnail(string path)
+    private bool IsUsableThumbnail(
+        string path,
+        bool cacheValidation = true)
     {
         try
         {
@@ -1893,12 +1959,163 @@ public sealed class ClipLibraryService
             }
 
             stream.Seek(-2, SeekOrigin.End);
-            return stream.ReadByte() == 0xFF && stream.ReadByte() == 0xD9;
+            if (stream.ReadByte() != 0xFF || stream.ReadByte() != 0xD9)
+            {
+                return false;
+            }
+
+            var cacheKey = new ThumbnailValidationCacheKey(
+                info.FullName.ToUpperInvariant(),
+                info.Length,
+                info.LastWriteTimeUtc.Ticks);
+            if (cacheValidation &&
+                TryGetCachedThumbnailValidation(cacheKey, out var cachedValidation))
+            {
+                return cachedValidation;
+            }
+
+            var isDecodable = _validateThumbnailDecode(info.FullName);
+            if (cacheValidation)
+            {
+                CacheThumbnailValidation(cacheKey, isDecodable);
+            }
+
+            return isDecodable;
         }
         catch (Exception exception) when (IsExpectedFileException(exception))
         {
             return false;
         }
+    }
+
+    internal static bool TryDecodeThumbnailForValidation(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 64 * 1024,
+                FileOptions.SequentialScan);
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+            // A tiny decode still traverses the complete JPEG bitstream while
+            // bounding retained WIC/WPF pixels for a malformed cache entry.
+            image.DecodePixelWidth = 64;
+            image.DecodePixelHeight = 64;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image.PixelWidth > 0 &&
+                   image.PixelHeight > 0 &&
+                   image.PixelWidth <= 64 &&
+                   image.PixelHeight <= 64;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or InvalidOperationException or FileFormatException)
+        {
+            return false;
+        }
+    }
+
+    private bool TryGetCachedThumbnailValidation(
+        ThumbnailValidationCacheKey key,
+        out bool isValid)
+    {
+        lock (_thumbnailValidationCacheGate)
+        {
+            if (!_thumbnailValidationCache.TryGetValue(key, out var cached))
+            {
+                isValid = false;
+                return false;
+            }
+
+            if (cached.ExpiresAtUtc is { } expiresAtUtc &&
+                expiresAtUtc <= _getUtcNow())
+            {
+                _thumbnailValidationCache.Remove(key);
+                isValid = false;
+                return false;
+            }
+
+            isValid = cached.IsValid;
+            _thumbnailValidationCache[key] = cached with
+            {
+                LastAccessOrder = NextThumbnailValidationCacheAccessOrderLocked()
+            };
+            return true;
+        }
+    }
+
+    private void CacheThumbnailValidation(
+        ThumbnailValidationCacheKey key,
+        bool isValid)
+    {
+        lock (_thumbnailValidationCacheGate)
+        {
+            if (!_thumbnailValidationCache.ContainsKey(key) &&
+                _thumbnailValidationCache.Count >= MaximumThumbnailValidationCacheEntries)
+            {
+                var oldestKey = _thumbnailValidationCache
+                    .MinBy(entry => entry.Value.LastAccessOrder)
+                    .Key;
+                _thumbnailValidationCache.Remove(oldestKey);
+            }
+
+            _thumbnailValidationCache[key] = new CachedThumbnailValidation(
+                isValid,
+                NextThumbnailValidationCacheAccessOrderLocked(),
+                isValid
+                    ? null
+                    : _getUtcNow() + InvalidThumbnailValidationCacheDuration);
+        }
+    }
+
+    private void InvalidateThumbnailValidationPath(string path)
+    {
+        string normalizedPath;
+        try
+        {
+            normalizedPath = Path.GetFullPath(path).ToUpperInvariant();
+        }
+        catch (Exception exception) when (IsExpectedFileException(exception))
+        {
+            return;
+        }
+
+        lock (_thumbnailValidationCacheGate)
+        {
+            foreach (var key in _thumbnailValidationCache.Keys
+                         .Where(key => key.FullPath.Equals(
+                             normalizedPath,
+                             StringComparison.Ordinal))
+                         .ToArray())
+            {
+                _thumbnailValidationCache.Remove(key);
+            }
+        }
+    }
+
+    private long NextThumbnailValidationCacheAccessOrderLocked()
+    {
+        if (_thumbnailValidationCacheAccessOrder == long.MaxValue)
+        {
+            _thumbnailValidationCacheAccessOrder = 0;
+            foreach (var key in _thumbnailValidationCache.Keys.ToArray())
+            {
+                _thumbnailValidationCache[key] = _thumbnailValidationCache[key] with
+                {
+                    LastAccessOrder = 0
+                };
+            }
+        }
+
+        return ++_thumbnailValidationCacheAccessOrder;
     }
 
     private static bool IsReparsePoint(string path)
@@ -1914,7 +2131,7 @@ public sealed class ClipLibraryService
         }
     }
 
-    private static void TryRemoveInvalidRegularThumbnail(string path)
+    private void TryRemoveInvalidRegularThumbnail(string path)
     {
         try
         {
@@ -1923,6 +2140,7 @@ public sealed class ClipLibraryService
                 !IsUsableThumbnail(path))
             {
                 File.Delete(path);
+                InvalidateThumbnailValidationPath(path);
             }
         }
         catch (Exception exception) when (IsExpectedFileException(exception))
@@ -1968,7 +2186,18 @@ public sealed class ClipLibraryService
 
     private readonly record struct CachedProbe(
         ProbeOutcome Outcome,
-        long LastAccessOrder);
+        long LastAccessOrder,
+        DateTimeOffset? ExpiresAtUtc);
+
+    private readonly record struct ThumbnailValidationCacheKey(
+        string FullPath,
+        long Length,
+        long LastWriteTimeUtcTicks);
+
+    private readonly record struct CachedThumbnailValidation(
+        bool IsValid,
+        long LastAccessOrder,
+        DateTimeOffset? ExpiresAtUtc);
 
     internal sealed class PinnedClipReadContext(
         SafeFileHandle rootDirectoryHandle,
