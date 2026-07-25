@@ -20,9 +20,16 @@ namespace ClipForge;
 public partial class LibraryWindow : Window
 {
     private const int InitialClipLimit = 100;
+    private const int MaximumThumbnailNoProgressRetries = 1;
+    private const int MaximumThumbnailHydrationPasses = 3;
     private static readonly TimeSpan NormalPlayerTimerInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan TrimPreviewTimerInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan TrimSeekDebounceInterval = TimeSpan.FromMilliseconds(75);
+    private static readonly TimeSpan ThumbnailNoProgressRetryDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MediaOpenTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ExplicitMediaWorkTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan MaximumThumbnailHydrationBatchDuration =
+        TimeSpan.FromSeconds(45);
     private static readonly LibraryFilterOption[] LibraryFilterOptions =
     [
         new(ClipLibraryFilter.All, "All clips"),
@@ -46,6 +53,7 @@ public partial class LibraryWindow : Window
 
     private CancellationTokenSource? _activeRefreshCancellation;
     private CancellationTokenSource? _activeTrimCancellation;
+    private CancellationTokenSource? _mediaOpenTimeoutCancellation;
     private ClipLibraryItem? _currentClip;
     private TimeSpan? _positionToRestore;
     private bool _isLoaded;
@@ -72,13 +80,26 @@ public partial class LibraryWindow : Window
     private bool _trimRangeInitialized;
     private bool _beginTrimWhenReady;
     private bool _suppressFilterChange;
+    private bool _suspendAutomaticMediaWorkForPlayback;
     private double _volumeBeforeMute = 0.8;
     private long _refreshGeneration;
+    private long _explicitPlaybackGeneration;
+    private long _mediaOpenGeneration;
+    private long _mediaWorkSuspensionOwner;
+    private long _activePlayerMediaWorkOwner;
     private LibraryMediaOpenPlan? _pendingOpenPlan;
     private ClipLibraryFilter _activeFilter = ClipLibraryFilter.All;
     private ClipTrimExecutionMode _activeTrimExecutionMode = ClipTrimExecutionMode.Standard;
     private TimeSpan? _pendingTrimSeekPosition;
     private string? _requestedPreferredPath;
+
+    private bool IsAutomaticRefreshSuppressed =>
+        _isPlaying ||
+        ShouldSuppressAutomaticRefresh(
+            _isReplayRunning,
+            _isPresentationSuspended,
+            IsTrimOwningLibraryWork,
+            _suspendAutomaticMediaWorkForPlayback);
 
     public LibraryWindow(
         ClipLibraryService clipLibraryService,
@@ -374,18 +395,6 @@ public partial class LibraryWindow : Window
         }
 
         OpenClip(clip, autoplay: false);
-        if (_currentClip is null ||
-            !_currentClip.FullPath.Equals(clip.FullPath, StringComparison.OrdinalIgnoreCase))
-        {
-            if (!_isReplayRunning)
-            {
-                _ = RefreshLibraryAsync(clip.FullPath);
-            }
-
-            return;
-        }
-
-        TryBeginRequestedTrim();
     }
 
     internal static bool ShouldOpenRequestedTrimDirectly(
@@ -474,10 +483,7 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        if (ShouldSuppressAutomaticRefresh(
-                _isReplayRunning,
-                _isPresentationSuspended,
-                IsTrimOwningLibraryWork))
+        if (IsAutomaticRefreshSuppressed)
         {
             _refreshPending = true;
             if (_isReplayRunning && !_isPresentationSuspended)
@@ -504,6 +510,9 @@ public partial class LibraryWindow : Window
         }
 
         var gateEntered = false;
+        ClipLibraryItem? clipToOpenAfterRefresh = null;
+        var preservePositionWhenOpeningAfterRefresh = false;
+        var shouldOpenClipAfterRefresh = false;
         RefreshButton.IsEnabled = false;
         LoadingState.Visibility = Visibility.Visible;
         EmptyLibraryState.Visibility = Visibility.Collapsed;
@@ -513,10 +522,7 @@ public partial class LibraryWindow : Window
         {
             await _refreshGate.WaitAsync(refreshCancellation.Token);
             gateEntered = true;
-            if (ShouldSuppressAutomaticRefresh(
-                    _isReplayRunning,
-                    _isPresentationSuspended,
-                    IsTrimOwningLibraryWork))
+            if (IsAutomaticRefreshSuppressed)
             {
                 _refreshPending = true;
                 return;
@@ -532,10 +538,7 @@ public partial class LibraryWindow : Window
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
             if (generation != Volatile.Read(ref _refreshGeneration) ||
-                ShouldSuppressAutomaticRefresh(
-                    _isReplayRunning,
-                    _isPresentationSuspended,
-                    IsTrimOwningLibraryWork) ||
+                IsAutomaticRefreshSuppressed ||
                 !IsVisible ||
                 !IsActive)
             {
@@ -603,14 +606,18 @@ public partial class LibraryWindow : Window
             }
             else
             {
-                OpenClip(
+                // Detach the paused decoder before thumbnail hydration. The
+                // selected poster remains interactive, and the media graph is
+                // reopened only after this refresh releases its helper gate.
+                SelectClipWithoutOpening(
                     selected,
-                    autoplay: false,
                     preserveRestorePosition: restorePreviousPosition);
+                clipToOpenAfterRefresh = selected;
+                preservePositionWhenOpeningAfterRefresh = restorePreviousPosition;
             }
 
             var requestedTrimPath = _requestedPreferredPath;
-            var currentPath = _currentClip?.FullPath;
+            var currentPath = selected?.FullPath;
             if (_beginTrimWhenReady &&
                 (currentPath is null ||
                  (requestedTrimPath is not null && !currentPath.Equals(
@@ -640,50 +647,108 @@ public partial class LibraryWindow : Window
             }
             else if (hasMissingThumbnails)
             {
-                var hydrated = await _clipLibraryService.HydrateThumbnailsAsync(
-                    _saveDirectory,
-                    clips,
-                    // The service already owns a 20-second total budget. Let it
-                    // advance beyond the first 12 cards while the fully bound
-                    // fallback gallery remains interactive.
-                    maximumMissingThumbnails: clips.Count,
-                    refreshCancellation.Token,
-                    preferredClipPath: _currentClip?.FullPath);
-                refreshCancellation.Token.ThrowIfCancellationRequested();
-                if (generation == Volatile.Read(ref _refreshGeneration) &&
-                    !ShouldSuppressAutomaticRefresh(
-                        _isReplayRunning,
-                        _isPresentationSuspended,
-                        IsTrimOwningLibraryWork) &&
-                    IsVisible &&
-                    IsActive)
+                IReadOnlyList<ClipLibraryItem> thumbnailSnapshot = clips;
+                var missingThumbnailCount = thumbnailSnapshot.Count(
+                    clip => clip.ThumbnailPath is null);
+                var noProgressRetryCount = 0;
+                var hydrationPassCount = 0;
+                using var hydrationBatchCancellation =
+                    CancellationTokenSource.CreateLinkedTokenSource(
+                        refreshCancellation.Token);
+                hydrationBatchCancellation.CancelAfter(
+                    MaximumThumbnailHydrationBatchDuration);
+                try
                 {
-                    var selectedAfterHydration = _currentClip?.FullPath;
-                    ClipList.ItemsSource = hydrated;
-                    _suppressSelectionAutoplay = true;
-                    try
+                    while (missingThumbnailCount > 0 &&
+                           hydrationPassCount < MaximumThumbnailHydrationPasses)
                     {
-                        ClipList.SelectedItem = selectedAfterHydration is { Length: > 0 }
-                            ? hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
-                                selectedAfterHydration,
-                                StringComparison.OrdinalIgnoreCase))
-                            : hydrated.FirstOrDefault();
-                    }
-                    finally
-                    {
-                        _suppressSelectionAutoplay = false;
-                    }
+                        hydrationPassCount++;
+                        var hydrated = await _clipLibraryService.HydrateThumbnailsAsync(
+                            _saveDirectory,
+                            thumbnailSnapshot,
+                            // Each service pass owns a bounded 20-second budget.
+                            // The outer batch additionally caps total foreground
+                            // passes and elapsed work before yielding the gate.
+                            maximumMissingThumbnails: thumbnailSnapshot.Count,
+                            hydrationBatchCancellation.Token,
+                            preferredClipPath: _currentClip?.FullPath);
+                        hydrationBatchCancellation.Token.ThrowIfCancellationRequested();
+                        if (generation != Volatile.Read(ref _refreshGeneration) ||
+                            IsAutomaticRefreshSuppressed ||
+                            !IsVisible ||
+                            !IsActive)
+                        {
+                            _refreshPending = true;
+                            return;
+                        }
 
-                    if (_currentClip is { } current &&
-                        hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
-                            current.FullPath,
-                            StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrent)
-                    {
-                        _currentClip = hydratedCurrent;
-                        PlayerPosterImage.DataContext = hydratedCurrent;
+                        var selectedAfterHydration = _currentClip?.FullPath;
+                        ClipList.ItemsSource = hydrated;
+                        _suppressSelectionAutoplay = true;
+                        try
+                        {
+                            ClipList.SelectedItem = selectedAfterHydration is { Length: > 0 }
+                                ? hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
+                                    selectedAfterHydration,
+                                    StringComparison.OrdinalIgnoreCase))
+                                : hydrated.FirstOrDefault();
+                        }
+                        finally
+                        {
+                            _suppressSelectionAutoplay = false;
+                        }
+
+                        if (_currentClip is { } current &&
+                            hydrated.FirstOrDefault(clip => clip.FullPath.Equals(
+                                current.FullPath,
+                                StringComparison.OrdinalIgnoreCase)) is { } hydratedCurrent)
+                        {
+                            _currentClip = hydratedCurrent;
+                            PlayerPosterImage.DataContext = hydratedCurrent;
+                        }
+
+                        var remainingThumbnailCount = hydrated.Count(
+                            clip => clip.ThumbnailPath is null);
+                        if (!ShouldContinueThumbnailHydration(
+                                missingThumbnailCount,
+                                remainingThumbnailCount,
+                                noProgressRetryCount,
+                                MaximumThumbnailNoProgressRetries))
+                        {
+                            missingThumbnailCount = remainingThumbnailCount;
+                            break;
+                        }
+
+                        if (remainingThumbnailCount < missingThumbnailCount)
+                        {
+                            noProgressRetryCount = 0;
+                        }
+                        else
+                        {
+                            noProgressRetryCount++;
+                            await Task.Delay(
+                                ThumbnailNoProgressRetryDelay,
+                                hydrationBatchCancellation.Token);
+                        }
+
+                        thumbnailSnapshot = hydrated;
+                        missingThumbnailCount = remainingThumbnailCount;
                     }
                 }
+                catch (OperationCanceledException) when (
+                    hydrationBatchCancellation.IsCancellationRequested &&
+                    !refreshCancellation.IsCancellationRequested)
+                {
+                    // Yield after the aggregate foreground thumbnail budget.
+                }
+
+                if (missingThumbnailCount > 0)
+                {
+                    _refreshPending = true;
+                }
             }
+
+            shouldOpenClipAfterRefresh = clipToOpenAfterRefresh is not null;
         }
         catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested)
         {
@@ -727,19 +792,265 @@ public partial class LibraryWindow : Window
 
             refreshCancellation.Dispose();
         }
+
+        if (shouldOpenClipAfterRefresh &&
+            clipToOpenAfterRefresh is { } clipToOpen &&
+            generation == Volatile.Read(ref _refreshGeneration) &&
+            !_isPlaying &&
+            !ShouldSuppressAutomaticRefresh(
+                _isReplayRunning,
+                _isPresentationSuspended,
+                _isTrimMode || _isTrimInProgress,
+                _suspendAutomaticMediaWorkForPlayback) &&
+            !_isClosing &&
+            IsVisible &&
+            IsActive &&
+            ClipList.SelectedItem is ClipLibraryItem selectedClip &&
+            selectedClip.FullPath.Equals(
+                clipToOpen.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            OpenClip(
+                clipToOpen,
+                autoplay: false,
+                preserveRestorePosition: preservePositionWhenOpeningAfterRefresh);
+        }
     }
 
     internal static bool ShouldSuppressAutomaticRefresh(
         bool replayRunning,
         bool presentationSuspended,
-        bool trimInProgress) =>
-        replayRunning || presentationSuspended || trimInProgress;
+        bool trimInProgress,
+        bool explicitPlaybackOrMediaOpen = false) =>
+        replayRunning ||
+        presentationSuspended ||
+        trimInProgress ||
+        explicitPlaybackOrMediaOpen;
+
+    internal static bool ShouldContinueThumbnailHydration(
+        int missingThumbnailCountBefore,
+        int missingThumbnailCountAfter,
+        int noProgressRetryCount,
+        int maximumNoProgressRetries) =>
+        missingThumbnailCountBefore > 0 &&
+        missingThumbnailCountAfter > 0 &&
+        missingThumbnailCountAfter <= missingThumbnailCountBefore &&
+        noProgressRetryCount >= 0 &&
+        maximumNoProgressRetries >= 0 &&
+        (missingThumbnailCountAfter < missingThumbnailCountBefore ||
+         noProgressRetryCount < maximumNoProgressRetries);
 
     internal async Task WaitForAutomaticRefreshIdleAsync(CancellationToken cancellationToken)
     {
         CancelRefreshForBackground();
         await _refreshGate.WaitAsync(cancellationToken);
         _refreshGate.Release();
+    }
+
+    private async Task WaitForAutomaticRefreshIdleForTrimAsync(
+        CancellationToken cancellationToken)
+    {
+        using var boundedWait = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        boundedWait.CancelAfter(ExplicitMediaWorkTimeout);
+        try
+        {
+            await WaitForAutomaticRefreshIdleAsync(boundedWait.Token);
+        }
+        catch (OperationCanceledException) when (
+            boundedWait.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                "The clips folder is not responding. Trim did not start while another media helper was still active.");
+        }
+    }
+
+    private async Task<(long PlaybackGeneration, long MediaWorkOwner)?>
+        StopLibraryHelperForExplicitPlaybackAsync()
+    {
+        var generation = Interlocked.Increment(ref _explicitPlaybackGeneration);
+        var mediaWorkOwner = SuspendAutomaticMediaWorkForPlayback();
+        using var boundedWait = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        boundedWait.CancelAfter(ExplicitMediaWorkTimeout);
+        var gateEntered = false;
+        var ownerTransferred = false;
+        try
+        {
+            await _refreshGate.WaitAsync(boundedWait.Token);
+            gateEntered = true;
+            if (generation == Volatile.Read(ref _explicitPlaybackGeneration) &&
+                !_isClosing &&
+                IsVisible &&
+                IsActive &&
+                !_isPresentationSuspended)
+            {
+                ownerTransferred = true;
+                return (generation, mediaWorkOwner);
+            }
+
+            return null;
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (OperationCanceledException) when (boundedWait.IsCancellationRequested)
+        {
+            if (generation == Volatile.Read(ref _explicitPlaybackGeneration) &&
+                !_isClosing &&
+                IsVisible &&
+                IsActive)
+            {
+                ShowError(
+                    "The clips folder is not responding. ClipForge stopped waiting before opening the player.");
+            }
+
+            return null;
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                _refreshGate.Release();
+            }
+
+            if (!ownerTransferred)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+            }
+        }
+    }
+
+    private long SuspendAutomaticMediaWorkForPlayback()
+    {
+        var owner = Interlocked.Increment(ref _mediaWorkSuspensionOwner);
+        _suspendAutomaticMediaWorkForPlayback = true;
+        CancelRefreshForBackground();
+        return owner;
+    }
+
+    private void ResumeAutomaticMediaWorkAfterPlayback(long mediaWorkOwner = 0)
+    {
+        if (!ShouldResumeAutomaticMediaWork(
+                _suspendAutomaticMediaWorkForPlayback,
+                mediaWorkOwner,
+                Volatile.Read(ref _mediaWorkSuspensionOwner)))
+        {
+            return;
+        }
+
+        if (mediaWorkOwner <= 0)
+        {
+            // A clear/background/shutdown transition invalidates every pending
+            // request, including one that has not attached a MediaElement yet.
+            Interlocked.Increment(ref _mediaWorkSuspensionOwner);
+        }
+
+        _suspendAutomaticMediaWorkForPlayback = false;
+    }
+
+    private void ResumeAttachedPlayerMediaWork()
+    {
+        var mediaWorkOwner = Interlocked.Exchange(
+            ref _activePlayerMediaWorkOwner,
+            0);
+        if (mediaWorkOwner > 0)
+        {
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+        }
+    }
+
+    internal static bool ShouldResumeAutomaticMediaWork(
+        bool isSuspended,
+        long requestedOwner,
+        long currentOwner) =>
+        isSuspended &&
+        (requestedOwner <= 0 || requestedOwner == currentOwner);
+
+    private async Task<string?> ValidateExplicitClipPathAsync(
+        ClipLibraryItem clip,
+        long playbackGeneration)
+    {
+        using var boundedValidation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                _lifetimeCancellation.Token);
+        try
+        {
+            var validatedPath = await Task.Run(
+                    () => ClipLibraryService.TryGetCurrentClipPath(
+                            _saveDirectory,
+                            clip,
+                            out var currentPath)
+                        ? currentPath
+                        : null,
+                    boundedValidation.Token)
+                .WaitAsync(ExplicitMediaWorkTimeout, boundedValidation.Token);
+            if (playbackGeneration !=
+                    Volatile.Read(ref _explicitPlaybackGeneration) ||
+                _isClosing ||
+                !IsVisible ||
+                !IsActive ||
+                _isPresentationSuspended)
+            {
+                return null;
+            }
+
+            if (validatedPath is null)
+            {
+                _refreshPending = true;
+                ShowError(
+                    "The selected clip changed or is no longer a safe local ClipForge recording. Refresh the library and try again.");
+            }
+
+            return validatedPath;
+        }
+        catch (TimeoutException)
+        {
+            boundedValidation.Cancel();
+            if (playbackGeneration ==
+                    Volatile.Read(ref _explicitPlaybackGeneration) &&
+                !_isClosing &&
+                IsVisible &&
+                IsActive)
+            {
+                ShowError(
+                    "The selected clip location is not responding. ClipForge stopped waiting so the app stays responsive.");
+            }
+
+            return null;
+        }
+        catch (OperationCanceledException) when (boundedValidation.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    private void ResumePendingRefreshAfterPlayback()
+    {
+        if (_refreshPending &&
+            !_isClosing &&
+            IsVisible &&
+            IsActive &&
+            !ShouldSuppressAutomaticRefresh(
+                _isReplayRunning,
+                _isPresentationSuspended,
+                IsTrimOwningLibraryWork,
+                _suspendAutomaticMediaWorkForPlayback))
+        {
+            if (_currentClip is not null &&
+                GetAttachedPlayer() is { Source: not null } player)
+            {
+                // A deferred refresh may rebuild the same paused media graph.
+                // Mark it as a restore so refreshing thumbnails/cards does not
+                // throw away the user's paused position.
+                _positionToRestore = player.Position;
+                _sourceReleasedForBackground = true;
+            }
+
+            _ = RefreshLibraryAsync(_requestedPreferredPath);
+        }
     }
 
     internal void UpsertKnownReplayClip(
@@ -1000,7 +1311,7 @@ public partial class LibraryWindow : Window
             : $"Replay is active - showing {ClipList.Items.Count} cached clips. Full refresh resumes when replay stops.";
     }
 
-    private void ClipList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void ClipList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_isClosing ||
             _suppressSelectionAutoplay ||
@@ -1019,8 +1330,51 @@ public partial class LibraryWindow : Window
             _requestedPreferredPath = null;
         }
 
-        CancelTrimMode();
-        OpenClip(clip, autoplay: true);
+        var playbackLease = await StopLibraryHelperForExplicitPlaybackAsync();
+        if (playbackLease is null)
+        {
+            return;
+        }
+
+        var ownerTransferred = false;
+        try
+        {
+            if (ClipList.SelectedItem is not ClipLibraryItem selectedClip ||
+                !selectedClip.FullPath.Equals(
+                    clip.FullPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var validatedClipPath = await ValidateExplicitClipPathAsync(
+                clip,
+                playbackLease.Value.PlaybackGeneration);
+            if (validatedClipPath is null ||
+                ClipList.SelectedItem is not ClipLibraryItem currentSelection ||
+                !currentSelection.FullPath.Equals(
+                    clip.FullPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            CancelTrimMode();
+            ownerTransferred = OpenValidatedClip(
+                clip,
+                validatedClipPath,
+                autoplay: true,
+                preserveRestorePosition: false,
+                playbackLease.Value.MediaWorkOwner);
+        }
+        finally
+        {
+            if (!ownerTransferred)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(
+                    playbackLease.Value.MediaWorkOwner);
+            }
+        }
     }
 
     internal static bool ShouldDeferAutomaticMediaOpen(
@@ -1028,13 +1382,18 @@ public partial class LibraryWindow : Window
         bool beginTrimWhenReady) =>
         replayRunning && !beginTrimWhenReady;
 
-    private void SelectClipWithoutOpening(ClipLibraryItem clip)
+    private void SelectClipWithoutOpening(
+        ClipLibraryItem clip,
+        bool preserveRestorePosition = false)
     {
-        ReleasePlayerSource(rememberPosition: false);
+        Interlocked.Increment(ref _explicitPlaybackGeneration);
+        ReleasePlayerSource(rememberPosition: preserveRestorePosition);
+        ResumeAutomaticMediaWorkAfterPlayback();
         _currentClip = clip;
         PlayerPosterImage.DataContext = clip;
         _isMediaOpenDeferred = true;
-        _sourceReleasedForBackground = false;
+        _sourceReleasedForBackground =
+            preserveRestorePosition && _positionToRestore is not null;
         _playWhenOpened = false;
         SelectedClipNameText.Text = clip.FileName;
         SelectedClipDetailsText.Text =
@@ -1061,18 +1420,71 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        _isMediaReady = false;
-        if (!ClipLibraryService.TryGetCurrentClipPath(
-                _saveDirectory,
-                clip,
-                out var validatedClipPath))
+        _ = OpenClipAfterValidationAsync(
+            clip,
+            autoplay,
+            preserveRestorePosition);
+    }
+
+    private async Task OpenClipAfterValidationAsync(
+        ClipLibraryItem clip,
+        bool autoplay,
+        bool preserveRestorePosition)
+    {
+        var playbackLease = await StopLibraryHelperForExplicitPlaybackAsync();
+        if (playbackLease is null)
         {
-            ClearPlayer();
-            ShowError("The selected clip changed or is no longer a safe local ClipForge recording. Refresh the library and try again.");
-            _refreshPending = true;
             return;
         }
 
+        var ownerTransferred = false;
+        try
+        {
+            var validatedClipPath = await ValidateExplicitClipPathAsync(
+                clip,
+                playbackLease.Value.PlaybackGeneration);
+            if (validatedClipPath is null ||
+                playbackLease.Value.PlaybackGeneration !=
+                    Volatile.Read(ref _explicitPlaybackGeneration) ||
+                _isClosing ||
+                !IsVisible ||
+                !IsActive ||
+                _isPresentationSuspended)
+            {
+                return;
+            }
+
+            ownerTransferred = OpenValidatedClip(
+                clip,
+                validatedClipPath,
+                autoplay,
+                preserveRestorePosition,
+                playbackLease.Value.MediaWorkOwner);
+        }
+        finally
+        {
+            if (!ownerTransferred)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(
+                    playbackLease.Value.MediaWorkOwner);
+            }
+        }
+    }
+
+    private bool OpenValidatedClip(
+        ClipLibraryItem clip,
+        string validatedClipPath,
+        bool autoplay,
+        bool preserveRestorePosition,
+        long mediaWorkOwner)
+    {
+        if (_isPresentationSuspended)
+        {
+            _refreshPending = true;
+            return false;
+        }
+
+        _isMediaReady = false;
         ReleasePlayerSource(rememberPosition: preserveRestorePosition);
         _currentClip = clip;
         PlayerPosterImage.DataContext = clip;
@@ -1103,22 +1515,29 @@ public partial class LibraryWindow : Window
                 : VolumeSlider.Value / 100);
         _pendingOpenPlan = openPlan;
         var player = EnsurePlayerElement();
+        Interlocked.Exchange(ref _activePlayerMediaWorkOwner, mediaWorkOwner);
         player.Volume = openPlan.PrimeVolume;
         player.Source = new Uri(validatedClipPath, UriKind.Absolute);
+        var openGeneration = Interlocked.Increment(ref _mediaOpenGeneration);
+        StartMediaOpenTimeout(player, openGeneration);
         if (openPlan.MustPrimeWithPlay)
         {
             player.Play();
         }
+
+        return true;
     }
 
     private void ClearPlayer()
     {
+        Interlocked.Increment(ref _explicitPlaybackGeneration);
         if (!_isTrimInProgress)
         {
             CancelTrimMode();
         }
 
         ReleasePlayerSource(rememberPosition: false);
+        ResumeAutomaticMediaWorkAfterPlayback();
         _currentClip = null;
         PlayerPosterImage.DataContext = null;
         _positionToRestore = null;
@@ -1134,7 +1553,7 @@ public partial class LibraryWindow : Window
         TimeText.Text = "0:00 / 0:00";
     }
 
-    private void PlayPauseButton_Click(object sender, RoutedEventArgs e)
+    private async void PlayPauseButton_Click(object sender, RoutedEventArgs e)
     {
         if (_currentClip is null)
         {
@@ -1142,33 +1561,85 @@ public partial class LibraryWindow : Window
         }
 
         var player = GetAttachedPlayer();
-        if (player?.Source is null)
+        if (_isPlaying)
         {
-            if (_isPresentationSuspended)
+            Interlocked.Increment(ref _explicitPlaybackGeneration);
+            player?.Pause();
+            SetPlaying(false);
+            ResumeAttachedPlayerMediaWork();
+            ResumePendingRefreshAfterPlayback();
+            return;
+        }
+
+        var requestedClipPath = _currentClip.FullPath;
+        var playbackLease = await StopLibraryHelperForExplicitPlaybackAsync();
+        if (playbackLease is null)
+        {
+            return;
+        }
+
+        var ownerTransferred = false;
+        try
+        {
+            if (_currentClip is null ||
+                !_currentClip.FullPath.Equals(
+                    requestedClipPath,
+                    StringComparison.OrdinalIgnoreCase))
             {
                 return;
             }
 
-            OpenClip(_currentClip, autoplay: true);
-            return;
-        }
+            player = GetAttachedPlayer();
+            if (player?.Source is null)
+            {
+                if (_isPresentationSuspended)
+                {
+                    return;
+                }
 
-        if (_isPlaying)
+                var validatedClipPath = await ValidateExplicitClipPathAsync(
+                    _currentClip,
+                    playbackLease.Value.PlaybackGeneration);
+                if (validatedClipPath is null ||
+                    _currentClip is null ||
+                    !_currentClip.FullPath.Equals(
+                        requestedClipPath,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                ownerTransferred = OpenValidatedClip(
+                    _currentClip,
+                    validatedClipPath,
+                    autoplay: true,
+                    preserveRestorePosition: false,
+                    mediaWorkOwner: playbackLease.Value.MediaWorkOwner);
+                return;
+            }
+
+            var duration = GetPlayerDuration();
+            if (duration > TimeSpan.Zero &&
+                player.Position >= duration - TimeSpan.FromMilliseconds(250))
+            {
+                player.Position = TimeSpan.Zero;
+            }
+
+            Interlocked.Exchange(
+                ref _activePlayerMediaWorkOwner,
+                playbackLease.Value.MediaWorkOwner);
+            ownerTransferred = true;
+            player.Play();
+            SetPlaying(true);
+        }
+        finally
         {
-            player.Pause();
-            SetPlaying(false);
-            return;
+            if (!ownerTransferred)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(
+                    playbackLease.Value.MediaWorkOwner);
+            }
         }
-
-        var duration = GetPlayerDuration();
-        if (duration > TimeSpan.Zero &&
-            player.Position >= duration - TimeSpan.FromMilliseconds(250))
-        {
-            player.Position = TimeSpan.Zero;
-        }
-
-        player.Play();
-        SetPlaying(true);
     }
 
     private void LibraryPlayer_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -1177,7 +1648,7 @@ public partial class LibraryWindow : Window
         e.Handled = true;
     }
 
-    private void RestartButton_Click(object sender, RoutedEventArgs e)
+    private async void RestartButton_Click(object sender, RoutedEventArgs e)
     {
         var player = GetAttachedPlayer();
         if (_currentClip is null || player?.Source is null)
@@ -1185,9 +1656,42 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        player.Position = TimeSpan.Zero;
-        player.Play();
-        SetPlaying(true);
+        var requestedClipPath = _currentClip.FullPath;
+        var playbackLease = await StopLibraryHelperForExplicitPlaybackAsync();
+        if (playbackLease is null)
+        {
+            return;
+        }
+
+        var ownerTransferred = false;
+        try
+        {
+            if (_currentClip is null ||
+                !_currentClip.FullPath.Equals(
+                    requestedClipPath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                GetAttachedPlayer() is not { Source: not null } currentPlayer)
+            {
+                return;
+            }
+
+            player = currentPlayer;
+            Interlocked.Exchange(
+                ref _activePlayerMediaWorkOwner,
+                playbackLease.Value.MediaWorkOwner);
+            ownerTransferred = true;
+            player.Position = TimeSpan.Zero;
+            player.Play();
+            SetPlaying(true);
+        }
+        finally
+        {
+            if (!ownerTransferred)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(
+                    playbackLease.Value.MediaWorkOwner);
+            }
+        }
     }
 
     private void BackTenButton_Click(object sender, RoutedEventArgs e)
@@ -1277,6 +1781,7 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        CancelMediaOpenTimeout();
         var openPlan = _pendingOpenPlan;
         _pendingOpenPlan = null;
         if (_isClosing ||
@@ -1331,6 +1836,10 @@ public partial class LibraryWindow : Window
         }
 
         TryBeginRequestedTrim();
+        if (!shouldAutoplay)
+        {
+            ResumeAttachedPlayerMediaWork();
+        }
 
         UpdatePlayerTime();
     }
@@ -1347,7 +1856,9 @@ public partial class LibraryWindow : Window
         player.Pause();
         player.Position = TimeSpan.Zero;
         SetPlaying(false);
+        ResumeAttachedPlayerMediaWork();
         UpdatePlayerTime();
+        ResumePendingRefreshAfterPlayback();
     }
 
     private void LibraryPlayer_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
@@ -1358,6 +1869,7 @@ public partial class LibraryWindow : Window
             return;
         }
 
+        CancelMediaOpenTimeout();
         _pendingOpenPlan = null;
         _playWhenOpened = false;
         if (_isClosing ||
@@ -1374,10 +1886,9 @@ public partial class LibraryWindow : Window
         // Detach a failed graph before the owner warning deactivates this
         // window. Otherwise the background lifecycle can mark the failed
         // source for restore and reopen it as soon as the dialog closes.
-        ReleasePlayerSource(rememberPosition: false);
-        _sourceReleasedForBackground = false;
-        SetControlsEnabled(false);
-        SurfacePlayButton.Visibility = Visibility.Collapsed;
+        var failedClip = _currentClip;
+        SelectClipWithoutOpening(failedClip);
+        ResumePendingRefreshAfterPlayback();
         ShowError($"This clip could not be played inside ClipForge. {e.ErrorException.Message}");
     }
 
@@ -1677,6 +2188,9 @@ public partial class LibraryWindow : Window
         // pending so Cancel/Save can resume it after the editor is finished.
         CancelRefreshForBackground();
         _isTrimMode = true;
+        player.Pause();
+        SetPlaying(false);
+        ResumeAttachedPlayerMediaWork();
         _trimRangeInitialized = false;
         _isPreviewingTrim = false;
         RefreshButton.IsEnabled = false;
@@ -1779,6 +2293,7 @@ public partial class LibraryWindow : Window
 
         player.Pause();
         SetPlaying(false);
+        ResumeAttachedPlayerMediaWork();
         _pendingTrimSeekPosition = GetTrimBoundaryPreviewPosition(
             e.Handle,
             e.LowerValue,
@@ -1903,12 +2418,19 @@ public partial class LibraryWindow : Window
 
         try
         {
-            var result = await _clipTrimService.TrimAsync(
-                _saveDirectory,
-                source,
-                start,
-                end,
-                _activeTrimExecutionMode,
+            // Do not let a cancelled ffprobe/thumbnail helper overlap trim,
+            // and move ClipTrimService's synchronous pin/process-start preamble
+            // off the dispatcher before awaiting its asynchronous completion.
+            await WaitForAutomaticRefreshIdleForTrimAsync(
+                trimCancellation.Token);
+            var result = await RunTrimPipelineOffDispatcherAsync(
+                () => _clipTrimService.TrimAsync(
+                    _saveDirectory,
+                    source,
+                    start,
+                    end,
+                    _activeTrimExecutionMode,
+                    trimCancellation.Token),
                 trimCancellation.Token);
             if (_isClosing)
             {
@@ -1999,6 +2521,22 @@ public partial class LibraryWindow : Window
                 await RefreshLibraryAsync(outputPath);
             }
         }
+        catch (OperationCanceledException) when (trimCancellation.IsCancellationRequested)
+        {
+            if (!_isClosing)
+            {
+                SetTrimBusy(false);
+                if (IsVisible && IsActive)
+                {
+                    OpenClip(source, autoplay: false);
+                }
+                else
+                {
+                    _requestedPreferredPath = source.FullPath;
+                    _refreshPending = true;
+                }
+            }
+        }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException or
                 ArgumentException or NotSupportedException)
@@ -2032,6 +2570,14 @@ public partial class LibraryWindow : Window
                 SetTrimBusy(false);
             }
         }
+    }
+
+    internal static Task<T> RunTrimPipelineOffDispatcherAsync<T>(
+        Func<Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        return Task.Run(operation, cancellationToken);
     }
 
     private async Task<bool> WaitForForegroundAsync(CancellationToken cancellationToken)
@@ -2367,6 +2913,7 @@ public partial class LibraryWindow : Window
 
     private void ReleasePlayerForBackground()
     {
+        Interlocked.Increment(ref _explicitPlaybackGeneration);
         _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
         _playWhenOpened = false;
         _isSeeking = false;
@@ -2376,12 +2923,14 @@ public partial class LibraryWindow : Window
         if (_currentClip is null || !hadOpenSource)
         {
             ReleasePlayerElement();
+            ResumeAutomaticMediaWorkAfterPlayback();
             SetPlaying(false);
             return;
         }
 
         _positionToRestore = player!.Position;
         ReleasePlayerSource(rememberPosition: true);
+        ResumeAutomaticMediaWorkAfterPlayback();
         _sourceReleasedForBackground = true;
         SetControlsEnabled(false);
     }
@@ -2405,24 +2954,33 @@ public partial class LibraryWindow : Window
 
     private void ReleasePlayerElement()
     {
-        var previousPlayer = GetAttachedPlayer();
-        if (previousPlayer is null)
+        CancelMediaOpenTimeout();
+        Interlocked.Increment(ref _mediaOpenGeneration);
+        try
         {
-            LibraryPlayer = null!;
-            return;
-        }
+            var previousPlayer = GetAttachedPlayer();
+            if (previousPlayer is null)
+            {
+                LibraryPlayer = null!;
+                return;
+            }
 
-        previousPlayer.MouseLeftButtonUp -= LibraryPlayer_MouseLeftButtonUp;
-        previousPlayer.MediaOpened -= LibraryPlayer_MediaOpened;
-        previousPlayer.MediaEnded -= LibraryPlayer_MediaEnded;
-        previousPlayer.MediaFailed -= LibraryPlayer_MediaFailed;
-        previousPlayer.Volume = 0;
-        previousPlayer.Stop();
-        previousPlayer.Close();
-        previousPlayer.Source = null;
-        _playerHostIndex = LibraryPlayerHost.Children.IndexOf(previousPlayer);
-        LibraryPlayerHost.Children.Remove(previousPlayer);
-        LibraryPlayer = null!;
+            previousPlayer.MouseLeftButtonUp -= LibraryPlayer_MouseLeftButtonUp;
+            previousPlayer.MediaOpened -= LibraryPlayer_MediaOpened;
+            previousPlayer.MediaEnded -= LibraryPlayer_MediaEnded;
+            previousPlayer.MediaFailed -= LibraryPlayer_MediaFailed;
+            previousPlayer.Volume = 0;
+            previousPlayer.Stop();
+            previousPlayer.Close();
+            previousPlayer.Source = null;
+            _playerHostIndex = LibraryPlayerHost.Children.IndexOf(previousPlayer);
+            LibraryPlayerHost.Children.Remove(previousPlayer);
+            LibraryPlayer = null!;
+        }
+        finally
+        {
+            ResumeAttachedPlayerMediaWork();
+        }
     }
 
     private MediaElement EnsurePlayerElement()
@@ -2463,6 +3021,85 @@ public partial class LibraryWindow : Window
         return replacement;
     }
 
+    private void StartMediaOpenTimeout(MediaElement player, long openGeneration)
+    {
+        CancelMediaOpenTimeout();
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _mediaOpenTimeoutCancellation = cancellation;
+        _ = EnforceMediaOpenTimeoutAsync(player, openGeneration, cancellation);
+    }
+
+    private async Task EnforceMediaOpenTimeoutAsync(
+        MediaElement player,
+        long openGeneration,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await Task.Delay(MediaOpenTimeout, cancellation.Token);
+            if (!ShouldHandleMediaOpenTimeout(
+                    openGeneration,
+                    Volatile.Read(ref _mediaOpenGeneration),
+                    _isClosing,
+                    IsVisible,
+                    IsActive,
+                    _isPresentationSuspended,
+                    _currentClip is not null,
+                    ReferenceEquals(player, GetAttachedPlayer()) &&
+                    player.Source is not null))
+            {
+                return;
+            }
+
+            var timedOutClip = _currentClip!;
+            _pendingOpenPlan = null;
+            _playWhenOpened = false;
+            SelectClipWithoutOpening(timedOutClip);
+            ResumePendingRefreshAfterPlayback();
+            ShowError(
+                "This clip took too long to open. Click Play to retry or refresh the library.");
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // MediaOpened, MediaFailed, source release, or shutdown ended this
+            // generation before its bounded open deadline.
+        }
+        finally
+        {
+            if (ReferenceEquals(_mediaOpenTimeoutCancellation, cancellation))
+            {
+                _mediaOpenTimeoutCancellation = null;
+            }
+
+            cancellation.Dispose();
+        }
+    }
+
+    private void CancelMediaOpenTimeout()
+    {
+        var cancellation = _mediaOpenTimeoutCancellation;
+        _mediaOpenTimeoutCancellation = null;
+        cancellation?.Cancel();
+    }
+
+    internal static bool ShouldHandleMediaOpenTimeout(
+        long timeoutGeneration,
+        long currentGeneration,
+        bool isClosing,
+        bool isVisible,
+        bool isActive,
+        bool presentationSuspended,
+        bool hasCurrentClip,
+        bool hasSource) =>
+        timeoutGeneration == currentGeneration &&
+        !isClosing &&
+        isVisible &&
+        isActive &&
+        !presentationSuspended &&
+        hasCurrentClip &&
+        hasSource;
+
     private MediaElement? GetAttachedPlayer() =>
         LibraryPlayer is { } player && LibraryPlayerHost.Children.Contains(player)
             ? player
@@ -2471,6 +3108,7 @@ public partial class LibraryWindow : Window
     private void LibraryWindow_Closing(object? sender, CancelEventArgs e)
     {
         _isClosing = true;
+        Interlocked.Increment(ref _explicitPlaybackGeneration);
         _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
         _isSeeking = false;
         _resumeAfterSeek = false;
@@ -2482,6 +3120,7 @@ public partial class LibraryWindow : Window
             _activeRefreshCancellation?.Cancel();
         }
         ReleasePlayerSource(rememberPosition: false);
+        ResumeAutomaticMediaWorkAfterPlayback();
     }
 
     private void LibraryWindow_Closed(object? sender, EventArgs e)

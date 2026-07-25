@@ -4,6 +4,18 @@ using ClipForge.Models;
 
 namespace ClipForge.Services;
 
+public enum SettingsLoadOutcome
+{
+    Loaded,
+    Missing,
+    Invalid,
+    TransientFailure
+}
+
+public sealed record SettingsLoadResult(
+    AppSettings Settings,
+    SettingsLoadOutcome Outcome);
+
 /// <summary>
 /// Persists the user's ClipForge preferences in their local application data folder.
 /// </summary>
@@ -44,7 +56,7 @@ public sealed class SettingsService : IDisposable
         return Path.Combine(localApplicationData, "ClipForge");
     }
 
-    public async Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default)
+    public async Task<SettingsLoadResult> LoadAsync(CancellationToken cancellationToken = default)
     {
         BeginOperation();
         var gateAcquired = false;
@@ -56,16 +68,6 @@ public sealed class SettingsService : IDisposable
 
             try
             {
-                if (!File.Exists(SettingsPath))
-                {
-                    return new AppSettings();
-                }
-
-                if (new FileInfo(SettingsPath).Length > MaximumSettingsBytes)
-                {
-                    return new AppSettings();
-                }
-
                 await using var stream = new FileStream(
                     SettingsPath,
                     FileMode.Open,
@@ -74,35 +76,70 @@ public sealed class SettingsService : IDisposable
                     bufferSize: 4096,
                     FileOptions.Asynchronous | FileOptions.SequentialScan);
 
-                return await JsonSerializer.DeserializeAsync<AppSettings>(
-                        stream,
-                        SerializerOptions,
-                        cancellationToken)
-                    .ConfigureAwait(false)
-                    ?? new AppSettings();
+                if (stream.Length > MaximumSettingsBytes)
+                {
+                    return new SettingsLoadResult(
+                        new AppSettings(),
+                        SettingsLoadOutcome.Invalid);
+                }
+
+                var settings = await JsonSerializer.DeserializeAsync<AppSettings>(
+                            stream,
+                            SerializerOptions,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                return settings is null
+                    ? new SettingsLoadResult(
+                        new AppSettings(),
+                        SettingsLoadOutcome.Invalid)
+                    : new SettingsLoadResult(
+                        settings,
+                        SettingsLoadOutcome.Loaded);
+            }
+            catch (FileNotFoundException)
+            {
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.Missing);
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.Missing);
             }
             catch (JsonException)
             {
                 // A partially written or manually edited file should not prevent startup.
-                return new AppSettings();
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.Invalid);
             }
             catch (NotSupportedException)
             {
-                return new AppSettings();
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.Invalid);
             }
             catch (IOException)
             {
                 // A temporary lock, concurrent replacement, or unavailable local
                 // profile should not prevent the application from starting.
-                return new AppSettings();
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.TransientFailure);
             }
             catch (UnauthorizedAccessException)
             {
-                return new AppSettings();
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.TransientFailure);
             }
             catch (System.Security.SecurityException)
             {
-                return new AppSettings();
+                return new SettingsLoadResult(
+                    new AppSettings(),
+                    SettingsLoadOutcome.TransientFailure);
             }
         }
         finally

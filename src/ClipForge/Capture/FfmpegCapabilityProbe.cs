@@ -22,7 +22,10 @@ internal interface IFfmpegProbeRunner
 
 internal sealed record FfmpegCapabilitySelection(
     VideoEncodingStrategy Strategy,
-    string Diagnostics);
+    string Diagnostics)
+{
+    internal DateTimeOffset? CacheExpiresAtUtc { get; init; }
+}
 
 /// <summary>
 /// Verifies that an encoder can create frames on the current machine instead
@@ -35,6 +38,8 @@ internal sealed class FfmpegCapabilityProbe
         TimeSpan.FromSeconds(15);
     private static readonly TimeSpan DefaultDegradedCacheMaximumDuration =
         TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan DefaultPositiveCacheDuration =
+        TimeSpan.FromMinutes(10);
     private static readonly VideoEncoderKind[] HardwarePreference =
     [
         VideoEncoderKind.NvidiaNvenc,
@@ -45,8 +50,10 @@ internal sealed class FfmpegCapabilityProbe
     private readonly IFfmpegProbeRunner _runner;
     private readonly TimeSpan _degradedCacheInitialDuration;
     private readonly TimeSpan _degradedCacheMaximumDuration;
+    private readonly TimeSpan _positiveCacheDuration;
     private readonly Func<DateTimeOffset> _getUtcNow;
     private readonly SemaphoreSlim _probeGate = new(1, 1);
+    private readonly object _cacheGate = new();
     private readonly Dictionary<string, CachedCapabilitySelection> _cache =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -54,6 +61,7 @@ internal sealed class FfmpegCapabilityProbe
         IFfmpegProbeRunner? runner = null,
         TimeSpan? degradedCacheInitialDuration = null,
         TimeSpan? degradedCacheMaximumDuration = null,
+        TimeSpan? positiveCacheDuration = null,
         Func<DateTimeOffset>? getUtcNow = null)
     {
         _runner = runner ?? new FfmpegProbeRunner();
@@ -61,6 +69,8 @@ internal sealed class FfmpegCapabilityProbe
             degradedCacheInitialDuration ?? DefaultDegradedCacheInitialDuration;
         _degradedCacheMaximumDuration =
             degradedCacheMaximumDuration ?? DefaultDegradedCacheMaximumDuration;
+        _positiveCacheDuration =
+            positiveCacheDuration ?? DefaultPositiveCacheDuration;
         _getUtcNow = getUtcNow ?? (static () => DateTimeOffset.UtcNow);
 
         if (_degradedCacheInitialDuration <= TimeSpan.Zero)
@@ -76,6 +86,13 @@ internal sealed class FfmpegCapabilityProbe
                 nameof(degradedCacheMaximumDuration),
                 "The degraded capability cache maximum must not be shorter than its initial duration.");
         }
+
+        if (_positiveCacheDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(positiveCacheDuration),
+                "The positive capability cache duration must be positive.");
+        }
     }
 
     public async Task<FfmpegCapabilitySelection> SelectAsync(
@@ -90,7 +107,12 @@ internal sealed class FfmpegCapabilityProbe
         await _probeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _cache.TryGetValue(cacheKey, out var previous);
+            CachedCapabilitySelection? previous;
+            lock (_cacheGate)
+            {
+                _cache.TryGetValue(cacheKey, out previous);
+            }
+
             if (previous is not null &&
                 (previous.ExpiresAtUtc is null ||
                  _getUtcNow() < previous.ExpiresAtUtc))
@@ -108,10 +130,15 @@ internal sealed class FfmpegCapabilityProbe
             if (selection.Strategy.CaptureBackend ==
                 DesktopCaptureBackend.WindowsGraphicsCapture)
             {
-                _cache[cacheKey] = new CachedCapabilitySelection(
-                    selection,
-                    ExpiresAtUtc: null,
-                    ConsecutiveDegradedSelections: 0);
+                var expiresAtUtc = _getUtcNow() + _positiveCacheDuration;
+                selection = selection with { CacheExpiresAtUtc = expiresAtUtc };
+                lock (_cacheGate)
+                {
+                    _cache[cacheKey] = new CachedCapabilitySelection(
+                        selection,
+                        expiresAtUtc,
+                        ConsecutiveDegradedSelections: 0);
+                }
             }
             else
             {
@@ -122,10 +149,15 @@ internal sealed class FfmpegCapabilityProbe
                         : previous.ConsecutiveDegradedSelections + 1;
                 var cacheDuration = GetDegradedCacheDuration(
                     consecutiveDegradedSelections);
-                _cache[cacheKey] = new CachedCapabilitySelection(
-                    selection,
-                    _getUtcNow() + cacheDuration,
-                    consecutiveDegradedSelections);
+                var expiresAtUtc = _getUtcNow() + cacheDuration;
+                selection = selection with { CacheExpiresAtUtc = expiresAtUtc };
+                lock (_cacheGate)
+                {
+                    _cache[cacheKey] = new CachedCapabilitySelection(
+                        selection,
+                        expiresAtUtc,
+                        consecutiveDegradedSelections);
+                }
             }
 
             return selection;
@@ -133,6 +165,28 @@ internal sealed class FfmpegCapabilityProbe
         finally
         {
             _probeGate.Release();
+        }
+    }
+
+    internal bool Invalidate(
+        string ffmpegPath,
+        CaptureConfiguration configuration,
+        VideoEncodingStrategy expectedStrategy)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(expectedStrategy);
+
+        var cacheKey = BuildCacheKey(ffmpegPath, configuration);
+        lock (_cacheGate)
+        {
+            if (!_cache.TryGetValue(cacheKey, out var cached) ||
+                cached.Selection.Strategy != expectedStrategy)
+            {
+                return false;
+            }
+
+            return _cache.Remove(cacheKey);
         }
     }
 

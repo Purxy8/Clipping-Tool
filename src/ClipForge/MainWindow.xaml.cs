@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -25,6 +26,12 @@ public partial class MainWindow : Window
     private static readonly int[] RecentClipCountOptions = [4, 8, 10, 15];
     private static readonly TimeSpan AutoStartLibraryPreloadTimeout =
         TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan AutoStartPreloadCancellationGrace =
+        TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan AutomaticLibraryIdleTimeout =
+        TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan PlayerOpenTimeout =
+        TimeSpan.FromSeconds(10);
     private static readonly TimeSpan CaptureSafeLibraryRecoveryRetryDelay =
         TimeSpan.FromSeconds(30);
     private static readonly AppearanceTargetOption[] AppearanceTargetOptions =
@@ -33,6 +40,7 @@ public partial class MainWindow : Window
         new(AppearanceColorTarget.Accent, "Accent & buttons"),
         new(AppearanceColorTarget.Surface, "Panels & controls")
     ];
+    private const uint DriveTypeFixed = 3;
 
     private readonly SettingsService _settingsService = new();
     private readonly DeviceDiscoveryService _deviceDiscoveryService = new();
@@ -56,6 +64,8 @@ public partial class MainWindow : Window
     private readonly CaptureEngineVerificationCoordinator _engineVerification;
 
     private AppSettings _settings = new();
+    private SettingsLoadOutcome? _settingsLoadOutcome;
+    private bool _settingsControlsPopulated;
     private ReplayStateSnapshot _latestState = new(
         ReplayState.Stopped,
         TimeSpan.Zero,
@@ -84,6 +94,7 @@ public partial class MainWindow : Window
     private bool _isUpdatingPlayerControls;
     private bool _isPlayerMuted;
     private bool _replayPlaybackAudioOptIn;
+    private bool _suspendThumbnailHydrationForPlayback;
     private double _playerVolumeBeforeMute = 0.8;
     private double? _playerVolumeAfterOpen;
     private string? _pendingLibraryPreferredPath;
@@ -95,11 +106,19 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _activeLibraryRefreshCancellation;
     private CancellationTokenSource? _activeRecentThumbnailHydrationCancellation;
     private CancellationTokenSource? _recentThumbnailRetryCancellation;
+    private CancellationTokenSource? _playerSelectionCancellation;
+    private CancellationTokenSource? _playerOpenTimeoutCancellation;
     private bool _recentThumbnailHydrationPending;
     private int _recentThumbnailRetryAttempt;
     private long _recentClipSnapshotVersion;
     private long _activeRecentThumbnailHydrationSnapshotVersion = -1;
     private long _lastAttemptedRecentThumbnailHydrationSnapshotVersion = -1;
+    private long _playerSelectionGeneration;
+    private long _activePlayerSelectionGeneration;
+    private long _playbackRequestGeneration;
+    private long _mediaWorkSuspensionOwner;
+    private long _activePlayerMediaWorkOwner;
+    private long _storageStatusGeneration;
     private CancellationTokenSource? _displayModeChangeCancellation;
     private int _displayModeWgcRenewalRequested;
     private bool _refreshingDisplaySelection;
@@ -165,12 +184,15 @@ public partial class MainWindow : Window
 
         try
         {
-            _settings = await _settingsService.LoadAsync(_lifetimeCancellation.Token);
+            var settingsLoad = await _settingsService.LoadAsync(_lifetimeCancellation.Token);
+            _settings = settingsLoad.Settings;
+            _settingsLoadOutcome = settingsLoad.Outcome;
             _settings.SaveClipHotkey ??= HotkeyGesture.DefaultSaveClip;
             _settings.ToggleOverlayHotkey ??= HotkeyGesture.DefaultToggleOverlay;
             _settings.RecentClipCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
             PopulateControls();
-            EnsureSaveDirectory();
+            _settingsControlsPopulated = true;
+            SyncSaveDirectoryFromControls();
             await RefreshEngineStateAsync(forceVerification: false);
             UpdateStorageText();
             InitializeUpdateControls();
@@ -205,10 +227,11 @@ public partial class MainWindow : Window
             _isInitializing = false;
             UpdateControlsForState(_latestState);
 
-            var staleAutoStartLaunch =
-                _launchOptions.IsAutoStart &&
-                initializationCompleted &&
-                !_settings.StartReplayWithWindows;
+            var staleAutoStartLaunch = ShouldRemoveStaleAutoStartRegistration(
+                _launchOptions.IsAutoStart,
+                initializationCompleted,
+                _settingsLoadOutcome,
+                _settings.StartReplayWithWindows);
             if (staleAutoStartLaunch)
             {
                 try
@@ -388,7 +411,7 @@ public partial class MainWindow : Window
         }
 
         SyncSettingsFromControls();
-        EnsureSaveDirectory();
+        SyncSaveDirectoryFromControls();
         HideError();
         SaveClipButton.IsEnabled = false;
 
@@ -668,6 +691,22 @@ public partial class MainWindow : Window
         !replayRunning &&
         !isClosing;
 
+    internal static bool ShouldRemoveStaleAutoStartRegistration(
+        bool isAutoStartLaunch,
+        bool initializationCompleted,
+        SettingsLoadOutcome? settingsLoadOutcome,
+        bool preferenceEnabled) =>
+        isAutoStartLaunch &&
+        initializationCompleted &&
+        settingsLoadOutcome == SettingsLoadOutcome.Loaded &&
+        !preferenceEnabled;
+
+    internal static bool ShouldPersistSettingsOnShutdown(
+        SettingsLoadOutcome? settingsLoadOutcome,
+        bool settingsControlsPopulated) =>
+        settingsControlsPopulated &&
+        settingsLoadOutcome is SettingsLoadOutcome.Loaded or SettingsLoadOutcome.Missing;
+
     internal static async Task RunAutoStartReplaySequenceAsync(
         bool shouldAutoStartReplay,
         Func<Task> preloadClipLibrary,
@@ -702,85 +741,49 @@ public partial class MainWindow : Window
 
         using var preloadCancellation =
             CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
-        preloadCancellation.CancelAfter(timeout);
         try
         {
-            await preload(preloadCancellation.Token);
-            return true;
+            var preloadTask = preload(preloadCancellation.Token);
+            var timeoutTask = Task.Delay(timeout, lifetimeToken);
+            if (await Task.WhenAny(preloadTask, timeoutTask) == preloadTask)
+            {
+                await preloadTask;
+                return true;
+            }
+
+            lifetimeToken.ThrowIfCancellationRequested();
+            preloadCancellation.Cancel();
+            try
+            {
+                await preloadTask.WaitAsync(AutoStartPreloadCancellationGrace);
+            }
+            catch (TimeoutException)
+            {
+                _ = preloadTask.ContinueWith(
+                    task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+            }
+
+            return false;
         }
         catch (OperationCanceledException) when (
             preloadCancellation.IsCancellationRequested &&
             !lifetimeToken.IsCancellationRequested)
         {
-            // Awaiting the preload above means its ffprobe/thumbnail cleanup has
-            // unwound before replay is allowed to start.
             return false;
         }
     }
 
-    private async Task PreloadClipLibraryBeforeAutoStartAsync()
+    private Task PreloadClipLibraryBeforeAutoStartAsync()
     {
-        if (_isClosing)
-        {
-            return;
-        }
-
-        try
-        {
-            var requestedCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
-            // Autostart must not wait up to the thumbnail-generation budget
-            // before replay begins. Bind validated clips and any existing
-            // posters now; missing posters hydrate when the window is active.
-            ClipLibrarySnapshot? snapshot = null;
-            var preloadCompleted = await RunBoundedAutoStartPreloadAsync(
-                async cancellationToken =>
-                {
-                    snapshot = await _clipLibraryService.LoadAsync(
-                        _settings.SaveDirectory,
-                        count: requestedCount,
-                        includeThumbnails: true,
-                        thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
-                        cancellationToken);
-                },
-                AutoStartLibraryPreloadTimeout,
-                _lifetimeCancellation.Token);
-            if (!preloadCompleted || snapshot is null)
-            {
-                _autoStartLibraryRecoveryPending = true;
-                _libraryRefreshPending = true;
-                return;
-            }
-
-            _lifetimeCancellation.Token.ThrowIfCancellationRequested();
-            if (_isClosing)
-            {
-                return;
-            }
-
-            RecentClipsItemsControl.ItemsSource = snapshot.Clips;
-            MarkRecentClipSnapshotChanged();
-            UpdateRecentGalleryCardWidth();
-            if (snapshot.LatestClip is { } latestClip)
-            {
-                // The autostart window is hidden. Bind only identity-checked
-                // metadata/posters; never create a Media Foundation decoder.
-                SelectClipWithoutOpening(latestClip);
-            }
-
-            _libraryRefreshPending = false;
-            _autoStartLibraryRecoveryPending = false;
-        }
-        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
-        {
-            // Windows is signing out or ClipForge is exiting.
-        }
-        catch (Exception)
-        {
-            // Gallery preload is best effort and must never prevent replay from
-            // starting. A normal full refresh remains queued for replay stop.
-            _autoStartLibraryRecoveryPending = true;
-            _libraryRefreshPending = true;
-        }
+        // Never detach non-cooperative directory work into a newly started
+        // capture session. The existing Ready/stopped recovery lanes populate
+        // the hidden gallery after replay startup is no longer waiting on it.
+        _autoStartLibraryRecoveryPending = true;
+        _libraryRefreshPending = true;
+        return Task.CompletedTask;
     }
 
     private async Task StartReplayAfterWindowsLoginAsync()
@@ -833,7 +836,7 @@ public partial class MainWindow : Window
         }
 
         SyncSettingsFromControls();
-        EnsureSaveDirectory();
+        SyncSaveDirectoryFromControls();
         await PersistSettingsAsync();
         if (_clipTrimService.HasReplayBlockingTrimWork)
         {
@@ -1919,12 +1922,25 @@ public partial class MainWindow : Window
 
     private async Task WaitForAutomaticLibraryWorkIdleAsync(CancellationToken cancellationToken)
     {
-        await _libraryRefreshGate.WaitAsync(cancellationToken);
-        _libraryRefreshGate.Release();
-
-        if (_libraryWindow is { } libraryWindow)
+        using var boundedWait = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        boundedWait.CancelAfter(AutomaticLibraryIdleTimeout);
+        try
         {
-            await libraryWindow.WaitForAutomaticRefreshIdleAsync(cancellationToken);
+            await _libraryRefreshGate.WaitAsync(boundedWait.Token);
+            _libraryRefreshGate.Release();
+
+            if (_libraryWindow is { } libraryWindow)
+            {
+                await libraryWindow.WaitForAutomaticRefreshIdleAsync(boundedWait.Token);
+            }
+        }
+        catch (OperationCanceledException) when (
+            boundedWait.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                "The clips folder is not responding. Instant Replay did not start while library I/O was still active. Choose a responsive local folder and try again.");
         }
     }
 
@@ -2127,44 +2143,115 @@ public partial class MainWindow : Window
             return;
         }
 
+        var estimate = StorageEstimator.EstimateBufferBytes(
+            display,
+            resolution,
+            framesPerSecond,
+            replayLength.Duration,
+            SystemAudioCheckBox.IsChecked == true || MicrophoneCheckBox.IsChecked == true);
+        var savePath = string.IsNullOrWhiteSpace(SavePathTextBox.Text)
+            ? AppSettings.GetDefaultSaveDirectory()
+            : SavePathTextBox.Text;
+        var generation = Interlocked.Increment(ref _storageStatusGeneration);
+        StorageText.Text = $"~{StorageEstimator.FormatBytes(estimate)} replay buffer";
+        StorageText.Foreground = Brush("TextMutedBrush");
+        _ = UpdateStorageFreeSpaceAsync(generation, savePath, estimate);
+    }
+
+    private async Task UpdateStorageFreeSpaceAsync(
+        long generation,
+        string savePath,
+        long estimatedBufferBytes)
+    {
+        if (!CanQueryStorageFreeSpace(savePath))
+        {
+            return;
+        }
+
         try
         {
-            var estimate = StorageEstimator.EstimateBufferBytes(
-                display,
-                resolution,
-                framesPerSecond,
-                replayLength.Duration,
-                SystemAudioCheckBox.IsChecked == true || MicrophoneCheckBox.IsChecked == true);
+            var freeSpace = await Task.Run(
+                () =>
+                {
+                    var root = Path.GetPathRoot(Path.GetFullPath(savePath));
+                    return string.IsNullOrWhiteSpace(root)
+                        ? (long?)null
+                        : new DriveInfo(root).AvailableFreeSpace;
+                },
+                _lifetimeCancellation.Token);
+            if (_isClosing ||
+                generation != Volatile.Read(ref _storageStatusGeneration) ||
+                freeSpace is null)
+            {
+                return;
+            }
 
-            var savePath = string.IsNullOrWhiteSpace(SavePathTextBox.Text)
-                ? AppSettings.GetDefaultSaveDirectory()
-                : SavePathTextBox.Text;
-            var root = Path.GetPathRoot(Path.GetFullPath(savePath));
-            var freeSpace = !string.IsNullOrWhiteSpace(root)
-                ? new DriveInfo(root).AvailableFreeSpace
-                : (long?)null;
-            var freeText = !string.IsNullOrWhiteSpace(root)
-                ? $" · {StorageEstimator.FormatBytes(freeSpace!.Value)} free"
-                : string.Empty;
-
-            StorageText.Text = $"~{StorageEstimator.FormatBytes(estimate)} replay buffer{freeText}";
-            StorageText.Foreground = freeSpace is { } availableFreeSpace &&
-                                     availableFreeSpace < estimate * 2
+            StorageText.Text =
+                $"~{StorageEstimator.FormatBytes(estimatedBufferBytes)} replay buffer · " +
+                $"{StorageEstimator.FormatBytes(freeSpace.Value)} free";
+            StorageText.Foreground = freeSpace.Value < estimatedBufferBytes * 2
                 ? Brush("WarningBrush")
                 : Brush("TextMutedBrush");
         }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
-            StorageText.Text = "Storage information unavailable";
-            StorageText.Foreground = Brush("TextMutedBrush");
+            // Application shutdown superseded the optional capacity hint.
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                System.Security.SecurityException)
+        {
+            // The estimate remains useful even when a drive is offline.
         }
     }
 
-    private void EnsureSaveDirectory()
+    internal static bool CanQueryStorageFreeSpace(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            return !fullPath.StartsWith(@"\\", StringComparison.Ordinal) &&
+                   !string.IsNullOrWhiteSpace(Path.GetPathRoot(fullPath));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or IOException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsDefinitelyFixedLocalPath(string? path)
+    {
+        if (!CanQueryStorageFreeSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(path!));
+            return !string.IsNullOrWhiteSpace(root) &&
+                   GetDriveType(root) == DriveTypeFixed;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint GetDriveType(string rootPathName);
+
+    private void SyncSaveDirectoryFromControls()
     {
         SyncSettingsFromControls();
-        Directory.CreateDirectory(_settings.SaveDirectory);
         SavePathTextBox.Text = _settings.SaveDirectory;
     }
 
@@ -2173,7 +2260,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFolderDialog
         {
             Title = "Choose where ClipForge should save videos",
-            InitialDirectory = Directory.Exists(SavePathTextBox.Text)
+            InitialDirectory = CanQueryStorageFreeSpace(SavePathTextBox.Text)
                 ? SavePathTextBox.Text
                 : AppSettings.GetDefaultSaveDirectory()
         };
@@ -2184,19 +2271,46 @@ public partial class MainWindow : Window
         }
 
         SavePathTextBox.Text = dialog.FolderName;
-        SyncSettingsFromControls();
-        EnsureSaveDirectory();
+        SyncSaveDirectoryFromControls();
+        ResetGalleryForSaveDirectoryChange();
         UpdateStorageText();
         await PersistSettingsAsync();
-        await RefreshClipLibraryAsync();
+        await RefreshClipLibraryAsync(allowCaptureSafeReadyRecovery: true);
     }
 
-    private void OpenFolderButton_Click(object sender, RoutedEventArgs e)
+    private void ResetGalleryForSaveDirectoryChange()
+    {
+        CancelActiveLibraryRefreshForBackground();
+        if (_libraryWindow is { } libraryWindow)
+        {
+            libraryWindow.Close();
+        }
+
+        _libraryWindow = null;
+        _pendingLibraryPreferredPath = null;
+        _lastSavedPath = null;
+        ClearPlayer();
+        CancelActiveLibraryRefreshForBackground();
+        RecentClipsItemsControl.ItemsSource = Array.Empty<ClipLibraryItem>();
+        MarkRecentClipSnapshotChanged();
+        UpdateRecentGalleryCardWidth();
+        _libraryRefreshPending = true;
+        _autoStartLibraryRecoveryPending = true;
+    }
+
+    private async void OpenFolderButton_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            EnsureSaveDirectory();
+            SyncSaveDirectoryFromControls();
+            await Task.Run(
+                () => Directory.CreateDirectory(_settings.SaveDirectory),
+                _lifetimeCancellation.Token);
             OpenPath(_settings.SaveDirectory);
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Application shutdown.
         }
         catch (Exception exception)
         {
@@ -2801,9 +2915,38 @@ public partial class MainWindow : Window
         }
 
         _settings.RecentClipCount = normalizedCount;
+        var currentCards = RecentClipsItemsControl.Items
+            .OfType<ClipLibraryItem>()
+            .ToArray();
+        if (currentCards.Length > normalizedCount)
+        {
+            var reducedCards = currentCards.Take(normalizedCount).ToArray();
+            RecentClipsItemsControl.ItemsSource = reducedCards;
+            MarkRecentClipSnapshotChanged();
+            if (_currentClip is not null &&
+                reducedCards.All(clip => !clip.FullPath.Equals(
+                    _currentClip.FullPath,
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                if (reducedCards.FirstOrDefault() is { } firstClip)
+                {
+                    SelectClip(firstClip, autoplay: false);
+                }
+                else
+                {
+                    ClearPlayer();
+                }
+            }
+
+            _libraryRefreshPending = true;
+        }
+
         UpdateRecentGalleryCardWidth();
         await PersistSettingsAsync();
-        await RefreshClipLibraryAsync();
+        if (currentCards.Length < normalizedCount || !_replayBufferService.IsRunning)
+        {
+            await RefreshClipLibraryAsync(allowCaptureSafeReadyRecovery: true);
+        }
     }
 
     private void RecentClipsScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e) =>
@@ -3241,6 +3384,12 @@ public partial class MainWindow : Window
             _pendingLibraryPreferredPath = preferredPath;
         }
 
+        if (_suspendThumbnailHydrationForPlayback)
+        {
+            _libraryRefreshPending = true;
+            return;
+        }
+
         if (IsAutomaticLibraryWorkSuppressed &&
             !(allowCaptureSafeReadyRecovery &&
               IsCaptureSafeReadyLibraryRefreshAllowed))
@@ -3284,9 +3433,10 @@ public partial class MainWindow : Window
         {
             await _libraryRefreshGate.WaitAsync(refreshCancellation.Token);
             gateEntered = true;
-            if (IsAutomaticLibraryWorkSuppressed &&
-                !(allowCaptureSafeReadyRecovery &&
-                  IsCaptureSafeReadyLibraryRefreshAllowed))
+            if (_suspendThumbnailHydrationForPlayback ||
+                (IsAutomaticLibraryWorkSuppressed &&
+                 !(allowCaptureSafeReadyRecovery &&
+                   IsCaptureSafeReadyLibraryRefreshAllowed)))
             {
                 _libraryRefreshPending = true;
                 return;
@@ -3302,8 +3452,9 @@ public partial class MainWindow : Window
                 refreshCancellation.Token);
 
             refreshCancellation.Token.ThrowIfCancellationRequested();
-            if ((IsAutomaticLibraryWorkSuppressed &&
-                !(allowCaptureSafeReadyRecovery &&
+            if (_suspendThumbnailHydrationForPlayback ||
+                (IsAutomaticLibraryWorkSuppressed &&
+                 !(allowCaptureSafeReadyRecovery &&
                    IsCaptureSafeReadyLibraryRefreshAllowed)) ||
                 !IsVisible ||
                 !IsActive ||
@@ -3406,6 +3557,9 @@ public partial class MainWindow : Window
 
     private void SelectClipWithoutOpening(ClipLibraryItem clip)
     {
+        Interlocked.Increment(ref _playerSelectionGeneration);
+        Interlocked.Increment(ref _playbackRequestGeneration);
+        _playerSelectionCancellation?.Cancel();
         if (!ClipLibraryService.IsCurrentClipSafe(_settings.SaveDirectory, clip))
         {
             ClearPlayer();
@@ -3432,13 +3586,109 @@ public partial class MainWindow : Window
 
     private void SelectClip(ClipLibraryItem clip, bool autoplay)
     {
-        if (!ClipLibraryService.IsCurrentClipSafe(_settings.SaveDirectory, clip))
-        {
-            ClearPlayer();
-            ShowError("The selected clip changed or is no longer a safe local ClipForge recording. Refresh the gallery and try again.");
-            return;
-        }
+        ArgumentNullException.ThrowIfNull(clip);
+        var generation = Interlocked.Increment(ref _playerSelectionGeneration);
+        Interlocked.Increment(ref _playbackRequestGeneration);
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        var previousCancellation = _playerSelectionCancellation;
+        _playerSelectionCancellation = cancellation;
+        previousCancellation?.Cancel();
+        var mediaWorkOwner = autoplay
+            ? SuspendAutomaticMediaWorkForPlayback()
+            : 0;
 
+        _ = SelectClipAfterValidationAsync(
+            clip,
+            autoplay,
+            generation,
+            mediaWorkOwner,
+            cancellation);
+    }
+
+    private async Task SelectClipAfterValidationAsync(
+        ClipLibraryItem clip,
+        bool autoplay,
+        long generation,
+        long mediaWorkOwner,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            if (autoplay &&
+                !await WaitForMainAutomaticMediaWorkIdleForPlaybackAsync(
+                    mediaWorkOwner,
+                    cancellation.Token))
+            {
+                return;
+            }
+
+            bool isSafe;
+            try
+            {
+                isSafe = await Task.Run(
+                        () => ClipLibraryService.IsCurrentClipSafe(
+                            _settings.SaveDirectory,
+                            clip),
+                        cancellation.Token)
+                    .WaitAsync(TimeSpan.FromSeconds(3), cancellation.Token);
+            }
+            catch (TimeoutException)
+            {
+                if (generation == Volatile.Read(ref _playerSelectionGeneration))
+                {
+                    ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+                    ShowError(
+                        "The selected clip location is not responding. ClipForge stopped waiting so the app stays responsive.");
+                }
+
+                return;
+            }
+
+            if (cancellation.IsCancellationRequested ||
+                generation != Volatile.Read(ref _playerSelectionGeneration) ||
+                !ReferenceEquals(_playerSelectionCancellation, cancellation))
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+                return;
+            }
+
+            if (_isClosing || !IsVisible || !IsActive)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+                return;
+            }
+
+            if (!isSafe)
+            {
+                ClearPlayer();
+                ShowError("The selected clip changed or is no longer a safe local ClipForge recording. Refresh the gallery and try again.");
+                return;
+            }
+
+            CommitSelectedClip(clip, autoplay, mediaWorkOwner);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // A newer selection, capture transition, or shutdown superseded this open.
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+        }
+        finally
+        {
+            if (ReferenceEquals(_playerSelectionCancellation, cancellation))
+            {
+                _playerSelectionCancellation = null;
+            }
+
+            cancellation.Dispose();
+        }
+    }
+
+    private void CommitSelectedClip(
+        ClipLibraryItem clip,
+        bool autoplay,
+        long mediaWorkOwner)
+    {
         ReleaseClipPlayerElement();
         ClipPlayerPosterImage.DataContext = clip;
 
@@ -3458,6 +3708,7 @@ public partial class MainWindow : Window
             PlayerTimeText.Text = clip.Duration is { } deferredDuration
                 ? $"0:00 / {FormatDuration(deferredDuration)}"
                 : "0:00 / --:--";
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
             return;
         }
 
@@ -3481,6 +3732,7 @@ public partial class MainWindow : Window
             PlayerTimeText.Text = clip.Duration is { } replayDuration
                 ? $"0:00 / {FormatDuration(replayDuration)}"
                 : "0:00 / --:--";
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
             return;
         }
 
@@ -3493,8 +3745,12 @@ public partial class MainWindow : Window
             : Math.Clamp(PlayerVolumeSlider.Value / 100, 0, 1);
         SetPlayerPlaying(false);
         var player = EnsureClipPlayerElement();
+        _activePlayerSelectionGeneration =
+            Volatile.Read(ref _playerSelectionGeneration);
+        Interlocked.Exchange(ref _activePlayerMediaWorkOwner, mediaWorkOwner);
         player.Volume = 0;
         player.Source = new Uri(clip.FullPath, UriKind.Absolute);
+        ArmPlayerOpenTimeout(player);
         // LoadedBehavior=Manual does not reliably build the native graph from
         // Source assignment alone. Prime silently; MediaOpened either continues
         // an explicit autoplay or pauses at frame zero.
@@ -3516,6 +3772,9 @@ public partial class MainWindow : Window
 
     private void ClearPlayer()
     {
+        Interlocked.Increment(ref _playerSelectionGeneration);
+        _playerSelectionCancellation?.Cancel();
+        CancelPlayerOpenTimeout();
         ReleaseClipPlayerElement();
         ClipPlayerPosterImage.DataContext = null;
         _currentClip = null;
@@ -3530,9 +3789,10 @@ public partial class MainWindow : Window
         SetPlayerControlsEnabled(false);
         SetSeekUi(TimeSpan.Zero, TimeSpan.Zero);
         PlayerTimeText.Text = "0:00 / 0:00";
+        ResumeAutomaticMediaWorkAfterPlayback();
     }
 
-    private void PlayPauseButton_Click(object sender, RoutedEventArgs e)
+    private async void PlayPauseButton_Click(object sender, RoutedEventArgs e)
     {
         if (_currentClip is null)
         {
@@ -3553,17 +3813,50 @@ public partial class MainWindow : Window
 
         if (_isPlayerPlaying)
         {
+            var selectionGeneration = Interlocked.Increment(
+                ref _playerSelectionGeneration);
+            Interlocked.Increment(ref _playbackRequestGeneration);
+            _playerSelectionCancellation?.Cancel();
+            // The attached decoder remains the current selection. Advance its
+            // event generation along with cancellation of any pending selection
+            // so MediaEnded/MediaFailed remain valid after a pause/resume cycle.
+            _activePlayerSelectionGeneration = selectionGeneration;
             player.Pause();
             SetPlayerPlaying(false);
+            ResumeAttachedPlayerMediaWork();
         }
         else
         {
+            var requestGeneration = Interlocked.Increment(
+                ref _playbackRequestGeneration);
+            var requestedClipPath = _currentClip.FullPath;
+            var mediaWorkOwner = SuspendAutomaticMediaWorkForPlayback();
+            if (!await WaitForMainAutomaticMediaWorkIdleForPlaybackAsync(
+                    mediaWorkOwner,
+                    _lifetimeCancellation.Token))
+            {
+                return;
+            }
+
+            if (requestGeneration != Volatile.Read(ref _playbackRequestGeneration) ||
+                _currentClip is null ||
+                !_currentClip.FullPath.Equals(
+                    requestedClipPath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !ReferenceEquals(player, GetAttachedClipPlayer()) ||
+                player.Source is null)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+                return;
+            }
+
             var duration = GetPlayerDuration();
             if (duration > TimeSpan.Zero && player.Position >= duration - TimeSpan.FromMilliseconds(250))
             {
                 player.Position = TimeSpan.Zero;
             }
 
+            Interlocked.Exchange(ref _activePlayerMediaWorkOwner, mediaWorkOwner);
             player.Play();
             SetPlayerPlaying(true);
         }
@@ -3619,13 +3912,37 @@ public partial class MainWindow : Window
         ApplyPlayerVolume();
     }
 
-    private void RestartClipButton_Click(object sender, RoutedEventArgs e)
+    private async void RestartClipButton_Click(object sender, RoutedEventArgs e)
     {
         if (_currentClip is null || GetAttachedClipPlayer() is not { } player)
         {
             return;
         }
 
+        var requestGeneration = Interlocked.Increment(
+            ref _playbackRequestGeneration);
+        var requestedClipPath = _currentClip.FullPath;
+        var mediaWorkOwner = SuspendAutomaticMediaWorkForPlayback();
+        if (!await WaitForMainAutomaticMediaWorkIdleForPlaybackAsync(
+                mediaWorkOwner,
+                _lifetimeCancellation.Token))
+        {
+            return;
+        }
+
+        if (requestGeneration != Volatile.Read(ref _playbackRequestGeneration) ||
+            _currentClip is null ||
+            !_currentClip.FullPath.Equals(
+                requestedClipPath,
+                StringComparison.OrdinalIgnoreCase) ||
+            !ReferenceEquals(player, GetAttachedClipPlayer()) ||
+            player.Source is null)
+        {
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+            return;
+        }
+
+        Interlocked.Exchange(ref _activePlayerMediaWorkOwner, mediaWorkOwner);
         player.Position = TimeSpan.Zero;
         player.Play();
         SetPlayerPlaying(true);
@@ -3638,6 +3955,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        CancelPlayerOpenTimeout();
         if (!CanHandlePlayerMediaEvent())
         {
             SuppressLatePlayerMediaEvent();
@@ -3664,6 +3982,7 @@ public partial class MainWindow : Window
         {
             player.Position = TimeSpan.Zero;
             SetPlayerPlaying(false);
+            ResumeAttachedPlayerMediaWork();
         }
 
         UpdatePlayerTime();
@@ -3685,6 +4004,7 @@ public partial class MainWindow : Window
         player.Pause();
         player.Position = TimeSpan.Zero;
         SetPlayerPlaying(false);
+        ResumeAttachedPlayerMediaWork();
         UpdatePlayerTime();
     }
 
@@ -3695,6 +4015,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        CancelPlayerOpenTimeout();
         if (!CanHandlePlayerMediaEvent())
         {
             SuppressLatePlayerMediaEvent();
@@ -3714,13 +4035,16 @@ public partial class MainWindow : Window
         ShowError($"This clip could not be played inside ClipForge. {e.ErrorException.Message}");
     }
 
-    private bool CanHandlePlayerMediaEvent() => ShouldHandlePlayerMediaEvent(
-        _captureCriticalPresentationActive,
-        _isClosing,
-        IsVisible,
-        IsActive,
-        _currentClip is not null,
-        GetAttachedClipPlayer()?.Source is not null);
+    private bool CanHandlePlayerMediaEvent() =>
+        _activePlayerSelectionGeneration ==
+            Volatile.Read(ref _playerSelectionGeneration) &&
+        ShouldHandlePlayerMediaEvent(
+            _captureCriticalPresentationActive,
+            _isClosing,
+            IsVisible,
+            IsActive,
+            _currentClip is not null,
+            GetAttachedClipPlayer()?.Source is not null);
 
     internal static bool ShouldHandlePlayerMediaEvent(
         bool captureCritical,
@@ -4054,6 +4378,11 @@ public partial class MainWindow : Window
 
     private void QueueRecentClipThumbnailHydration()
     {
+        if (_suspendThumbnailHydrationForPlayback)
+        {
+            return;
+        }
+
         var clips = RecentClipsItemsControl.Items
             .OfType<ClipLibraryItem>()
             .ToArray();
@@ -4103,7 +4432,8 @@ public partial class MainWindow : Window
         {
             await _libraryRefreshGate.WaitAsync(hydrationCancellation.Token);
             gateEntered = true;
-            if (snapshotVersion != _recentClipSnapshotVersion)
+            if (_suspendThumbnailHydrationForPlayback ||
+                snapshotVersion != _recentClipSnapshotVersion)
             {
                 _recentThumbnailHydrationPending = true;
                 return;
@@ -4138,7 +4468,8 @@ public partial class MainWindow : Window
             var currentClips = RecentClipsItemsControl.Items
                 .OfType<ClipLibraryItem>()
                 .ToArray();
-            if (snapshotVersion != _recentClipSnapshotVersion ||
+            if (_suspendThumbnailHydrationForPlayback ||
+                snapshotVersion != _recentClipSnapshotVersion ||
                 !ShouldHydrateRecentClipThumbnails(
                     _isClosing,
                     IsVisible,
@@ -4347,6 +4678,149 @@ public partial class MainWindow : Window
         }
     }
 
+    private long SuspendAutomaticMediaWorkForPlayback()
+    {
+        var owner = Interlocked.Increment(ref _mediaWorkSuspensionOwner);
+        _suspendThumbnailHydrationForPlayback = true;
+        CancelActiveLibraryRefreshForBackground();
+        return owner;
+    }
+
+    private async Task<bool> WaitForMainAutomaticMediaWorkIdleForPlaybackAsync(
+        long mediaWorkOwner,
+        CancellationToken cancellationToken)
+    {
+        using var boundedWait = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        boundedWait.CancelAfter(AutomaticLibraryIdleTimeout);
+        try
+        {
+            await _libraryRefreshGate.WaitAsync(boundedWait.Token);
+            _libraryRefreshGate.Release();
+            var canOpen = !_isClosing && IsVisible && IsActive;
+            if (!canOpen)
+            {
+                ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+            }
+
+            return canOpen;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+            return false;
+        }
+        catch (OperationCanceledException) when (
+            boundedWait.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+            ShowError(
+                "The clips folder is not responding. ClipForge stopped waiting before opening the player so the app stays responsive.");
+            return false;
+        }
+    }
+
+    private void ResumeAutomaticMediaWorkAfterPlayback(long mediaWorkOwner = 0)
+    {
+        if (!_suspendThumbnailHydrationForPlayback)
+        {
+            return;
+        }
+
+        if (mediaWorkOwner > 0)
+        {
+            if (mediaWorkOwner != Volatile.Read(ref _mediaWorkSuspensionOwner))
+            {
+                return;
+            }
+        }
+        else
+        {
+            // A background/clear transition owns cancellation of every pending
+            // playback request, so invalidate any outstanding owner token too.
+            Interlocked.Increment(ref _mediaWorkSuspensionOwner);
+        }
+
+        _suspendThumbnailHydrationForPlayback = false;
+        if (_libraryRefreshPending &&
+            !_isClosing &&
+            IsVisible &&
+            IsActive &&
+            !IsAutomaticLibraryWorkSuppressed)
+        {
+            _ = RefreshClipLibraryAsync(_pendingLibraryPreferredPath);
+        }
+        else
+        {
+            QueueRecentClipThumbnailHydration();
+        }
+    }
+
+    private void ResumeAttachedPlayerMediaWork()
+    {
+        var mediaWorkOwner = Interlocked.Exchange(
+            ref _activePlayerMediaWorkOwner,
+            0);
+        if (mediaWorkOwner > 0)
+        {
+            ResumeAutomaticMediaWorkAfterPlayback(mediaWorkOwner);
+        }
+    }
+
+    private void ArmPlayerOpenTimeout(MediaElement player)
+    {
+        CancelPlayerOpenTimeout();
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _playerOpenTimeoutCancellation = cancellation;
+        _ = EnforcePlayerOpenTimeoutAsync(player, cancellation);
+    }
+
+    private async Task EnforcePlayerOpenTimeoutAsync(
+        MediaElement expectedPlayer,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await Task.Delay(PlayerOpenTimeout, cancellation.Token);
+            if (_isClosing ||
+                !ReferenceEquals(_playerOpenTimeoutCancellation, cancellation) ||
+                !ReferenceEquals(GetAttachedClipPlayer(), expectedPlayer))
+            {
+                return;
+            }
+
+            ReleaseClipPlayerElement();
+            _playerSourceReleasedForBackground = false;
+            SetPlayerPlaying(false);
+            SetPlayerControlsEnabled(false);
+            PlayerSurfacePlayButton.Visibility = Visibility.Collapsed;
+            ShowError(
+                "This clip did not open within 10 seconds. ClipForge closed the stalled player so the app stays responsive.");
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // MediaOpened, MediaFailed, a newer selection, or shutdown won.
+        }
+        finally
+        {
+            if (ReferenceEquals(_playerOpenTimeoutCancellation, cancellation))
+            {
+                _playerOpenTimeoutCancellation = null;
+            }
+
+            cancellation.Dispose();
+        }
+    }
+
+    private void CancelPlayerOpenTimeout()
+    {
+        var cancellation = _playerOpenTimeoutCancellation;
+        _playerOpenTimeoutCancellation = null;
+        cancellation?.Cancel();
+    }
+
     private void PausePlayerForBackgroundWork()
     {
         // Cancel an autoplay that is still waiting for MediaOpened as well as
@@ -4365,10 +4839,14 @@ public partial class MainWindow : Window
 
     private void ReleasePlayerForBackground()
     {
+        Interlocked.Increment(ref _playerSelectionGeneration);
+        Interlocked.Increment(ref _playbackRequestGeneration);
+        _playerSelectionCancellation?.Cancel();
         _ = WindowInputReleaseService.ReleaseMouseCaptureWithin(this);
         PausePlayerForBackgroundWork();
         var hadOpenSource = GetAttachedClipPlayer()?.Source is not null;
         ReleaseClipPlayerElement();
+        ResumeAutomaticMediaWorkAfterPlayback();
         if (hadOpenSource)
         {
             _playerSourceReleasedForBackground = _currentClip is not null;
@@ -4380,23 +4858,32 @@ public partial class MainWindow : Window
 
     private void ReleaseClipPlayerElement()
     {
+        CancelPlayerOpenTimeout();
         _playerVolumeAfterOpen = null;
-        if (GetAttachedClipPlayer() is not { } previousPlayer)
+        try
         {
-            return;
-        }
+            _activePlayerSelectionGeneration = 0;
+            if (GetAttachedClipPlayer() is not { } previousPlayer)
+            {
+                return;
+            }
 
-        previousPlayer.MouseLeftButtonUp -= ClipPlayer_MouseLeftButtonUp;
-        previousPlayer.MediaOpened -= ClipPlayer_MediaOpened;
-        previousPlayer.MediaEnded -= ClipPlayer_MediaEnded;
-        previousPlayer.MediaFailed -= ClipPlayer_MediaFailed;
-        previousPlayer.Volume = 0;
-        previousPlayer.Stop();
-        previousPlayer.Close();
-        previousPlayer.Source = null;
-        _clipPlayerHostIndex = ClipPlayerHost.Children.IndexOf(previousPlayer);
-        ClipPlayerHost.Children.Remove(previousPlayer);
-        ClipPlayer = null!;
+            previousPlayer.MouseLeftButtonUp -= ClipPlayer_MouseLeftButtonUp;
+            previousPlayer.MediaOpened -= ClipPlayer_MediaOpened;
+            previousPlayer.MediaEnded -= ClipPlayer_MediaEnded;
+            previousPlayer.MediaFailed -= ClipPlayer_MediaFailed;
+            previousPlayer.Volume = 0;
+            previousPlayer.Stop();
+            previousPlayer.Close();
+            previousPlayer.Source = null;
+            _clipPlayerHostIndex = ClipPlayerHost.Children.IndexOf(previousPlayer);
+            ClipPlayerHost.Children.Remove(previousPlayer);
+            ClipPlayer = null!;
+        }
+        finally
+        {
+            ResumeAttachedPlayerMediaWork();
+        }
     }
 
     private MediaElement EnsureClipPlayerElement()
@@ -4447,6 +4934,35 @@ public partial class MainWindow : Window
             ? $"{(int)duration.TotalHours}:{duration.Minutes:00}:{duration.Seconds:00}"
             : $"{(int)duration.TotalMinutes}:{duration.Seconds:00}";
 
+    internal static async Task RunBestEffortShutdownStepsAsync(
+        Func<Task>? persistSettingsAsync,
+        Func<Task> stopReplayAsync,
+        Func<Task> disposeReplayAsync)
+    {
+        ArgumentNullException.ThrowIfNull(stopReplayAsync);
+        ArgumentNullException.ThrowIfNull(disposeReplayAsync);
+
+        if (persistSettingsAsync is not null)
+        {
+            await RunBestEffortShutdownStepAsync(persistSettingsAsync);
+        }
+
+        await RunBestEffortShutdownStepAsync(stopReplayAsync);
+        await RunBestEffortShutdownStepAsync(disposeReplayAsync);
+    }
+
+    private static async Task RunBestEffortShutdownStepAsync(Func<Task> step)
+    {
+        try
+        {
+            await step();
+        }
+        catch
+        {
+            // Every shutdown phase is independent and must not suppress later cleanup.
+        }
+    }
+
     private async void MainWindow_Closing(object? sender, CancelEventArgs e)
     {
         if (!_exitRequested && !_isClosing)
@@ -4476,24 +4992,33 @@ public partial class MainWindow : Window
 
         try
         {
-            SyncSettingsFromControls();
-            await _settingsService.SaveAsync(_settings);
-
-            await _captureCommandGate.WaitAsync();
-            try
+            Func<Task>? persistSettingsAsync = null;
+            if (ShouldPersistSettingsOnShutdown(
+                    _settingsLoadOutcome,
+                    _settingsControlsPopulated))
             {
-                await _replayBufferService.StopAsync();
-            }
-            finally
-            {
-                _captureCommandGate.Release();
+                persistSettingsAsync = async () =>
+                {
+                    SyncSettingsFromControls();
+                    await _settingsService.SaveAsync(_settings);
+                };
             }
 
-            await _replayBufferService.DisposeAsync();
-        }
-        catch
-        {
-            // Shutdown should continue even when capture cleanup cannot complete normally.
+            await RunBestEffortShutdownStepsAsync(
+                persistSettingsAsync,
+                async () =>
+                {
+                    await _captureCommandGate.WaitAsync();
+                    try
+                    {
+                        await _replayBufferService.StopAsync();
+                    }
+                    finally
+                    {
+                        _captureCommandGate.Release();
+                    }
+                },
+                async () => await _replayBufferService.DisposeAsync());
         }
         finally
         {

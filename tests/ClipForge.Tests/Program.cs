@@ -40,6 +40,8 @@ internal static class Program
             ("Windows autostart launch options", TestLaunchOptionsAsync),
             ("Windows autostart registration policy", TestStartupRegistrationAsync),
             ("Windows autostart replay decision", TestAutoStartReplayPolicyAsync),
+            ("Settings startup lifecycle policy", TestSettingsStartupLifecyclePolicyAsync),
+            ("Best-effort shutdown cleanup", TestBestEffortShutdownCleanupAsync),
             ("Replay presentation state policy", TestReplayPresentationStatePolicyAsync),
             ("Capture settings change coalescing", TestCaptureSettingsChangeCoalescingAsync),
             ("Capture engine verification scheduling", TestCaptureEngineVerificationSchedulingAsync),
@@ -51,6 +53,8 @@ internal static class Program
             ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
             ("Capture recovery request gate", TestCaptureRecoveryRequestGateAsync),
             ("Scheduled capture refresh coordinator", TestScheduledCaptureRefreshCoordinatorAsync),
+            ("Replay capture fallback recovery policy", TestReplayCaptureFallbackRecoveryPolicyAsync),
+            ("Replay post-save state and scheduler", TestReplayPostSaveStateAndSchedulerAsync),
             ("Renewal segment quarantine provenance", TestRenewalSegmentQuarantineProvenanceAsync),
             ("Capture smoke argument propagation", TestCaptureSmokeArgumentPropagationAsync),
             ("Replay service concurrent disposal", TestReplayServiceConcurrentDisposalAsync),
@@ -532,6 +536,20 @@ internal static class Program
             replayStarted && boundedStart.Elapsed < TimeSpan.FromSeconds(2),
             "A hung cached-library preload held Windows autostart replay too long.");
 
+        var releaseNonCooperativePreload = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var hardBoundedStart = Stopwatch.StartNew();
+        var hardBoundedResult = await MainWindow.RunBoundedAutoStartPreloadAsync(
+            _ => releaseNonCooperativePreload.Task,
+            TimeSpan.FromMilliseconds(50),
+            CancellationToken.None);
+        hardBoundedStart.Stop();
+        releaseNonCooperativePreload.TrySetResult();
+        Assert.True(
+            !hardBoundedResult &&
+            hardBoundedStart.Elapsed < TimeSpan.FromSeconds(1),
+            "A non-cooperative filesystem preload defeated the hard autostart deadline.");
+
         var readySnapshot = CreateReplayStateSnapshot(ReplayState.Ready);
         Assert.True(
             MainWindow.ShouldRecoverAutoStartLibraryDuringReady(
@@ -569,6 +587,124 @@ internal static class Program
                 replayServiceRunning: true,
                 snapshot: readySnapshot),
             "A complete cached gallery scheduled unnecessary capture-time discovery.");
+    }
+
+    private static Task TestSettingsStartupLifecyclePolicyAsync()
+    {
+        Assert.True(
+            MainWindow.ShouldRemoveStaleAutoStartRegistration(
+                isAutoStartLaunch: true,
+                initializationCompleted: true,
+                settingsLoadOutcome: SettingsLoadOutcome.Loaded,
+                preferenceEnabled: false),
+            "Only a successfully loaded explicit opt-out should remove the Startup shortcut.");
+
+        foreach (var outcome in new SettingsLoadOutcome?[]
+                 {
+                     null,
+                     SettingsLoadOutcome.Missing,
+                     SettingsLoadOutcome.Invalid,
+                     SettingsLoadOutcome.TransientFailure
+                 })
+        {
+            Assert.True(
+                !MainWindow.ShouldRemoveStaleAutoStartRegistration(
+                    isAutoStartLaunch: true,
+                    initializationCompleted: true,
+                    settingsLoadOutcome: outcome,
+                    preferenceEnabled: false),
+                "A missing, invalid, unavailable, or incomplete settings load is not an explicit opt-out.");
+        }
+
+        Assert.True(
+            !MainWindow.ShouldRemoveStaleAutoStartRegistration(
+                isAutoStartLaunch: true,
+                initializationCompleted: false,
+                settingsLoadOutcome: SettingsLoadOutcome.Loaded,
+                preferenceEnabled: false),
+            "An incomplete startup must preserve the Startup shortcut.");
+        Assert.True(
+            !MainWindow.ShouldRemoveStaleAutoStartRegistration(
+                isAutoStartLaunch: true,
+                initializationCompleted: true,
+                settingsLoadOutcome: SettingsLoadOutcome.Loaded,
+                preferenceEnabled: true),
+            "An explicit opt-in must preserve the Startup shortcut.");
+
+        Assert.True(
+            MainWindow.ShouldPersistSettingsOnShutdown(
+                SettingsLoadOutcome.Loaded,
+                settingsControlsPopulated: true),
+            "Fully loaded settings should be persisted during orderly shutdown.");
+        Assert.True(
+            MainWindow.ShouldPersistSettingsOnShutdown(
+                SettingsLoadOutcome.Missing,
+                settingsControlsPopulated: true),
+            "Confirmed first-run defaults may be persisted after controls are populated.");
+
+        foreach (var outcome in new SettingsLoadOutcome?[]
+                 {
+                     null,
+                     SettingsLoadOutcome.Invalid,
+                     SettingsLoadOutcome.TransientFailure
+                 })
+        {
+            Assert.True(
+                !MainWindow.ShouldPersistSettingsOnShutdown(
+                    outcome,
+                    settingsControlsPopulated: true),
+                "Untrusted fallback settings must not overwrite the user's file during shutdown.");
+        }
+
+        Assert.True(
+            !MainWindow.ShouldPersistSettingsOnShutdown(
+                SettingsLoadOutcome.Loaded,
+                settingsControlsPopulated: false),
+            "Exit before control hydration must not persist partial settings.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestBestEffortShutdownCleanupAsync()
+    {
+        var steps = new List<string>();
+        await MainWindow.RunBestEffortShutdownStepsAsync(
+            () =>
+            {
+                steps.Add("save");
+                return Task.FromException(new IOException("Injected save failure."));
+            },
+            () =>
+            {
+                steps.Add("stop");
+                return Task.FromException(new InvalidOperationException("Injected stop failure."));
+            },
+            () =>
+            {
+                steps.Add("dispose");
+                return Task.FromException(new ObjectDisposedException("Injected dispose failure."));
+            });
+        Assert.SequenceEqual(
+            new[] { "save", "stop", "dispose" },
+            steps,
+            "Every shutdown phase must run even when every preceding phase fails.");
+
+        steps.Clear();
+        await MainWindow.RunBestEffortShutdownStepsAsync(
+            persistSettingsAsync: null,
+            () =>
+            {
+                steps.Add("stop");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                steps.Add("dispose");
+                return Task.CompletedTask;
+            });
+        Assert.SequenceEqual(
+            new[] { "stop", "dispose" },
+            steps,
+            "Skipping an unsafe settings save must not skip capture disposal.");
     }
 
     private static Task TestReplayPresentationStatePolicyAsync()
@@ -715,6 +851,13 @@ internal static class Program
                 presentationSuspended: false,
                 trimInProgress: true),
             "Library helpers must stay deferred while the trim editor or export owns the clip.");
+        Assert.True(
+            LibraryWindow.ShouldSuppressAutomaticRefresh(
+                replayRunning: false,
+                presentationSuspended: false,
+                trimInProgress: false,
+                explicitPlaybackOrMediaOpen: true),
+            "Library helpers must stay deferred from explicit validation through media open and playback.");
 
         return Task.CompletedTask;
     }
@@ -928,6 +1071,30 @@ internal static class Program
         Assert.True(replaySafeSelection.MustPrimeWithPlay && replaySafeSelection.ContinueAfterOpened,
             "A replay-safe foreground selection must still build and continue its media graph.");
         Assert.True(
+            LibraryWindow.ShouldResumeAutomaticMediaWork(
+                isSuspended: true,
+                requestedOwner: 12,
+                currentOwner: 12),
+            "The active playback owner must be able to release helper suspension.");
+        Assert.True(
+            !LibraryWindow.ShouldResumeAutomaticMediaWork(
+                isSuspended: true,
+                requestedOwner: 11,
+                currentOwner: 12),
+            "A stale playback completion must not release a newer media-open suspension.");
+        Assert.True(
+            LibraryWindow.ShouldResumeAutomaticMediaWork(
+                isSuspended: true,
+                requestedOwner: 0,
+                currentOwner: 12),
+            "A background or shutdown transition must invalidate every pending playback owner.");
+        Assert.True(
+            !LibraryWindow.ShouldResumeAutomaticMediaWork(
+                isSuspended: false,
+                requestedOwner: 12,
+                currentOwner: 12),
+            "An already released suspension must remain idempotent.");
+        Assert.True(
             LibraryWindow.ShouldDeferAutomaticMediaOpen(
                 replayRunning: true,
                 beginTrimWhenReady: false),
@@ -1108,6 +1275,34 @@ internal static class Program
         Assert.True(
             constructionTimer.Elapsed < TimeSpan.FromSeconds(2),
             "Preparing optional sound feedback must not block application startup.");
+        Assert.True(
+            MainWindow.CanQueryStorageFreeSpace(@"C:\Videos\ClipForge"),
+            "A regular local save path should allow asynchronous capacity lookup.");
+        Assert.True(
+            !MainWindow.CanQueryStorageFreeSpace(@"\\offline-server\clips"),
+            "UNC capacity lookup must be skipped instead of blocking the WPF dispatcher.");
+        Assert.True(
+            MainWindow.IsDefinitelyFixedLocalPath(
+                Path.Combine(
+                    Path.GetPathRoot(Environment.SystemDirectory)!,
+                    "ClipForge")),
+            "The fixed system volume was excluded from safe autostart preload.");
+        Assert.True(
+            !MainWindow.IsDefinitelyFixedLocalPath(@"\\offline-server\clips"),
+            "A UNC folder was allowed into capture-critical autostart preload.");
+        Assert.True(
+            ClipLibraryService.ShouldContinueDiscovery(
+                inspectedEntries: 16_384,
+                elapsed: TimeSpan.FromSeconds(2)),
+            "Library discovery stopped before its documented bounded edge.");
+        Assert.True(
+            !ClipLibraryService.ShouldContinueDiscovery(
+                inspectedEntries: 16_385,
+                elapsed: TimeSpan.FromMilliseconds(10)) &&
+            !ClipLibraryService.ShouldContinueDiscovery(
+                inspectedEntries: 1,
+                elapsed: TimeSpan.FromSeconds(2.01)),
+            "Library discovery must be bounded by both inspected entries and elapsed work.");
         return Task.CompletedTask;
     }
 
@@ -2311,6 +2506,193 @@ internal static class Program
             "A disposed coordinator accepted another refresh.");
     }
 
+    private static Task TestReplayCaptureFallbackRecoveryPolicyAsync()
+    {
+        var deadline = new DateTimeOffset(
+            2026,
+            7,
+            25,
+            12,
+            0,
+            0,
+            TimeSpan.Zero).UtcDateTime.Ticks;
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline - 1),
+            "A degraded capture reprobe ran before the real cache deadline.");
+        Assert.True(
+            ReplayBufferService.ShouldScheduleDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline),
+            "A service-selected GDI strategy did not become eligible at cache expiry.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: false,
+                deadline,
+                deadline),
+            "An explicit GDI strategy override was incorrectly scheduled for promotion.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleDegradedCaptureReprobe(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline),
+            "An active WGC strategy entered the degraded-capture reprobe path.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadlineUtcTicks: 0,
+                deadline),
+            "A degraded capture without an actual cache expiry entered a reprobe loop.");
+        Assert.Equal(
+            TimeSpan.FromMinutes(5),
+            ReplayBufferService.GetDegradedCaptureReprobeDelay(attempt: 0),
+            "The first active GDI recheck can still compete with gameplay too frequently.");
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            ReplayBufferService.GetDegradedCaptureReprobeDelay(attempt: 1),
+            "The active GDI recheck did not back off after a repeated miss.");
+        Assert.Equal(
+            TimeSpan.FromMinutes(30),
+            ReplayBufferService.GetDegradedCaptureReprobeDelay(attempt: 20),
+            "The active GDI recheck did not respect its bounded long-session cap.");
+
+        var currentGdi = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.Gdi);
+        var verifiedWgc = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.WindowsGraphicsCapture);
+        Assert.True(
+            ReplayBufferService.CanPromoteDegradedCapture(
+                currentGdi,
+                verifiedWgc,
+                strategyUsesCapabilityProbe: true),
+            "A capability-probed GDI session rejected a confirmed WGC replacement.");
+        Assert.True(
+            !ReplayBufferService.CanPromoteDegradedCapture(
+                currentGdi,
+                VideoEncodingStrategy.SoftwareGdi,
+                strategyUsesCapabilityProbe: true),
+            "A second GDI result was treated as a WGC promotion.");
+        Assert.True(
+            !ReplayBufferService.CanPromoteDegradedCapture(
+                currentGdi,
+                verifiedWgc,
+                strategyUsesCapabilityProbe: false),
+            "An explicit strategy override was eligible for automatic promotion.");
+        Assert.True(
+            ReplayBufferService.ShouldDeferDegradedCapturePromotion(
+                promotesDegradedCapture: true,
+                reachedSegmentBoundary: false),
+            "An optional WGC promotion could still stop healthy GDI before a completed segment boundary.");
+        Assert.True(
+            !ReplayBufferService.ShouldDeferDegradedCapturePromotion(
+                promotesDegradedCapture: true,
+                reachedSegmentBoundary: true),
+            "A boundary-aligned optional WGC promotion was deferred.");
+        Assert.True(
+            !ReplayBufferService.ShouldDeferDegradedCapturePromotion(
+                promotesDegradedCapture: false,
+                reachedSegmentBoundary: false),
+            "A mandatory service-owned WGC renewal was mistaken for an optional promotion.");
+
+        Assert.True(
+            ReplayBufferService.ShouldRetryCaptureLaunch(
+                allowFreshCapabilityRetry: true,
+                strategyUsesCapabilityProbe: true,
+                realCaptureLaunchFailed: true),
+            "A real launch failure did not permit the single fresh capability retry.");
+        Assert.True(
+            !ReplayBufferService.ShouldRetryCaptureLaunch(
+                allowFreshCapabilityRetry: false,
+                strategyUsesCapabilityProbe: true,
+                realCaptureLaunchFailed: true),
+            "Capture launch recovery was not bounded to one retry.");
+        Assert.True(
+            !ReplayBufferService.ShouldRetryCaptureLaunch(
+                allowFreshCapabilityRetry: true,
+                strategyUsesCapabilityProbe: false,
+                realCaptureLaunchFailed: true),
+            "An explicit strategy override entered capability-cache recovery.");
+        Assert.True(
+            !ReplayBufferService.ShouldRetryCaptureLaunch(
+                allowFreshCapabilityRetry: true,
+                strategyUsesCapabilityProbe: true,
+                realCaptureLaunchFailed: false),
+            "A preflight failure was misclassified as a real capture launch failure.");
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestReplayPostSaveStateAndSchedulerAsync()
+    {
+        var faulted = new ReplayStateSnapshot(
+            ReplayState.Faulted,
+            TimeSpan.FromSeconds(18),
+            TimeSpan.FromSeconds(30),
+            BufferBytes: 12_345,
+            Message: "capture fault");
+        var faultedAfterSave = ReplayBufferService.BuildPostSaveSnapshot(
+            faulted,
+            @"C:\Clips\saved.mp4");
+        Assert.Equal(
+            ReplayState.Faulted,
+            faultedAfterSave.State,
+            "Save completion overwrote a terminal capture fault.");
+        Assert.Equal(
+            faulted.AvailableDuration,
+            faultedAfterSave.AvailableDuration,
+            "Save completion rewrote the faulted buffer duration.");
+        Assert.Equal(
+            faulted.BufferBytes,
+            faultedAfterSave.BufferBytes,
+            "Save completion rewrote the faulted buffer size.");
+        Assert.Equal(
+            faulted.Message,
+            faultedAfterSave.Message,
+            "Save completion replaced the terminal fault diagnostic.");
+        Assert.Equal(
+            @"C:\Clips\saved.mp4",
+            faultedAfterSave.LastSavedPath,
+            "Save completion did not preserve the successful export path.");
+
+        var stopped = faulted with
+        {
+            State = ReplayState.Stopped,
+            Message = "stopped",
+            LastSavedPath = @"C:\Clips\previous.mp4"
+        };
+        var stoppedAfterFailedSave = ReplayBufferService.BuildPostSaveSnapshot(
+            stopped,
+            lastSavedPath: null);
+        Assert.Equal(
+            stopped,
+            stoppedAfterFailedSave,
+            "A failed save changed an already stopped replay snapshot.");
+
+        var awaiter = ReplayBufferService.SwitchToThreadPool().GetAwaiter();
+        Assert.True(
+            !awaiter.IsCompleted,
+            "The replay snapshot scheduler can complete inline on the caller thread.");
+        var continuation = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        awaiter.UnsafeOnCompleted(
+            () => continuation.TrySetResult(Thread.CurrentThread.IsThreadPoolThread));
+        Assert.True(
+            await continuation.Task
+                .WaitAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(false),
+            "The replay segment snapshot continuation did not move to the thread pool.");
+    }
+
     private static async Task TestCaptureRuntimeJournalAsync()
     {
         var testDirectory = CreateTestDirectory();
@@ -2472,6 +2854,31 @@ internal static class Program
                 .WaitAsync(TimeSpan.FromSeconds(2))
                 .ConfigureAwait(false);
             await service.DisposeAsync().ConfigureAwait(false);
+
+            Assert.True(
+                ReplayBufferService.ShouldContinueCurrentSessionCleanup(
+                    directoriesInspected: 0,
+                    filesDeleted: 0,
+                    elapsed: TimeSpan.Zero),
+                "Current-session crash cleanup rejected an empty maintenance pass.");
+            Assert.True(
+                !ReplayBufferService.ShouldContinueCurrentSessionCleanup(
+                    ReplayBufferService.MaximumCurrentSessionCleanupDirectoryCandidatesPerRun,
+                    filesDeleted: 0,
+                    elapsed: TimeSpan.Zero),
+                "Current-session crash cleanup exceeded its directory bound.");
+            Assert.True(
+                !ReplayBufferService.ShouldContinueCurrentSessionCleanup(
+                    directoriesInspected: 0,
+                    ReplayBufferService.MaximumCurrentSessionCleanupFilesPerRun,
+                    elapsed: TimeSpan.Zero),
+                "Current-session crash cleanup exceeded its file bound.");
+            Assert.True(
+                !ReplayBufferService.ShouldContinueCurrentSessionCleanup(
+                    directoriesInspected: 0,
+                    filesDeleted: 0,
+                    ReplayBufferService.CurrentSessionCleanupTimeBudget),
+                "Current-session crash cleanup exceeded its elapsed-time bound.");
 
             var oneHourReady = new ReplayStateSnapshot(
                 ReplayState.Ready,
@@ -2706,6 +3113,24 @@ internal static class Program
             Assert.True(
                 Directory.Exists(staleRoot),
                 "Fail-closed ownership cleanup removed inactive capture data.");
+
+            using (var cancelledCleanup = new CancellationTokenSource())
+            {
+                cancelledCleanup.Cancel();
+                Assert.Equal(
+                    0,
+                    ReplayBufferService.CleanupInactiveWindowsSessionBufferRoots(
+                        bufferParent,
+                        currentRoot,
+                        utcNow,
+                        new HashSet<int> { 3 },
+                        ownershipEstablished: true,
+                        cancellationToken: cancelledCleanup.Token),
+                    "Cancelled startup maintenance continued deleting inactive-session data.");
+            }
+            Assert.True(
+                Directory.Exists(staleRoot),
+                "Cancelled startup maintenance deleted data before live capture.");
 
             Assert.Equal(
                 1,
@@ -3607,6 +4032,7 @@ internal static class Program
             runner,
             degradedCacheInitialDuration: TimeSpan.FromSeconds(10),
             degradedCacheMaximumDuration: TimeSpan.FromSeconds(20),
+            positiveCacheDuration: TimeSpan.FromSeconds(30),
             getUtcNow: () => utcNow);
 
         var first = await probe.SelectAsync(
@@ -3617,6 +4043,10 @@ internal static class Program
             DesktopCaptureBackend.Gdi,
             first.Strategy.CaptureBackend,
             "The permanent-fallback regression must begin on GDI.");
+        Assert.Equal(
+            utcNow + TimeSpan.FromSeconds(10),
+            first.CacheExpiresAtUtc,
+            "The degraded selection did not expose its actual cache expiry to the replay service.");
         var firstProbeCalls = runner.CallCount;
 
         var rapidRestart = await probe.SelectAsync(
@@ -3699,6 +4129,10 @@ internal static class Program
         Assert.True(
             runner.CallCount > maximumBackoffProbeCalls,
             "Recovery after degraded-cache expiry did not run a fresh capability probe.");
+        Assert.Equal(
+            utcNow + TimeSpan.FromSeconds(30),
+            recovered.CacheExpiresAtUtc,
+            "A verified WGC result did not receive a bounded positive-cache lifetime.");
 
         var recoveredProbeCalls = runner.CallCount;
         _ = await probe.SelectAsync(
@@ -3709,6 +4143,55 @@ internal static class Program
             recoveredProbeCalls,
             runner.CallCount,
             "A verified WGC recovery was not promoted to the stable positive cache.");
+
+        utcNow += TimeSpan.FromSeconds(29);
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.Equal(
+            recoveredProbeCalls,
+            runner.CallCount,
+            "The bounded positive cache expired before its configured lifetime.");
+        utcNow += TimeSpan.FromSeconds(1);
+        var refreshedPositive = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > recoveredProbeCalls,
+            "A verified WGC capability remained cached forever.");
+        Assert.Equal(
+            DesktopCaptureBackend.WindowsGraphicsCapture,
+            refreshedPositive.Strategy.CaptureBackend,
+            "The fresh positive-cache probe lost a still-working WGC path.");
+
+        var refreshedPositiveProbeCalls = runner.CallCount;
+        Assert.True(
+            !probe.Invalidate(
+                @"C:\Test\ffmpeg.exe",
+                differentConfiguration,
+                refreshedPositive.Strategy),
+            "Capability invalidation removed a different configuration key.");
+        Assert.True(
+            !probe.Invalidate(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                VideoEncodingStrategy.SoftwareGdi),
+            "Capability invalidation removed a cache entry for a different strategy.");
+        Assert.True(
+            probe.Invalidate(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                refreshedPositive.Strategy),
+            "The exact failed capability cache entry was not invalidated.");
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > refreshedPositiveProbeCalls,
+            "A launch-failure invalidation did not force one fresh capability probe.");
 
         var blockingRunner = new BlockingProbeRunner(arguments =>
         {
@@ -4830,6 +5313,11 @@ internal static class Program
         try
         {
             using var service = new SettingsService(testDirectory);
+            var missing = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.Missing,
+                missing.Outcome,
+                "An absent settings file must be reported separately from a read failure.");
             var expected = new AppSettings
             {
                 ReplaySeconds = 600,
@@ -4854,7 +5342,12 @@ internal static class Program
             };
 
             await service.SaveAsync(expected).ConfigureAwait(false);
-            var actual = await service.LoadAsync().ConfigureAwait(false);
+            var loaded = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.Loaded,
+                loaded.Outcome,
+                "A valid settings file must report a successful load.");
+            var actual = loaded.Settings;
 
             Assert.True(File.Exists(service.SettingsPath), "The settings file was not created.");
             Assert.Equal(expected.ReplaySeconds, actual.ReplaySeconds, "Replay duration did not roundtrip.");
@@ -4915,7 +5408,12 @@ internal static class Program
             using var service = new SettingsService(testDirectory);
             await File.WriteAllTextAsync(service.SettingsPath, "{ this is not valid json").ConfigureAwait(false);
 
-            var settings = await service.LoadAsync().ConfigureAwait(false);
+            var load = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.Invalid,
+                load.Outcome,
+                "Malformed JSON must be classified as invalid, not as a transient read failure.");
+            var settings = load.Settings;
             Assert.Equal(120, settings.ReplaySeconds, "Malformed JSON should fall back to defaults.");
             Assert.Equal("1080p", settings.ResolutionId, "Malformed JSON should fall back to defaults.");
         }
@@ -4937,7 +5435,12 @@ internal static class Program
                 $"{{\"replaySeconds\":30,\"padding\":\"{new string('a', 1024 * 1024)}\"}}";
             await File.WriteAllTextAsync(service.SettingsPath, oversizedButValidJson).ConfigureAwait(false);
 
-            var settings = await service.LoadAsync().ConfigureAwait(false);
+            var load = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.Invalid,
+                load.Outcome,
+                "Oversized settings must be classified as invalid.");
+            var settings = load.Settings;
             Assert.Equal(120, settings.ReplaySeconds, "Settings larger than 1 MiB must be ignored before parsing.");
         }
         finally
@@ -4964,11 +5467,26 @@ internal static class Program
                 FileAccess.ReadWrite,
                 FileShare.None);
 
-            var settings = await service.LoadAsync().ConfigureAwait(false);
+            var load = await service.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.TransientFailure,
+                load.Outcome,
+                "A temporary file lock must remain distinguishable from an explicit preference.");
+            var settings = load.Settings;
             Assert.Equal(
                 120,
                 settings.ReplaySeconds,
                 "A temporarily locked settings file should fall back to defaults.");
+
+            var collisionDirectory = Path.Combine(testDirectory, "PathCollision");
+            Directory.CreateDirectory(collisionDirectory);
+            using var collisionService = new SettingsService(collisionDirectory);
+            Directory.CreateDirectory(collisionService.SettingsPath);
+            var collisionLoad = await collisionService.LoadAsync().ConfigureAwait(false);
+            Assert.Equal(
+                SettingsLoadOutcome.TransientFailure,
+                collisionLoad.Outcome,
+                "An inaccessible settings path must not be mistaken for a missing file.");
         }
         finally
         {
