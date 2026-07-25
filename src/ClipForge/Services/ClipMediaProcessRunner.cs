@@ -13,13 +13,20 @@ internal readonly record struct ClipMediaProcessResult(
     public bool Succeeded => !TimedOut && ExitCode == 0;
 }
 
+internal enum ClipMediaProcessPriority
+{
+    Background,
+    Interactive
+}
+
 internal interface IClipMediaProcessRunner
 {
     Task<ClipMediaProcessResult> RunAsync(
         string executablePath,
         IReadOnlyList<string> arguments,
         TimeSpan timeout,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        ClipMediaProcessPriority priority = ClipMediaProcessPriority.Background);
 }
 
 /// <summary>
@@ -28,13 +35,17 @@ internal interface IClipMediaProcessRunner
 internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
 {
     private const int MaximumCapturedCharacters = 64 * 1024;
-    private static readonly SemaphoreSlim AuxiliaryProcessGate = new(1, 1);
+    // Each owning service keeps its own serialized lane. A static application-
+    // wide gate made a foreground trim wait behind an unrelated thumbnail or
+    // metadata probe, sometimes for the full helper timeout.
+    private readonly SemaphoreSlim _processGate = new(1, 1);
 
     public async Task<ClipMediaProcessResult> RunAsync(
         string executablePath,
         IReadOnlyList<string> arguments,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ClipMediaProcessPriority priority = ClipMediaProcessPriority.Background)
     {
         if (timeout <= TimeSpan.Zero)
         {
@@ -42,19 +53,20 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        await AuxiliaryProcessGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _processGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             return await RunCoreAsync(
                     executablePath,
                     arguments,
                     timeout,
-                    cancellationToken)
+                    cancellationToken,
+                    priority)
                 .ConfigureAwait(false);
         }
         finally
         {
-            AuxiliaryProcessGate.Release();
+            _processGate.Release();
         }
     }
 
@@ -62,7 +74,8 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
         string executablePath,
         IReadOnlyList<string> arguments,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ClipMediaProcessPriority priority)
     {
         using var process = new Process
         {
@@ -75,9 +88,13 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
             throw new Win32Exception("The media helper process could not be started.");
         }
 
-        // Only one auxiliary helper runs at once and it stays at Idle priority,
-        // below both the foreground game and ClipForge's live capture process.
-        _ = ProcessTuning.TryApplyAuxiliaryMediaPriority(process);
+        using var processJob = AttachProcessLifetime(process);
+        // Background discovery/thumbnail work stays at Idle. A user-requested
+        // trim runs BelowNormal so it finishes promptly without outranking the
+        // foreground game or live capture.
+        _ = priority == ClipMediaProcessPriority.Interactive
+            ? ProcessTuning.TryApplyLowImpactPriority(process)
+            : ProcessTuning.TryApplyAuxiliaryMediaPriority(process);
 
         var outputTask = ReadBoundedAsync(process.StandardOutput);
         var errorTask = ReadBoundedAsync(process.StandardError);
@@ -109,6 +126,43 @@ internal sealed class ClipMediaProcessRunner : IClipMediaProcessRunner
             standardOutput,
             standardError,
             timedOut);
+    }
+
+    private static CaptureProcessJob? AttachProcessLifetime(Process process)
+    {
+        try
+        {
+            return CaptureProcessJob.Attach(process);
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or Win32Exception)
+        {
+            var processHasExited = false;
+            try
+            {
+                processHasExited = process.HasExited;
+            }
+            catch (Exception statusException) when (
+                statusException is InvalidOperationException or Win32Exception)
+            {
+                // Preserve the original ownership failure below.
+            }
+
+            if (CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                    exception,
+                    processHasExited))
+            {
+                return null;
+            }
+
+            TryKill(process);
+            throw;
+        }
+        catch
+        {
+            TryKill(process);
+            throw;
+        }
     }
 
     internal static ProcessStartInfo CreateStartInfo(

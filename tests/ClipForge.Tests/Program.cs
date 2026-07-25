@@ -48,6 +48,7 @@ internal static class Program
             ("FFmpeg capability priority", TestEncoderCapabilityPriorityAsync),
             ("FFmpeg diagnostic prioritization", TestCaptureDiagnosticPriorityAsync),
             ("FFmpeg concat arguments", TestConcatArgumentsAsync),
+            ("Replay export timeline validation", TestReplayExportTimelineValidationAsync),
             ("FFmpeg trim arguments", TestTrimArgumentsAsync),
             ("Trim range and output naming", TestTrimRangeAndNamingAsync),
             ("Configured FFmpeg discovery", TestConfiguredFfmpegDiscoveryAsync),
@@ -411,6 +412,17 @@ internal static class Program
                 clipCount: 4,
                 missingThumbnailCount: 2),
             "A foreground steady replay may hydrate already validated recent cards.");
+        Assert.True(
+            MainWindow.ShouldHydrateRecentClipThumbnails(
+                isClosing: false,
+                isVisible: true,
+                isActive: true,
+                captureCritical: false,
+                replayServiceRunning: false,
+                stopped,
+                clipCount: 4,
+                missingThumbnailCount: 2),
+            "A foreground stopped session must retry transiently missing thumbnails.");
 
         (bool Closing, bool Visible, bool Active, bool Critical, bool Running, ReplayState State, int Clips, int Missing)[]
             blockedHydrationCases =
@@ -467,6 +479,12 @@ internal static class Program
                 presentationSuspended: false,
                 trimInProgress: false),
             "The Library may refresh after replay and other foreground work have stopped.");
+        Assert.True(
+            LibraryWindow.ShouldSuppressAutomaticRefresh(
+                replayRunning: false,
+                presentationSuspended: false,
+                trimInProgress: true),
+            "Library helpers must stay deferred while the trim editor or export owns the clip.");
 
         return Task.CompletedTask;
     }
@@ -694,6 +712,29 @@ internal static class Program
                 replayRunning: false,
                 beginTrimWhenReady: false),
             "Normal Library browsing may preload the selected paused clip.");
+        Assert.True(
+            LibraryWindow.ShouldOpenRequestedTrimDirectly(
+                isLoaded: true,
+                isVisible: true,
+                isActive: true,
+                presentationSuspended: false),
+            "An existing foreground Library must open an identity-bound trim request without a discovery pass.");
+        foreach (var state in new[]
+                 {
+                     (Loaded: false, Visible: true, Active: true, Suspended: false),
+                     (Loaded: true, Visible: false, Active: true, Suspended: false),
+                     (Loaded: true, Visible: true, Active: false, Suspended: false),
+                     (Loaded: true, Visible: true, Active: true, Suspended: true)
+                 })
+        {
+            Assert.True(
+                !LibraryWindow.ShouldOpenRequestedTrimDirectly(
+                    state.Loaded,
+                    state.Visible,
+                    state.Active,
+                    state.Suspended),
+                $"Unsafe direct trim open was accepted for {state}.");
+        }
 
         var requestedPath = @"C:\Clips\Clip_2026-07-13_15-00-00.mp4";
         Assert.True(
@@ -936,7 +977,7 @@ internal static class Program
             arguments.Any(argument => argument.Contains("amix=inputs=2", StringComparison.Ordinal)),
             "Two selected audio endpoints must be mixed.");
         Assert.Equal(
-            "scale=1280:720:flags=fast_bilinear,format=yuv420p",
+            "scale=1280:720:flags=fast_bilinear,format=yuv420p,setpts=PTS-STARTPTS",
             GetArgumentAfter(arguments, "-vf"),
             "Fixed-resolution GDI capture must downscale directly without a padded canvas.");
         Assert.True(
@@ -989,7 +1030,7 @@ internal static class Program
             [],
             @"C:\Buffer");
         Assert.Equal(
-            "null,format=yuv420p",
+            "null,format=yuv420p,setpts=PTS-STARTPTS",
             GetArgumentAfter(sourceArguments, "-vf"),
             "Source/native GDI capture must remain a no-resize path.");
 
@@ -1105,6 +1146,23 @@ internal static class Program
                 () => CaptureProcessJob.Attach(currentProcess),
                 "The job helper must refuse to attach the ClipForge process itself.");
         }
+
+        Assert.True(
+            CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                new InvalidOperationException("process exited during attachment"),
+                processHasExited: true) &&
+            CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                new System.ComponentModel.Win32Exception(6),
+                processHasExited: true),
+            "Expected process-exit races must be benign for both supported ownership failures.");
+        Assert.True(
+            !CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                new InvalidOperationException("ownership failed while process remained alive"),
+                processHasExited: false) &&
+            !CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                new IOException("unexpected ownership failure"),
+                processHasExited: true),
+            "Live-process or unexpected ownership failures must remain fatal.");
 
         var pingPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.System),
@@ -2057,10 +2115,10 @@ internal static class Program
                     @"C:\Buffer");
                 var gdiFilter = GetArgumentAfter(gdiArguments, "-vf") ?? string.Empty;
                 var expectedGdiFilter = expected.RequiresScaling
-                    ? $"scale={expected.Width}:{expected.Height}:flags=fast_bilinear,format=yuv420p"
+                    ? $"scale={expected.Width}:{expected.Height}:flags=fast_bilinear,format=yuv420p,setpts=PTS-STARTPTS"
                     : sourceWidth % 2 == 0 && sourceHeight % 2 == 0
-                        ? "null,format=yuv420p"
-                        : "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear,format=yuv420p";
+                        ? "null,format=yuv420p,setpts=PTS-STARTPTS"
+                        : "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear,format=yuv420p,setpts=PTS-STARTPTS";
                 Assert.Equal(expectedGdiFilter, gdiFilter,
                     $"{context} built the wrong GDI geometry filter.");
                 Assert.True(!gdiFilter.Contains("pad=", StringComparison.Ordinal),
@@ -2213,7 +2271,9 @@ internal static class Program
         Assert.ContainsSequence(nvenc, "-rc-lookahead", "0", "-surfaces", "4", "-bf", "0");
         Assert.ContainsSequence(nvenc, "-forced-idr", "1");
         Assert.True(
-            nvenc.Any(argument => argument.EndsWith("format=nv12", StringComparison.Ordinal)),
+            nvenc.Any(argument => argument.EndsWith(
+                "format=nv12,setpts=PTS-STARTPTS",
+                StringComparison.Ordinal)),
             "GDI hardware capture should convert frames to bounded NV12 input.");
 
         var quickSync = FfmpegArgumentBuilder.BuildCaptureArguments(
@@ -2265,6 +2325,7 @@ internal static class Program
         Assert.True(
             !graphicsNvenc.Any(argument => argument.Contains("hwdownload", StringComparison.Ordinal)),
             "Direct graphics capture should keep frames on the GPU.");
+        Assert.ContainsSequence(graphicsNvenc, "-vf", "setpts=PTS-STARTPTS");
 
         var nativeFullHdConfiguration = configuration with
         {
@@ -2334,6 +2395,57 @@ internal static class Program
                 "hwdownload,format=bgra,format=nv12",
                 StringComparison.Ordinal)),
             "Quick Sync graphics capture must use its supported NV12 system-memory format.");
+        Assert.ContainsSequence(
+            graphicsQsvProbe,
+            "-nostats",
+            "-stats_period", "0.25",
+            "-progress", "pipe:1");
+        Assert.ContainsSequence(
+            graphicsQsvProbe,
+            "-vf",
+            "setpts=PTS-STARTPTS",
+            "-frames:v",
+            (configuration.FramesPerSecond * FfmpegArgumentBuilder.ScaledGraphicsProbeSeconds)
+                .ToString(CultureInfo.InvariantCulture),
+            "-an");
+        Assert.True(
+            FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                graphicsQsvProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(2.5),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(5.5)),
+                out _),
+            "A scaled graphics probe sustaining about 60 FPS after startup was rejected.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                graphicsQsvProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.1),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(6.1)),
+                out var slowProbeDiagnostic) &&
+            slowProbeDiagnostic.Contains("required minimum", StringComparison.Ordinal),
+            "A scaled graphics probe sustaining about 30 FPS was accepted.");
+        Assert.True(
+            FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                graphicsQsvProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(5),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(8)),
+                out _),
+            "Legitimate D3D startup time incorrectly reduced the sustained cadence result.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                graphicsQsvProbe,
+                observation: null,
+                out var missingProgressDiagnostic) &&
+            missingProgressDiagnostic.Contains("frame-progress", StringComparison.Ordinal),
+            "A scaled graphics probe without progress evidence was accepted.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.CapturePriority,
             "Capture processes should yield CPU time to the foreground game.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.HardwareCapturePriority,
@@ -2342,6 +2454,27 @@ internal static class Program
             GraphicsSchedulingPriorityClass.BelowNormal,
             ProcessTuning.CaptureGraphicsPriority,
             "WGC, scaling and hardware encoding must yield GPU scheduling to DWM and the game.");
+        var wgcStrategy = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.WindowsGraphicsCapture);
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.Normal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                wgcStrategy,
+                captureOutputRequiresScaling: true),
+            "Scaled WGC must keep enough GPU scheduling priority to avoid game-time scaler starvation.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                wgcStrategy,
+                captureOutputRequiresScaling: false),
+            "Native Source WGC should retain the low-impact GPU policy.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: true),
+            "GDI capture must not opt into the scaled WGC GPU policy.");
 
         return Task.CompletedTask;
     }
@@ -2609,6 +2742,152 @@ internal static class Program
             TimeSpan.Zero,
             TimeSpan.FromSeconds(30));
         Assert.ContainsSequence(remuxArguments, "-c", "copy", "-avoid_negative_ts", "make_zero");
+        Assert.True(
+            !remuxArguments.Contains("-movflags", StringComparer.Ordinal) &&
+            !remuxArguments.Contains("+faststart", StringComparer.Ordinal),
+            "A local replay remux must not rewrite the whole MP4 for faststart.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestReplayExportTimelineValidationAsync()
+    {
+        var validationArguments = ReplayBufferService.BuildExportValidationArguments(
+            @"C:\Clips\clip.partial.mp4");
+        Assert.ContainsSequence(
+            validationArguments,
+            "-show_entries",
+            "stream=codec_type,start_time,duration,avg_frame_rate,r_frame_rate,nb_frames:format=duration");
+        Assert.Equal(
+            @"C:\Clips\clip.partial.mp4",
+            validationArguments[^1],
+            "The validation input path must remain one exact argument.");
+
+        const string healthy = """
+            {
+              "streams": [
+                {
+                  "codec_type": "video",
+                  "r_frame_rate": "60/1",
+                  "avg_frame_rate": "10800000/179999",
+                  "start_time": "0.000000",
+                  "duration": "179.999000",
+                  "nb_frames": "10800"
+                },
+                {
+                  "codec_type": "audio",
+                  "start_time": "0.005000",
+                  "duration": "180.010500"
+                }
+              ],
+              "format": { "duration": "180.015500" }
+            }
+            """;
+        Assert.True(
+            ReplayBufferService.TryValidateExportProbe(
+                healthy,
+                TimeSpan.FromSeconds(180),
+                60,
+                expectedAudio: true,
+                out var healthyFailure),
+            $"A healthy export was rejected: {healthyFailure}");
+
+        const string actualCorruptRenewalClip = """
+            {
+              "streams": [
+                {
+                  "codec_type": "video",
+                  "r_frame_rate": "60/1",
+                  "avg_frame_rate": "2159800/29061",
+                  "start_time": "34.699000",
+                  "duration": "145.305000",
+                  "nb_frames": "10799"
+                },
+                {
+                  "codec_type": "audio",
+                  "start_time": "0.000000",
+                  "duration": "179.999500"
+                }
+              ],
+              "format": { "duration": "180.004000" }
+            }
+            """;
+        Assert.True(
+            !ReplayBufferService.TryValidateExportProbe(
+                actualCorruptRenewalClip,
+                TimeSpan.FromSeconds(180),
+                60,
+                expectedAudio: true,
+                out var corruptFailure) &&
+            corruptFailure.Contains("begins at", StringComparison.Ordinal),
+            "The real late-video renewal corruption must be rejected before publication.");
+
+        const string videoOnly = """
+            {
+              "streams": [
+                {
+                  "codec_type": "video",
+                  "r_frame_rate": "60/1",
+                  "avg_frame_rate": "60/1",
+                  "start_time": "0",
+                  "duration": "30",
+                  "nb_frames": "1800"
+                }
+              ],
+              "format": { "duration": "30" }
+            }
+            """;
+        Assert.True(
+            !ReplayBufferService.TryValidateExportProbe(
+                videoOnly,
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: true,
+                out var missingAudioFailure) &&
+            missingAudioFailure.Contains("audio", StringComparison.OrdinalIgnoreCase),
+            "An expected audio stream must not disappear silently.");
+        Assert.True(
+            ReplayBufferService.TryValidateExportProbe(
+                videoOnly,
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: false,
+                out _),
+            "A deliberately silent capture should validate without audio.");
+        Assert.True(
+            !ReplayBufferService.TryValidateExportProbe(
+                "[]",
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: false,
+                out _),
+            "A non-object ffprobe root must fail closed without throwing.");
+        Assert.True(
+            !ReplayBufferService.TryValidateExportProbe(
+                "{not-json}",
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: false,
+                out _),
+            "Malformed ffprobe JSON must fail closed.");
+
+        Assert.True(
+            ReplayBufferService.ShouldRetainCompletedSegments(
+                preserveCompletedSegments: true,
+                reachedSegmentBoundary: true),
+            "A healthy boundary-aligned maintenance renewal should retain the ring.");
+        Assert.True(
+            !ReplayBufferService.ShouldRetainCompletedSegments(
+                preserveCompletedSegments: true,
+                reachedSegmentBoundary: false) &&
+            !ReplayBufferService.ShouldRetainCompletedSegments(
+                preserveCompletedSegments: false,
+                reachedSegmentBoundary: true),
+            "Unaligned and health-triggered renewals must invalidate the old generation.");
+        Assert.True(
+            !ReplayBufferService.IsCaptureSegmentTrusted(42, 42) &&
+            ReplayBufferService.IsCaptureSegmentTrusted(43, 42),
+            "Only the startup head of each capture generation should be quarantined.");
 
         return Task.CompletedTask;
     }
@@ -2647,6 +2926,55 @@ internal static class Program
                 !arguments.Contains("copy", StringComparer.Ordinal),
                 "Frame-accurate trim must re-encode rather than copy keyframe-bounded packets.");
 
+            var fastCopyArguments = FfmpegArgumentBuilder.BuildTrimArguments(
+                inputPath,
+                outputPath,
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(4),
+                includeAudio: true,
+                framesPerSecond: 60,
+                VideoEncodingStrategy.SoftwareGdi,
+                replayCoexisting: true,
+                fastStreamCopyVerified: true);
+            Assert.ContainsSequence(fastCopyArguments, "-ss", "2", "-i", inputPath, "-t", "4");
+            Assert.ContainsSequence(fastCopyArguments, "-map", "0:v:0", "-map", "0:a:0?");
+            Assert.ContainsSequence(fastCopyArguments, "-c", "copy");
+            Assert.True(
+                !fastCopyArguments.Contains("-c:v", StringComparer.Ordinal),
+                "A GOP-aligned trim unexpectedly selected a video encoder.");
+            Assert.True(
+                !fastCopyArguments.Contains("-movflags", StringComparer.Ordinal),
+                "A fast stream-copy trim must not pay for MP4 faststart relocation.");
+            Assert.True(
+                !fastCopyArguments.Contains("-readrate", StringComparer.Ordinal) &&
+                !fastCopyArguments.Contains("-threads", StringComparer.Ordinal),
+                "A packet-only trim must not inherit software replay throttling.");
+            Assert.True(
+                ClipTrimService.TryValidateKeyframeProbe(
+                    """
+                    {"packets":[{"pts_time":"2.000000","flags":"K__"}]}
+                    """,
+                    TimeSpan.FromSeconds(2),
+                    framesPerSecond: 60),
+                "An exact source keyframe was not accepted for fast trim.");
+            Assert.True(
+                !ClipTrimService.TryValidateKeyframeProbe(
+                    """
+                    {"packets":[{"pts_time":"1.966667","flags":"K__"},{"pts_time":"2.000000","flags":"___"}]}
+                    """,
+                    TimeSpan.FromSeconds(2),
+                    framesPerSecond: 60),
+                "Fast trim accepted a non-key packet at the requested start.");
+            var keyframeProbeArguments = ClipTrimService.BuildKeyframeProbeArguments(
+                inputPath,
+                TimeSpan.FromSeconds(2),
+                framesPerSecond: 60);
+            Assert.ContainsSequence(
+                keyframeProbeArguments,
+                "-select_streams", "v:0",
+                "-read_intervals", "2%+0.1",
+                "-show_entries", "packet=pts_time,flags");
+
             var silentArguments = FfmpegArgumentBuilder.BuildTrimArguments(
                 inputPath,
                 outputPath,
@@ -2665,7 +2993,7 @@ internal static class Program
                 inputPath,
                 outputPath,
                 TimeSpan.FromSeconds(2),
-                TimeSpan.FromSeconds(4),
+                TimeSpan.FromSeconds(3),
                 includeAudio: true,
                 framesPerSecond: 60,
                 VideoEncodingStrategy.SoftwareGdi,
@@ -2694,7 +3022,26 @@ internal static class Program
             Assert.True(
                 !replayCoexistingArguments.Any(argument =>
                     argument is "h264_nvenc" or "h264_qsv" or "h264_amf"),
-                "Replay-coexisting trim must not claim a hardware encoder used by live capture.");
+                "The software fallback unexpectedly selected a hardware encoder.");
+
+            var hardwareReplayArguments = FfmpegArgumentBuilder.BuildTrimArguments(
+                inputPath,
+                outputPath,
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(3),
+                includeAudio: true,
+                framesPerSecond: 60,
+                new VideoEncodingStrategy(VideoEncoderKind.NvidiaNvenc, DesktopCaptureBackend.Gdi),
+                replayCoexisting: true);
+            Assert.ContainsSequence(hardwareReplayArguments, "-c:v", "h264_nvenc");
+            Assert.True(
+                !hardwareReplayArguments.Contains("-readrate", StringComparer.Ordinal) &&
+                !hardwareReplayArguments.Contains("-filter_threads", StringComparer.Ordinal) &&
+                !hardwareReplayArguments.Contains("-threads", StringComparer.Ordinal),
+                "A validated replay-time hardware encoder inherited software throttling.");
+            Assert.True(
+                !hardwareReplayArguments.Contains("copy", StringComparer.Ordinal),
+                "A trim with only one GOP-aligned bound must remain frame-accurate.");
 
             Assert.Throws<ArgumentOutOfRangeException>(
                 () => FfmpegArgumentBuilder.BuildTrimArguments(
@@ -4040,33 +4387,188 @@ internal static class Program
                 "The successful trim did not use a strict Trimmed filename.");
             Assert.Equal(1, successRunner.TrimRunCount,
                 "A software trim should launch exactly one export after hardware probes fail.");
+            Assert.True(
+                successRunner.Invocations.All(invocation =>
+                    invocation.Priority == ClipMediaProcessPriority.Interactive),
+                "User-requested trim probes/exports must not inherit background Idle priority.");
             Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
                 "A successful trim left a partial output behind.");
 
-            var replayCoexistingRunner = new FakeTrimMediaProcessRunner();
-            var replayCoexistingService = new ClipTrimService(
+            var replayHardwareRunner = new FakeTrimMediaProcessRunner
+            {
+                AvailableHardwareEncoder = VideoEncoderKind.NvidiaNvenc
+            };
+            var replayHardwareService = new ClipTrimService(
                 () => ffmpegPath,
                 () => ffprobePath,
-                replayCoexistingRunner);
-            var replayCoexisting = await replayCoexistingService.TrimAsync(
+                replayHardwareRunner);
+            var replayHardware = await replayHardwareService.TrimAsync(
                     clipsDirectory,
                     source,
                     TimeSpan.FromSeconds(2),
                     TimeSpan.FromSeconds(5),
                     ClipTrimExecutionMode.ReplayCoexisting)
                 .ConfigureAwait(false);
-            Assert.Equal(ClipTrimStatus.Succeeded, replayCoexisting.Status,
-                $"Replay-coexisting trim failed: {replayCoexisting.Message}");
-            Assert.Equal(1, replayCoexistingRunner.TrimRunCount,
-                "Replay-coexisting trim must launch one bounded software export.");
-            var replayFfmpegInvocations = replayCoexistingRunner.Invocations
+            Assert.Equal(ClipTrimStatus.Succeeded, replayHardware.Status,
+                $"Hardware replay-coexisting trim failed: {replayHardware.Message}");
+            Assert.Equal(1, replayHardwareRunner.TrimRunCount,
+                "A validated hardware replay trim should launch one export.");
+            var replayHardwareFfmpegInvocations = replayHardwareRunner.Invocations
                 .Where(invocation => Path.GetFileName(invocation.ExecutablePath).Equals(
                     "ffmpeg.exe",
                     StringComparison.OrdinalIgnoreCase))
                 .ToArray();
-            Assert.Equal(1, replayFfmpegInvocations.Length,
-                "Replay-coexisting trim must skip all hardware encoder probes.");
-            var replayTrimArguments = replayFfmpegInvocations[0].Arguments;
+            Assert.Equal(2, replayHardwareFfmpegInvocations.Length,
+                "A replay-time hardware trim should validate the selected encoder once before export.");
+            Assert.True(
+                replayHardwareFfmpegInvocations[0].Arguments.Contains("lavfi", StringComparer.Ordinal),
+                "The replay-time hardware encoder was not capability-probed.");
+            var replayHardwareTrimArguments = replayHardwareFfmpegInvocations[1].Arguments;
+            Assert.ContainsSequence(replayHardwareTrimArguments, "-c:v", "h264_nvenc");
+            Assert.True(
+                !replayHardwareTrimArguments.Contains("-readrate", StringComparer.Ordinal) &&
+                !replayHardwareTrimArguments.Contains("-filter_threads", StringComparer.Ordinal) &&
+                !replayHardwareTrimArguments.Contains("-threads", StringComparer.Ordinal),
+                "A validated replay-time hardware trim inherited software fallback throttling.");
+
+            var fastCopyRunner = new FakeTrimMediaProcessRunner();
+            var fastCopyService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                fastCopyRunner);
+            var fastCopy = await fastCopyService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(6),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.Succeeded, fastCopy.Status,
+                $"GOP-aligned fast trim failed: {fastCopy.Message}");
+            Assert.Equal(1, fastCopyRunner.TrimRunCount,
+                "A GOP-aligned trim should launch one packet-copy export.");
+            var fastCopyFfmpegInvocations = fastCopyRunner.Invocations
+                .Where(invocation => Path.GetFileName(invocation.ExecutablePath).Equals(
+                    "ffmpeg.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            Assert.Equal(1, fastCopyFfmpegInvocations.Length,
+                "A GOP-aligned trim unexpectedly ran hardware encoder probes.");
+            var fastCopyTrimArguments = fastCopyFfmpegInvocations[0].Arguments;
+            Assert.ContainsSequence(fastCopyTrimArguments, "-c", "copy");
+            Assert.True(
+                !fastCopyTrimArguments.Contains("-movflags", StringComparer.Ordinal) &&
+                !fastCopyTrimArguments.Contains("-readrate", StringComparer.Ordinal) &&
+                !fastCopyTrimArguments.Contains("lavfi", StringComparer.Ordinal),
+                "A GOP-aligned packet copy inherited transcode-only work.");
+            Assert.True(
+                fastCopyRunner.Invocations.Any(invocation =>
+                    Path.GetFileName(invocation.ExecutablePath).Equals(
+                        "ffprobe.exe",
+                        StringComparison.OrdinalIgnoreCase) &&
+                    invocation.Arguments.Contains(
+                        "packet=pts_time,flags",
+                        StringComparer.Ordinal)),
+                "A GOP-aligned trim copied packets without first verifying its source keyframe.");
+
+            var fastCopyRetryRunner = new FakeTrimMediaProcessRunner
+            {
+                FailFirstTrimOnly = true
+            };
+            var fastCopyRetryService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                fastCopyRetryRunner);
+            var fastCopyRetry = await fastCopyRetryService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(6),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                ClipTrimStatus.Succeeded,
+                fastCopyRetry.Status,
+                "A verified packet-copy failure should retry through exact encoding.");
+            Assert.Equal(
+                2,
+                fastCopyRetryRunner.TrimRunCount,
+                "A failed packet copy should launch exactly one encoded retry.");
+            var fastCopyRetryArguments = fastCopyRetryRunner.Invocations
+                .Where(invocation =>
+                    Path.GetFileName(invocation.ExecutablePath).Equals(
+                        "ffmpeg.exe",
+                        StringComparison.OrdinalIgnoreCase) &&
+                    Path.GetFileName(invocation.Arguments[^1]).StartsWith(
+                        ".clipforge-trim-",
+                        StringComparison.OrdinalIgnoreCase))
+                .Select(invocation => invocation.Arguments)
+                .ToArray();
+            Assert.Equal(
+                2,
+                fastCopyRetryArguments.Length,
+                "The packet-copy fallback launched an unexpected number of exports.");
+            Assert.ContainsSequence(fastCopyRetryArguments[0], "-c", "copy");
+            Assert.ContainsSequence(fastCopyRetryArguments[1], "-c:v", "libx264");
+            Assert.True(
+                !fastCopyRetryArguments[1].Contains("copy", StringComparer.Ordinal),
+                "The exact fallback retained packet-copy arguments.");
+
+            var missingKeyframeRunner = new FakeTrimMediaProcessRunner
+            {
+                HasRequestedKeyframe = false,
+                AvailableHardwareEncoder = VideoEncoderKind.NvidiaNvenc
+            };
+            var missingKeyframeService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                missingKeyframeRunner);
+            var missingKeyframe = await missingKeyframeService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(6),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                ClipTrimStatus.Succeeded,
+                missingKeyframe.Status,
+                "A missing fast-copy keyframe should safely fall back to encoding.");
+            var missingKeyframeTrimArguments = missingKeyframeRunner.Invocations
+                .Where(invocation => Path.GetFileName(invocation.ExecutablePath).Equals(
+                    "ffmpeg.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                .Last()
+                .Arguments;
+            Assert.ContainsSequence(missingKeyframeTrimArguments, "-c:v", "h264_nvenc");
+            Assert.True(
+                !missingKeyframeTrimArguments.Contains("copy", StringComparer.Ordinal),
+                "A source without a keyframe at the requested start was packet-copied.");
+
+            var replaySoftwareRunner = new FakeTrimMediaProcessRunner();
+            var replaySoftwareService = new ClipTrimService(
+                () => ffmpegPath,
+                () => ffprobePath,
+                replaySoftwareRunner);
+            var replaySoftware = await replaySoftwareService.TrimAsync(
+                    clipsDirectory,
+                    source,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5),
+                    ClipTrimExecutionMode.ReplayCoexisting)
+                .ConfigureAwait(false);
+            Assert.Equal(ClipTrimStatus.Succeeded, replaySoftware.Status,
+                $"Software replay-coexisting trim failed: {replaySoftware.Message}");
+            Assert.Equal(1, replaySoftwareRunner.TrimRunCount,
+                "Replay software fallback must launch one bounded export.");
+            var replaySoftwareFfmpegInvocations = replaySoftwareRunner.Invocations
+                .Where(invocation => Path.GetFileName(invocation.ExecutablePath).Equals(
+                    "ffmpeg.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            Assert.Equal(4, replaySoftwareFfmpegInvocations.Length,
+                "Software replay fallback should follow the three failed hardware probes.");
+            var replayTrimArguments = replaySoftwareFfmpegInvocations[^1].Arguments;
             Assert.ContainsSequence(
                 replayTrimArguments,
                 "-filter_threads", "1",
@@ -4076,10 +4578,10 @@ internal static class Program
             Assert.True(
                 !replayTrimArguments.Any(argument =>
                     argument is "h264_nvenc" or "h264_qsv" or "h264_amf"),
-                "Replay-coexisting service trim claimed a live-capture hardware encoder.");
+                "The replay software fallback unexpectedly retained a hardware encoder.");
             Assert.True(
                 !replayTrimArguments.Contains("lavfi", StringComparer.Ordinal),
-                "Replay-coexisting service trim unexpectedly ran an encoder capability probe.");
+                "The final replay software export was confused with a capability probe.");
             Assert.True(!EnumerateTrimPartials(clipsDirectory).Any(),
                 "Replay-coexisting trim left a partial output behind.");
 
@@ -4868,6 +5370,40 @@ internal static class Program
                 .ConfigureAwait(false);
             Assert.Equal(0, afterTimeout.Count, "A timed-out media probe must not reach embedded playback.");
             Assert.Equal(1, timeoutRunner.Invocations.Count, "The timed-out candidate should be probed once.");
+
+            var brokenTimelineRunner = new FakeClipMediaProcessRunner
+            {
+                ProbeOutput =
+                    """
+                    {
+                      "streams": [
+                        {
+                          "codec_type": "video",
+                          "start_time": "34.699000",
+                          "duration": "145.305000",
+                          "avg_frame_rate": "25917120/348839",
+                          "r_frame_rate": "60/1"
+                        }
+                      ],
+                      "format": { "duration": "180.004000" }
+                    }
+                    """
+            };
+            var brokenTimelineService = new ClipLibraryService(
+                () => null,
+                () => probePath,
+                brokenTimelineRunner,
+                Path.Combine(testDirectory, "Cache-Broken-Timeline"),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
+            var afterBrokenTimeline = await brokenTimelineService.GetRecentClipsAsync(
+                    testDirectory,
+                    includeThumbnails: false)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                0,
+                afterBrokenTimeline.Count,
+                "A clip whose video starts late and covers only part of the container must be hidden.");
         }
         finally
         {
@@ -5186,9 +5722,13 @@ internal static class Program
 
         public bool FailTrim { get; init; }
 
+        public bool FailFirstTrimOnly { get; init; }
+
         public bool ReturnInvalidOutputMetadata { get; init; }
 
         public bool WaitForTrimCancellation { get; init; }
+
+        public VideoEncoderKind? AvailableHardwareEncoder { get; init; }
 
         public string SourceAverageFrameRate { get; init; } = "60/1";
 
@@ -5198,18 +5738,37 @@ internal static class Program
 
         public string OutputNominalFrameRate { get; init; } = "60/1";
 
+        public bool HasRequestedKeyframe { get; init; } = true;
+
         public int TrimRunCount { get; private set; }
 
         public async Task<ClipMediaProcessResult> RunAsync(
             string executablePath,
             IReadOnlyList<string> arguments,
             TimeSpan timeout,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            ClipMediaProcessPriority priority = ClipMediaProcessPriority.Background)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Invocations.Add(new Invocation(executablePath, arguments.ToArray(), timeout));
+            Invocations.Add(new Invocation(executablePath, arguments.ToArray(), timeout, priority));
             if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
             {
+                if (arguments.Contains("packet=pts_time,flags", StringComparer.Ordinal))
+                {
+                    var intervalIndex = arguments.ToList().IndexOf("-read_intervals");
+                    var interval = intervalIndex >= 0 && intervalIndex + 1 < arguments.Count
+                        ? arguments[intervalIndex + 1]
+                        : "0%+0.1";
+                    var boundary = interval.Split('%', 2)[0];
+                    var packetTime = HasRequestedKeyframe ? boundary : "0";
+                    var flags = HasRequestedKeyframe ? "K__" : "___";
+                    return new ClipMediaProcessResult(
+                        0,
+                        $"{{\"packets\":[{{\"pts_time\":\"{packetTime}\",\"flags\":\"{flags}\"}}]}}",
+                        string.Empty,
+                        false);
+                }
+
                 var mediaPath = arguments[^1];
                 var isTrimPartial = Path.GetFileName(mediaPath).StartsWith(
                     ".clipforge-trim-",
@@ -5238,9 +5797,17 @@ internal static class Program
                     ".clipforge-trim-",
                     StringComparison.OrdinalIgnoreCase))
             {
-                // Hardware encoder probes deliberately fail so the deterministic
-                // service test exercises the bounded software fallback.
-                return new ClipMediaProcessResult(1, string.Empty, "probe unavailable", false);
+                var expectedEncoder = AvailableHardwareEncoder switch
+                {
+                    VideoEncoderKind.NvidiaNvenc => "h264_nvenc",
+                    VideoEncoderKind.IntelQuickSync => "h264_qsv",
+                    VideoEncoderKind.AmdAmf => "h264_amf",
+                    _ => null
+                };
+                return expectedEncoder is not null &&
+                       arguments.Contains(expectedEncoder, StringComparer.Ordinal)
+                    ? new ClipMediaProcessResult(0, string.Empty, string.Empty, false)
+                    : new ClipMediaProcessResult(1, string.Empty, "probe unavailable", false);
             }
 
             TrimRunCount++;
@@ -5259,7 +5826,7 @@ internal static class Program
                 await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
             }
 
-            return FailTrim
+            return FailTrim || (FailFirstTrimOnly && TrimRunCount == 1)
                 ? new ClipMediaProcessResult(1, string.Empty, "scripted encoding failure", false)
                 : new ClipMediaProcessResult(0, string.Empty, string.Empty, false);
         }
@@ -5267,7 +5834,8 @@ internal static class Program
         public sealed record Invocation(
             string ExecutablePath,
             IReadOnlyList<string> Arguments,
-            TimeSpan Timeout);
+            TimeSpan Timeout,
+            ClipMediaProcessPriority Priority);
     }
 
     private sealed class FakeClipMediaProcessRunner : IClipMediaProcessRunner
@@ -5290,6 +5858,8 @@ internal static class Program
 
         public TimeSpan ProbeDelay { get; init; }
 
+        public string? ProbeOutput { get; init; }
+
         public Action<IReadOnlyList<string>>? BeforeThumbnailWrite { get; init; }
 
         public void ReleaseThumbnailGeneration() =>
@@ -5299,10 +5869,11 @@ internal static class Program
             string executablePath,
             IReadOnlyList<string> arguments,
             TimeSpan timeout,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            ClipMediaProcessPriority priority = ClipMediaProcessPriority.Background)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Invocations.Add(new Invocation(executablePath, arguments.ToArray(), timeout));
+            Invocations.Add(new Invocation(executablePath, arguments.ToArray(), timeout, priority));
 
             if (Path.GetFileName(executablePath).Equals("ffprobe.exe", StringComparison.OrdinalIgnoreCase))
             {
@@ -5322,6 +5893,7 @@ internal static class Program
                     ? new ClipMediaProcessResult(1, string.Empty, "invalid media", false)
                     : new ClipMediaProcessResult(
                         0,
+                        ProbeOutput ??
                         "{\"streams\":[{\"codec_type\":\"video\"}],\"format\":{\"duration\":\"42.5\"}}",
                         string.Empty,
                         false);
@@ -5349,7 +5921,8 @@ internal static class Program
         public sealed record Invocation(
             string ExecutablePath,
             IReadOnlyList<string> Arguments,
-            TimeSpan Timeout);
+            TimeSpan Timeout,
+            ClipMediaProcessPriority Priority);
     }
 
     private static class Assert

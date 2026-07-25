@@ -4,6 +4,32 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.9] - 2026-07-25
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- Save Clip now exports only completed, trusted segments from one capture generation, quarantines an unaligned or unhealthy generation, and validates the committed video's start time, duration, frame cadence, frame count, and audio/video alignment. A failed validation leaves no visible partial clip, while a second save request is rejected instead of queueing behind the first.
+- Fixed-preset WGC capture now probes sustained frame delivery with the exact production scaling graph and keeps scaled GPU scheduling at Normal while the capture process remains Below Normal on the CPU. A confirmed scaled-capture pacing fault falls back to Source immediately, preventing stretched/custom-resolution sessions from publishing audio-long/video-short 1080p clips.
+- Same-geometry display notifications no longer force unnecessary WGC renewals. Resume, unlock, health recovery, and other forced transitions still renew deliberately, and health recovery no longer mixes completed media from a suspect generation with the replacement process.
+- Saving no longer performs a second whole-file `faststart` pass. The bounded stream-copy export remains atomic and kill-on-close contained, so large clips become available after one media pass without leaving an orphan FFmpeg or FFprobe process.
+- Trim verifies a requested segment boundary against an actual H.264 keyframe and uses near-instant stream copy when it is safe. A rejected packet copy retries through exact encoding; other ranges retain exact boundaries through hardware encoding when available, with a safe software retry. Replay-time trims are no longer artificially paced to real time or serialized behind unrelated thumbnail work.
+- Recent clips and Library bind validated cached cards before metadata or thumbnail hydration. Missing posters retry with capped backoff, decoded posters use a bounded strong LRU cache, entering trim cancels background hydration, and an already selected Main-to-Library trim opens directly without waiting for a full library scan.
+- Clip playback keeps controls disabled until the media graph is ready, primes manual WPF playback silently, pauses before restoring audible volume, debounces trim-preview seeking, and releases a failed graph instead of retaining a stalled decoder.
+- Library discovery rejects malformed or capture-corrupted MP4 timelines before WPF playback and thumbnail generation, including a video stream that starts late, ends far before its container, or reports implausible average cadence.
+
+### Verification note
+
+- Release builds complete with zero warnings/errors, formatting and whitespace checks are clean, all 55 deterministic tests pass, and the release-payload preparation/tamper guards pass. Coverage includes generation trust, export validation, keyframe-gated trim, process priority/lifetime, corrupt-library filtering, thumbnail retry policy, and stopped/replay lifecycle behavior.
+- A real 1920x1080/60 fixed-preset WGC/NVIDIA NVENC replay produced 360 frames over 5.999 seconds at 60.01 FPS with no timestamp gap above 17 ms. Source/native 2560x1440 control, WGC process renewal, exact re-encoded trim, and aligned stream-copy trim also passed on the development PC.
+- These checks cover the reproduced failure mechanisms and real desktop capture on the development machine. They do not replace a long target-game soak across every GPU driver, fullscreen mode, stretched resolution, overlay, or mixed-refresh display configuration.
+
+## [1.9.0-beta.8] - 2026-07-20
+
 ### Fixed
 
 - Windows-sign-in autostart now validates and binds the configured 4/8/10/15 recent clips before replay suppresses automatic library discovery. Opening the foreground window can then fill missing posters from that identity-bound snapshot without repeating folder enumeration or FFprobe work, fixing the single poster-less card left by a hidden autostart session.

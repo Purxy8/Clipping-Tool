@@ -18,6 +18,7 @@ public sealed class ClipTrimService
     private const int MaximumFramesPerSecond = 240;
     private const long MinimumWorkingFreeBytes = 64L * 1024 * 1024;
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan KeyframeProbeTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan EncoderProbeTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan MinimumTrimTimeout = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan MaximumTrimTimeout = TimeSpan.FromHours(2);
@@ -291,7 +292,18 @@ public sealed class ClipTrimService
                 MidpointRounding.AwayFromZero),
             1,
             MaximumFramesPerSecond);
-        var encoder = executionMode == ClipTrimExecutionMode.ReplayCoexisting
+        var useFastStreamCopy =
+            FfmpegArgumentBuilder.CanUseFastStreamCopyTrim(
+                range.Start,
+                range.Duration) &&
+            await HasKeyframeAtAsync(
+                    ffprobePath,
+                    pinnedSource.MediaPath,
+                    range.Start,
+                    sourceMetadata.Value.NominalFramesPerSecond,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        var encoder = useFastStreamCopy
             ? VideoEncodingStrategy.SoftwareGdi
             : await SelectEncoderAsync(
                     ffmpegPath,
@@ -314,24 +326,61 @@ public sealed class ClipTrimService
                     framesPerSecond,
                     encoder,
                     executionMode,
+                    useFastStreamCopy,
                     timeout,
                     cancellationToken)
                 .ConfigureAwait(false);
 
             if (!execution.Succeeded &&
                 !execution.TimedOut &&
-                executionMode == ClipTrimExecutionMode.Standard &&
+                useFastStreamCopy)
+            {
+                // Packet copy is an optimization, not a reliability boundary.
+                // A source can still reject copy after its keyframe probe (for
+                // example because of an unexpected stream/container detail), so
+                // retry the same exact range through the normal verified encoder
+                // path before reporting a user-visible failure.
+                TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
+                useFastStreamCopy = false;
+                encoder = await SelectEncoderAsync(
+                        ffmpegPath,
+                        sourceMetadata.Value.Width,
+                        sourceMetadata.Value.Height,
+                        framesPerSecond,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                execution = await RunTrimAttemptAsync(
+                        ffmpegPath,
+                        pinnedSource.MediaPath,
+                        stagingPath,
+                        range,
+                        sourceMetadata.Value.HasAudio,
+                        framesPerSecond,
+                        encoder,
+                        executionMode,
+                        useFastStreamCopy: false,
+                        timeout,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (!execution.Succeeded &&
+                !execution.TimedOut &&
                 encoder.IsHardwareEncoder)
             {
                 TryDeleteStagingFile(pinnedSource.RootDirectoryPath, stagingPath);
                 var software = VideoEncodingStrategy.SoftwareGdi;
-                CacheEncoder(
-                    BuildEncoderCacheKey(
-                        ffmpegPath,
-                        sourceMetadata.Value.Width,
-                        sourceMetadata.Value.Height,
-                        framesPerSecond),
-                    software);
+                if (executionMode == ClipTrimExecutionMode.Standard)
+                {
+                    CacheEncoder(
+                        BuildEncoderCacheKey(
+                            ffmpegPath,
+                            sourceMetadata.Value.Width,
+                            sourceMetadata.Value.Height,
+                            framesPerSecond),
+                        software);
+                }
+
                 execution = await RunTrimAttemptAsync(
                         ffmpegPath,
                         pinnedSource.MediaPath,
@@ -341,6 +390,7 @@ public sealed class ClipTrimService
                         framesPerSecond,
                         software,
                         executionMode,
+                        useFastStreamCopy: false,
                         timeout,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -450,6 +500,7 @@ public sealed class ClipTrimService
         int framesPerSecond,
         VideoEncodingStrategy encoder,
         ClipTrimExecutionMode executionMode,
+        bool useFastStreamCopy,
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
@@ -461,12 +512,14 @@ public sealed class ClipTrimService
             includeAudio,
             framesPerSecond,
             encoder,
-            executionMode == ClipTrimExecutionMode.ReplayCoexisting);
+            executionMode == ClipTrimExecutionMode.ReplayCoexisting,
+            fastStreamCopyVerified: useFastStreamCopy);
         return await _processRunner.RunAsync(
                 ffmpegPath,
                 arguments,
                 timeout,
-                cancellationToken)
+                cancellationToken,
+                ClipMediaProcessPriority.Interactive)
             .ConfigureAwait(false);
     }
 
@@ -503,7 +556,8 @@ public sealed class ClipTrimService
                             height,
                             framesPerSecond),
                         EncoderProbeTimeout,
-                        cancellationToken)
+                        cancellationToken,
+                        ClipMediaProcessPriority.Interactive)
                     .ConfigureAwait(false);
                 if (result.Succeeded)
                 {
@@ -569,11 +623,124 @@ public sealed class ClipTrimService
                 ffprobePath,
                 BuildMediaProbeArguments(mediaPath),
                 timeout,
-                cancellationToken)
+                cancellationToken,
+                ClipMediaProcessPriority.Interactive)
             .ConfigureAwait(false);
         return result.Succeeded
             ? ParseMediaProbe(result.StandardOutput)
             : null;
+    }
+
+    private async Task<bool> HasKeyframeAtAsync(
+        string ffprobePath,
+        string mediaPath,
+        TimeSpan requestedStart,
+        double framesPerSecond,
+        CancellationToken cancellationToken)
+    {
+        var result = await _processRunner.RunAsync(
+                ffprobePath,
+                BuildKeyframeProbeArguments(mediaPath, requestedStart, framesPerSecond),
+                KeyframeProbeTimeout,
+                cancellationToken,
+                ClipMediaProcessPriority.Interactive)
+            .ConfigureAwait(false);
+        return result.Succeeded &&
+               TryValidateKeyframeProbe(
+                   result.StandardOutput,
+                   requestedStart,
+                   framesPerSecond);
+    }
+
+    internal static IReadOnlyList<string> BuildKeyframeProbeArguments(
+        string mediaPath,
+        TimeSpan requestedStart,
+        double framesPerSecond)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaPath);
+        if (requestedStart < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requestedStart));
+        }
+
+        if (!double.IsFinite(framesPerSecond) ||
+            framesPerSecond <= 0 ||
+            framesPerSecond > MaximumFramesPerSecond)
+        {
+            throw new ArgumentOutOfRangeException(nameof(framesPerSecond));
+        }
+
+        var probeWindowSeconds = Math.Max(0.1, 3 / framesPerSecond);
+        var interval = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{requestedStart.TotalSeconds:0.######}%+{probeWindowSeconds:0.######}");
+        return
+        [
+            "-v", "error",
+            "-protocol_whitelist", "file",
+            "-f", "mov",
+            "-select_streams", "v:0",
+            "-read_intervals", interval,
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "json",
+            mediaPath
+        ];
+    }
+
+    internal static bool TryValidateKeyframeProbe(
+        string output,
+        TimeSpan requestedStart,
+        double framesPerSecond)
+    {
+        if (requestedStart < TimeSpan.Zero ||
+            !double.IsFinite(framesPerSecond) ||
+            framesPerSecond <= 0 ||
+            framesPerSecond > MaximumFramesPerSecond)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(output, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 16
+            });
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("packets", out var packets) ||
+                packets.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            var toleranceSeconds = Math.Max(0.002, 1.1 / framesPerSecond);
+            foreach (var packet in packets.EnumerateArray())
+            {
+                if (packet.ValueKind != JsonValueKind.Object ||
+                    !packet.TryGetProperty("flags", out var flags) ||
+                    flags.ValueKind != JsonValueKind.String ||
+                    flags.GetString()?.Contains('K', StringComparison.Ordinal) != true ||
+                    !packet.TryGetProperty("pts_time", out var pts) ||
+                    !TryReadNonnegativeDouble(pts, out var packetSeconds))
+                {
+                    continue;
+                }
+
+                if (Math.Abs(packetSeconds - requestedStart.TotalSeconds) <= toleranceSeconds)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (Exception exception) when (
+            exception is JsonException or InvalidOperationException or FormatException)
+        {
+            return false;
+        }
     }
 
     internal static IReadOnlyList<string> BuildMediaProbeArguments(string mediaPath) =>
@@ -739,6 +906,21 @@ public sealed class ClipTrimService
             _ => double.NaN
         };
         return double.IsFinite(value) && value > 0;
+    }
+
+    private static bool TryReadNonnegativeDouble(JsonElement element, out double value)
+    {
+        value = element.ValueKind switch
+        {
+            JsonValueKind.Number when element.TryGetDouble(out var number) => number,
+            JsonValueKind.String when double.TryParse(
+                element.GetString(),
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var textNumber) => textNumber,
+            _ => double.NaN
+        };
+        return double.IsFinite(value) && value >= 0;
     }
 
     private static bool TryValidateExpectedOutput(

@@ -103,6 +103,15 @@ internal sealed class CaptureProcessJob : IDisposable
         }
     }
 
+    internal static bool IsBenignExitedProcessAttachFailure(
+        Exception exception,
+        bool processHasExited)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        return processHasExited &&
+               exception is InvalidOperationException or Win32Exception;
+    }
+
     public void Dispose()
     {
         Interlocked.Exchange(ref _jobHandle, null)?.Dispose();

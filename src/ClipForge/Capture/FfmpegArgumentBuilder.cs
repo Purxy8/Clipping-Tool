@@ -10,6 +10,7 @@ internal static class FfmpegArgumentBuilder
     internal const int ScaledVideoInputQueuePackets = 4;
     internal const int CompatibilityVideoInputQueuePackets = 8;
     internal const int AudioInputQueuePackets = 64;
+    internal const int ScaledGraphicsProbeSeconds = 3;
 
     public static IReadOnlyList<string> BuildCaptureArguments(
         CaptureConfiguration configuration,
@@ -93,8 +94,15 @@ internal static class FfmpegArgumentBuilder
                 : "nv12";
             arguments.AddRange([
                 "-vf",
-                $"{BuildVideoFilter(configuration)},format={encoderPixelFormat}"
+                $"{BuildVideoFilter(configuration)},format={encoderPixelFormat},setpts=PTS-STARTPTS"
             ]);
+        }
+        else
+        {
+            // Each WGC process owns a fresh clock. Normalize that generation at
+            // capture time so a delayed first D3D frame cannot retain a positive
+            // source offset while audio begins at zero.
+            arguments.AddRange(["-vf", "setpts=PTS-STARTPTS"]);
         }
 
         if (audioInputs.Count == 0)
@@ -189,10 +197,34 @@ internal static class FfmpegArgumentBuilder
         {
             "-hide_banner",
             "-loglevel", "error",
-            "-nostdin"
+            "-nostdin",
+            "-nostats",
+            "-stats_period", "0.25",
+            "-progress", "pipe:1"
         };
+        if (UsesDirectWindowsGraphicsHardwarePath(encodingStrategy))
+        {
+            arguments.AddRange([
+                "-filter_threads", "1",
+                "-filter_complex_threads", "1"
+            ]);
+        }
+
         AddVideoInput(arguments, configuration, encodingStrategy);
-        arguments.AddRange(["-frames:v", "2", "-an"]);
+        var output = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution);
+        var probeFrames = output.RequiresScaling
+            ? checked(configuration.FramesPerSecond * ScaledGraphicsProbeSeconds)
+            : 2;
+        // Exercise the same timestamp-normalization graph as live capture. A
+        // capability probe must not approve a simpler D3D11-to-encoder path than
+        // the one that will run continuously.
+        arguments.AddRange([
+            "-vf", "setpts=PTS-STARTPTS",
+            "-frames:v", Invariant(probeFrames),
+            "-an"
+        ]);
         AddEncoderArguments(arguments, encodingStrategy);
         arguments.AddRange(["-f", "null", "NUL"]);
         return arguments;
@@ -262,7 +294,6 @@ internal static class FfmpegArgumentBuilder
         arguments.AddRange(
         [
             "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
             "-y",
             outputPath
         ]);
@@ -271,10 +302,11 @@ internal static class FfmpegArgumentBuilder
     }
 
     /// <summary>
-    /// Builds an exact-seek transcode for an arbitrary clip range. FFmpeg's accurate-seek path is
-    /// enabled by default when input-side -ss is combined with video re-encoding: it seeks to the
-    /// preceding keyframe, decodes/discards up to the requested source frame, and starts the new
-    /// stream there. Stream copy is intentionally never used for user-selected trim boundaries.
+    /// Builds a fast stream-copy trim when both normalized bounds match ClipForge's fixed GOP
+    /// boundaries, or an exact-seek transcode for an arbitrary range. FFmpeg's accurate-seek path
+    /// is enabled by default when input-side -ss is combined with video re-encoding: it seeks to
+    /// the preceding keyframe, decodes/discards up to the requested source frame, and starts the
+    /// new stream there.
     /// </summary>
     internal static IReadOnlyList<string> BuildTrimArguments(
         string inputPath,
@@ -284,7 +316,8 @@ internal static class FfmpegArgumentBuilder
         bool includeAudio,
         int framesPerSecond,
         VideoEncodingStrategy encodingStrategy,
-        bool replayCoexisting = false)
+        bool replayCoexisting = false,
+        bool fastStreamCopyVerified = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
@@ -304,6 +337,16 @@ internal static class FfmpegArgumentBuilder
             throw new ArgumentOutOfRangeException(nameof(framesPerSecond));
         }
 
+        // Arithmetic alignment only makes a range a candidate. ClipTrimService
+        // separately verifies the source packet at the requested start is a real
+        // keyframe before enabling packet copy.
+        var useFastStreamCopy =
+            fastStreamCopyVerified &&
+            CanUseFastStreamCopyTrim(start, duration);
+        var useSoftwareReplayThrottle =
+            replayCoexisting &&
+            !useFastStreamCopy &&
+            !encodingStrategy.IsHardwareEncoder;
         var arguments = new List<string>
         {
             "-hide_banner",
@@ -311,11 +354,13 @@ internal static class FfmpegArgumentBuilder
             "-nostdin",
         };
 
-        if (replayCoexisting)
+        if (useSoftwareReplayThrottle)
         {
             // A replay-time trim intentionally progresses at real-time speed on
             // one decoder thread. This prevents a bursty second media workload
-            // from starving the live capture graph or claiming its GPU encoder.
+            // from starving the live capture graph when hardware encoding is not
+            // available. A validated hardware encoder and packet-only stream copy
+            // do not need this software fallback throttle.
             arguments.AddRange([
                 "-filter_threads", "1",
                 "-threads", "1",
@@ -349,31 +394,54 @@ internal static class FfmpegArgumentBuilder
             "-dn"
         ]);
 
-        AddEncoderArguments(
-            arguments,
-            encodingStrategy,
-            softwareThreadLimit: replayCoexisting ? 1 : 2);
-        arguments.AddRange(
-        [
-            "-pix_fmt", "yuv420p",
-            "-g", Invariant(checked(framesPerSecond * SegmentSeconds)),
-            "-keyint_min", Invariant(checked(framesPerSecond * SegmentSeconds))
-        ]);
-
-        if (includeAudio)
+        if (useFastStreamCopy)
         {
-            arguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+            arguments.AddRange(["-c", "copy"]);
+        }
+        else
+        {
+            AddEncoderArguments(
+                arguments,
+                encodingStrategy,
+                softwareThreadLimit: useSoftwareReplayThrottle ? 1 : 2);
+            arguments.AddRange(
+            [
+                "-pix_fmt", "yuv420p",
+                "-g", Invariant(checked(framesPerSecond * SegmentSeconds)),
+                "-keyint_min", Invariant(checked(framesPerSecond * SegmentSeconds))
+            ]);
+
+            if (includeAudio)
+            {
+                arguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]);
+            }
         }
 
         arguments.AddRange(
         [
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            "-f", "mp4",
-            "-n",
-            outputPath
+            "-avoid_negative_ts", "make_zero"
         ]);
+        if (!useFastStreamCopy)
+        {
+            arguments.AddRange(["-movflags", "+faststart"]);
+        }
+
+        arguments.AddRange(["-f", "mp4", "-n", outputPath]);
         return arguments;
+    }
+
+    internal static bool CanUseFastStreamCopyTrim(TimeSpan start, TimeSpan duration)
+    {
+        if (start < TimeSpan.Zero ||
+            duration <= TimeSpan.Zero ||
+            duration.Ticks > TimeSpan.MaxValue.Ticks - start.Ticks)
+        {
+            return false;
+        }
+
+        var segmentTicks = TimeSpan.FromSeconds(SegmentSeconds).Ticks;
+        return start.Ticks % segmentTicks == 0 &&
+               (start.Ticks + duration.Ticks) % segmentTicks == 0;
     }
 
     private static string BuildVideoFilter(CaptureConfiguration configuration)
