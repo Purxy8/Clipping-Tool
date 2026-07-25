@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Security;
 using System.Text;
 using System.Text.Json;
@@ -26,6 +27,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         ".windows-session-cleanup.cursor";
     private const int MaximumWindowsSessionDirectoriesPerRoot = 8;
     private const int MaximumWindowsSessionFilesPerDirectory = 4_096;
+    internal const int MaximumCurrentSessionCleanupDirectoryCandidatesPerRun = 64;
+    internal const int MaximumCurrentSessionCleanupFilesPerRun = 2_048;
     internal const int MaximumSegmentDeleteAttemptsPerRefresh = 64;
     private static readonly TimeSpan CaptureHealthPollInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan BufferRefreshInterval = TimeSpan.FromSeconds(1);
@@ -36,6 +39,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private static readonly TimeSpan CaptureRecoveryRetryDelay = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ExportProcessMaximumRuntime = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LegacyBufferMinimumInactivity = TimeSpan.FromHours(24);
+    internal static readonly TimeSpan CurrentSessionCleanupTimeBudget =
+        TimeSpan.FromMilliseconds(750);
+    private static readonly TimeSpan InitialBufferMaintenanceStartWaitBudget =
+        TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan DegradedCaptureReprobeInitialDelay =
+        TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DegradedCaptureReprobeMaximumDelay =
+        TimeSpan.FromMinutes(30);
     // Windows Graphics Capture frame pools can lose delivery cadence after a
     // long, uninterrupted desktop session while FFmpeg itself remains alive.
     // Renew only the capture process at a bounded age; the disk ring survives.
@@ -48,6 +59,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim _saveGate = new(1, 1);
     private readonly object _fileGate = new();
+    private readonly object _stateGate = new();
+    private readonly object _statePublicationGate = new();
     private readonly object _diagnosticGate = new();
     private readonly HashSet<string> _protectedSegments = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _diagnosticLines = new();
@@ -56,6 +69,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly CaptureRecoveryRequestGate _captureRecoveryRequestGate = new();
     private readonly CaptureRuntimeJournal _runtimeJournal = new();
     private readonly ScheduledCaptureRefreshCoordinator _scheduledCaptureRefreshCoordinator;
+    private readonly ScheduledCaptureRefreshCoordinator _degradedCaptureReprobeCoordinator;
+    private readonly CancellationTokenSource _initialBufferMaintenanceCancellation = new();
     private readonly TaskCompletionSource _disposeCompletion = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Task _initialBufferMaintenanceTask;
@@ -96,6 +111,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private long _recoveryRetryNotBefore;
     private int _recoveryRetryGeneration;
     private int _capturePriorityRefreshWarningReported;
+    private int _activeStrategyUsesCapabilityProbe;
+    private int _degradedCaptureReprobeAttempt;
+    private long _degradedCaptureReprobeNotBeforeUtcTicks;
+    private long _statePublicationVersion;
     private int _disposeStarted;
     private int _disposed;
 
@@ -125,13 +144,24 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 EnqueueDiagnostic(
                     $"Background WGC renewal for process {processId} failed: " +
                     $"{diagnostic} {exception.GetBaseException().Message}"));
+        _degradedCaptureReprobeCoordinator = new ScheduledCaptureRefreshCoordinator(
+            RunDegradedCaptureReprobeAsync,
+            (processId, diagnostic, exception) =>
+            {
+                DeferDegradedCaptureReprobe();
+                EnqueueDiagnostic(
+                    $"Background degraded-capture reprobe for process {processId} failed: " +
+                    $"{diagnostic} {exception.GetBaseException().Message}");
+            });
 
         // Crash residue can contain thousands of large two-second segments.
         // Never enumerate or recursively delete it on the WPF constructor path.
         // StartAsync awaits this worker before it creates a new session, so
         // capture and disk/AV maintenance still cannot overlap.
         _initialBufferMaintenanceTask = Task.Run(
-            () => RunInitialBufferMaintenanceAsync(initialBufferMaintenanceOverride));
+            () => RunInitialBufferMaintenanceAsync(
+                initialBufferMaintenanceOverride,
+                _initialBufferMaintenanceCancellation.Token));
     }
 
     internal ReplayBufferService(
@@ -236,13 +266,57 @@ public sealed class ReplayBufferService : IAsyncDisposable
         VideoEncodingStrategy? sessionStrategyOverride,
         bool sourceSafetyMode)
     {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await StartCoreAsync(
+                        configuration,
+                        cancellationToken,
+                        sessionStrategyOverride,
+                        sourceSafetyMode,
+                        allowFreshCapabilityRetry: attempt == 0)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (RetryableCaptureLaunchException) when (attempt == 0)
+            {
+                // The exact capability entry was removed by StartCoreAsync after
+                // the verified strategy failed in the real capture graph. Retry
+                // the complete lifecycle once so a fresh probe can choose another
+                // WGC/transfer/encoder path without creating a restart loop.
+            }
+        }
+    }
+
+    private async Task StartCoreAsync(
+        CaptureConfiguration configuration,
+        CancellationToken cancellationToken,
+        VideoEncodingStrategy? sessionStrategyOverride,
+        bool sourceSafetyMode,
+        bool allowFreshCapabilityRetry)
+    {
         ArgumentNullException.ThrowIfNull(configuration);
         ThrowIfDisposed();
+        FfmpegCapabilitySelection? selectedCapability = null;
+        string? selectedFfmpegPath = null;
+        var capabilityWasProbed = false;
+        var realCaptureLaunchFailed = false;
         try
         {
             await _initialBufferMaintenanceTask
-                .WaitAsync(cancellationToken)
+                .WaitAsync(InitialBufferMaintenanceStartWaitBudget, cancellationToken)
                 .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // A local antivirus/filter driver can make one synchronous directory
+            // operation ignore the cleanup worker's soft time budget. Cancel the
+            // entire pipeline before creating a live session so a delayed
+            // enumerator can neither delete that session nor compete with capture.
+            _initialBufferMaintenanceCancellation.Cancel();
+            EnqueueDiagnostic(
+                "Initial replay maintenance exceeded one second and was cancelled before capture.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -286,11 +360,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 var ffmpegPath = _ffmpegSetupService.FindExecutable()
                     ?? throw new InvalidOperationException(
                         "The capture engine is not installed. Use Install engine and try again.");
+                selectedFfmpegPath = ffmpegPath;
 
                 EnsureSafeBufferRoot();
                 Directory.CreateDirectory(_bufferRoot);
                 EnsureSafeBufferRoot();
-                CleanupStaleBuffers();
                 _segmentDirectory = Path.Combine(
                     _bufferRoot,
                     $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
@@ -353,6 +427,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         sessionStrategyOverride is null
                             ? $"Capture smoke override selected {effectiveStrategyOverride.Description}."
                             : $"Capture recovery retained the verified {effectiveStrategyOverride.Description} path.");
+                selectedCapability = capabilitySelection;
+                capabilityWasProbed =
+                    effectiveStrategyOverride is null &&
+                    !sourceSafetyMode;
                 if (sourceSafetyMode &&
                     capabilitySelection.Strategy.CaptureBackend !=
                     DesktopCaptureBackend.WindowsGraphicsCapture)
@@ -369,6 +447,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _activeConfiguration = configuration;
                 _activeCaptureStrategy = capabilitySelection.Strategy;
                 _activeFfmpegPath = ffmpegPath;
+                Volatile.Write(
+                    ref _activeStrategyUsesCapabilityProbe,
+                    capabilityWasProbed ? 1 : 0);
+                ResetDegradedCaptureReprobe();
+                if (capabilityWasProbed &&
+                    capabilitySelection.Strategy.CaptureBackend ==
+                    DesktopCaptureBackend.Gdi)
+                {
+                    ScheduleNextDegradedCaptureReprobe(
+                        capabilitySelection.CacheExpiresAtUtc);
+                }
                 Volatile.Write(
                     ref _lastCapturePlan,
                     new CaptureSessionPlan(
@@ -389,6 +478,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     arguments,
                     redirectStandardInput: true,
                     redirectStandardOutput: true);
+                var captureProcessStarted = false;
                 try
                 {
                     if (!captureProcess.Start())
@@ -396,6 +486,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         throw new InvalidOperationException("Windows could not start the capture engine.");
                     }
 
+                    captureProcessStarted = true;
                     // Attach immediately after Process.Start. If ClipForge is
                     // terminated before graceful cleanup, closing this job's
                     // last handle makes Windows terminate FFmpeg as well.
@@ -403,6 +494,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
                 catch
                 {
+                    realCaptureLaunchFailed =
+                        captureProcessStarted &&
+                        HasProcessExitedSafely(captureProcess);
                     TryKill(captureProcess);
                     _captureProcessJob?.Dispose();
                     _captureProcessJob = null;
@@ -432,14 +526,25 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     var connectionTasks = _audioPipes
                         .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
                         .ToArray();
-                    await Task.WhenAll(connectionTasks)
-                        .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                        .ConfigureAwait(false);
+                    try
+                    {
+                        await Task.WhenAll(connectionTasks)
+                            .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch when (
+                        !cancellationToken.IsCancellationRequested &&
+                        HasProcessExitedSafely(captureProcess))
+                    {
+                        realCaptureLaunchFailed = true;
+                        throw;
+                    }
                 }
 
                 await Task.Delay(500, cancellationToken).ConfigureAwait(false);
                 if (captureProcess.HasExited)
                 {
+                    realCaptureLaunchFailed = true;
                     throw new InvalidOperationException(BuildCaptureFailureMessage());
                 }
 
@@ -505,6 +610,24 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 var message = exception is InvalidOperationException
                     ? exception.Message
                     : $"Instant Replay could not start. {exception.Message}";
+                var confirmedProbedLaunchFailure =
+                    capabilityWasProbed &&
+                    realCaptureLaunchFailed;
+                if (confirmedProbedLaunchFailure &&
+                    selectedCapability is { } failedCapability &&
+                    selectedFfmpegPath is { Length: > 0 } failedFfmpegPath)
+                {
+                    _ = _capabilityProbe.Invalidate(
+                        failedFfmpegPath,
+                        configuration,
+                        failedCapability.Strategy);
+                }
+
+                var retryWithFreshCapability =
+                    ShouldRetryCaptureLaunch(
+                        allowFreshCapabilityRetry,
+                        capabilityWasProbed,
+                        realCaptureLaunchFailed);
 
                 try
                 {
@@ -513,6 +636,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 catch
                 {
                     // Preserve the original startup failure.
+                }
+
+                if (retryWithFreshCapability)
+                {
+                    Publish(new ReplayStateSnapshot(
+                        ReplayState.Starting,
+                        TimeSpan.Zero,
+                        _retention,
+                        0,
+                        "The verified capture path changed at launch; probing once more before giving up."));
+                    throw new RetryableCaptureLaunchException(message, exception);
                 }
 
                 Publish(new ReplayStateSnapshot(
@@ -565,7 +699,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     internal async Task<bool> RefreshCaptureAsync(
         int? expectedProcessId,
         CancellationToken cancellationToken,
-        bool preserveCompletedSegments = true)
+        bool preserveCompletedSegments = true,
+        FfmpegCapabilitySelection? verifiedReplacement = null)
     {
         ThrowIfDisposed();
         await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -578,12 +713,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 var process = _captureProcess;
                 var configuration = _activeConfiguration;
                 var strategy = _activeCaptureStrategy;
+                var replacementStrategy = verifiedReplacement?.Strategy ?? strategy;
                 var ffmpegPath = _activeFfmpegPath;
                 var segmentDirectory = _segmentDirectory;
                 if (!IsRunning ||
                     process is null ||
                     configuration is null ||
                     strategy is null ||
+                    replacementStrategy is null ||
                     string.IsNullOrWhiteSpace(ffmpegPath) ||
                     string.IsNullOrWhiteSpace(segmentDirectory) ||
                     expectedProcessId is null ||
@@ -592,7 +729,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     return false;
                 }
 
-                if (strategy.CaptureBackend != DesktopCaptureBackend.WindowsGraphicsCapture)
+                var promotesDegradedCapture = verifiedReplacement is not null;
+                if (promotesDegradedCapture
+                        ? !CanPromoteDegradedCapture(
+                            strategy,
+                            replacementStrategy,
+                            Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0)
+                        : strategy.CaptureBackend !=
+                          DesktopCaptureBackend.WindowsGraphicsCapture)
                 {
                     return false;
                 }
@@ -655,9 +799,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 // renewal instead of being rejected as though replay were off.
                 Publish(_state with
                 {
-                    Message = "Refreshing the capture engine while keeping your replay buffer..."
+                    Message = promotesDegradedCapture
+                        ? "Restoring Windows Graphics Capture while keeping your replay buffer..."
+                        : "Refreshing the capture engine while keeping your replay buffer..."
                 });
 
+                var replacementCaptureLaunchFailed = false;
                 try
                 {
                     var boundaryWaitStarted = Stopwatch.GetTimestamp();
@@ -667,6 +814,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         .ConfigureAwait(false);
                     var boundaryWait = Stopwatch.GetElapsedTime(boundaryWaitStarted);
                     var replacementStarted = Stopwatch.GetTimestamp();
+
+                    if (ShouldDeferDegradedCapturePromotion(
+                            promotesDegradedCapture,
+                            reachedSegmentBoundary))
+                    {
+                        EnqueueDiagnostic(
+                            "Deferred optional WGC promotion because the healthy GDI recorder did not reach a completed segment boundary.");
+                        RefreshBufferState();
+                        return false;
+                    }
 
                     if (!IsSafeActiveBufferDirectory(segmentDirectory))
                     {
@@ -725,7 +882,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     var arguments = FfmpegArgumentBuilder.BuildCaptureArguments(
                         configuration,
                         _audioPipes.Select(pipe => pipe.Specification).ToArray(),
-                        strategy,
+                        replacementStrategy,
                         segmentDirectory,
                         segmentStartNumber);
                     var replacement = CreateProcess(
@@ -733,6 +890,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         arguments,
                         redirectStandardInput: true,
                         redirectStandardOutput: true);
+                    var replacementStartedProcess = false;
                     try
                     {
                         if (!replacement.Start())
@@ -741,10 +899,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                                 "Windows could not renew the capture engine.");
                         }
 
+                        replacementStartedProcess = true;
                         _captureProcessJob = CaptureProcessJob.Attach(replacement);
                     }
                     catch
                     {
+                        replacementCaptureLaunchFailed =
+                            replacementStartedProcess &&
+                            HasProcessExitedSafely(replacement);
                         TryKill(replacement);
                         _captureProcessJob?.Dispose();
                         _captureProcessJob = null;
@@ -755,7 +917,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     _captureProcess = replacement;
                     if (!ProcessTuning.TryApplyCapturePriority(
                             replacement,
-                            strategy,
+                            replacementStrategy,
                             CaptureGeometry.ResolveOutputSize(
                                 configuration.Display,
                                 configuration.Resolution).RequiresScaling))
@@ -772,20 +934,31 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var connectionTasks = _audioPipes
                             .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
                             .ToArray();
-                        await Task.WhenAll(connectionTasks)
-                            .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                            .ConfigureAwait(false);
+                        try
+                        {
+                            await Task.WhenAll(connectionTasks)
+                                .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch when (
+                            !cancellationToken.IsCancellationRequested &&
+                            HasProcessExitedSafely(replacement))
+                        {
+                            replacementCaptureLaunchFailed = true;
+                            throw;
+                        }
                     }
 
                     await Task.Delay(500, cancellationToken).ConfigureAwait(false);
                     if (replacement.HasExited)
                     {
+                        replacementCaptureLaunchFailed = true;
                         throw new InvalidOperationException(BuildCaptureFailureMessage());
                     }
 
                     if (!ProcessTuning.TryApplyCapturePriority(
                             replacement,
-                            strategy,
+                            replacementStrategy,
                             CaptureGeometry.ResolveOutputSize(
                                 configuration.Display,
                                 configuration.Resolution).RequiresScaling))
@@ -798,23 +971,36 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     _ = Interlocked.Increment(ref _recoveryRetryGeneration);
                     Volatile.Write(ref _isStopping, 0);
                     Volatile.Write(ref _isRunning, 1);
+                    _activeCaptureStrategy = replacementStrategy;
+                    _activeEncoderDescription = replacementStrategy.Description;
+                    Volatile.Write(
+                        ref _lastCapturePlan,
+                        new CaptureSessionPlan(
+                            configuration.Display,
+                            configuration.Resolution,
+                            replacementStrategy));
+                    ResetDegradedCaptureReprobe();
                     _monitorTask = MonitorCaptureAsync(
                         replacement,
                         configuration,
-                        strategy,
+                        replacementStrategy,
                         _sessionCancellation.Token);
                     RecordCaptureRuntimeEvent(
-                        "capture_renewed",
+                        promotesDegradedCapture
+                            ? "capture_promoted"
+                            : "capture_renewed",
                         replacement,
                         configuration,
-                        strategy,
+                        replacementStrategy,
                         string.Create(
                             CultureInfo.InvariantCulture,
                             $"BoundaryAligned={reachedSegmentBoundary}; boundaryWaitMs={boundaryWait.TotalMilliseconds:0}; replacementMs={Stopwatch.GetElapsedTime(replacementStarted).TotalMilliseconds:0}."));
                     EnqueueDiagnostic(
                         string.Create(
                             CultureInfo.InvariantCulture,
-                            $"Renewed the WGC capture process at segment {segmentStartNumber}; " +
+                            $"{(promotesDegradedCapture
+                                ? "Promoted capture from GDI to verified WGC"
+                                : "Renewed the WGC capture process")} at segment {segmentStartNumber}; " +
                             $"{(retainedCompletedSegments
                                 ? "completed replay segments were retained. "
                                 : "the previous capture generation was invalidated and is rebuffering. ")}" +
@@ -834,8 +1020,32 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
                 catch (Exception exception)
                 {
+                    if (promotesDegradedCapture &&
+                        replacementCaptureLaunchFailed)
+                    {
+                        _capabilityProbe.Invalidate(
+                            ffmpegPath,
+                            configuration,
+                            replacementStrategy);
+                    }
+
                     Volatile.Write(ref _isStopping, 1);
-                    await StopCaptureResourcesForRefreshAsync().ConfigureAwait(false);
+                    var failedReplacementCleaned =
+                        await StopCaptureResourcesForRefreshAsync().ConfigureAwait(false);
+                    if (promotesDegradedCapture &&
+                        failedReplacementCleaned &&
+                        await TryRestoreDegradedCaptureAfterPromotionFailureAsync(
+                                verifiedFfmpegPath,
+                                configuration,
+                                strategy,
+                                segmentDirectory,
+                                cancellationToken,
+                                exception)
+                            .ConfigureAwait(false))
+                    {
+                        return false;
+                    }
+
                     Volatile.Write(ref _isRunning, 0);
                     Volatile.Write(ref _isStopping, 0);
                     var message = exception is InvalidOperationException
@@ -980,7 +1190,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
     }
 
     internal Task WaitForScheduledCaptureRefreshIdleAsync() =>
-        _scheduledCaptureRefreshCoordinator.WaitForIdleAsync();
+        Task.WhenAll(
+            _scheduledCaptureRefreshCoordinator.WaitForIdleAsync(),
+            _degradedCaptureReprobeCoordinator.WaitForIdleAsync());
 
     public async Task<string> SaveClipAsync(
         TimeSpan requestedDuration,
@@ -1009,6 +1221,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         try
         {
+            // Always leave the caller before any path can reach the synchronous
+            // segment snapshot (including cancellation while waiting for the
+            // save gate).
+            await SwitchToThreadPool();
             await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             enteredSaveGate = true;
             if (!IsRunning)
@@ -1125,7 +1341,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
 
             Volatile.Write(ref _saveOperationPending, 0);
-            RefreshBufferState(_lastSavedPath);
+            RefreshBufferStateAfterSave(_lastSavedPath);
         }
     }
 
@@ -1141,12 +1357,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // internal cleanup path. Concurrent DisposeAsync callers await the same
         // completion instead of racing semaphore disposal.
         Volatile.Write(ref _disposed, 1);
+        _initialBufferMaintenanceCancellation.Cancel();
         try
         {
             // Stop accepting maintenance before waiting for the lifecycle gates.
             // This cancels a coordinator that is queued behind a long save and lets
             // an in-flight refresh perform its normal bounded capture cleanup.
-            await _scheduledCaptureRefreshCoordinator.DisposeAsync().ConfigureAwait(false);
+            await Task.WhenAll(
+                    _scheduledCaptureRefreshCoordinator.DisposeAsync().AsTask(),
+                    _degradedCaptureReprobeCoordinator.DisposeAsync().AsTask())
+                .ConfigureAwait(false);
 
             await _saveGate.WaitAsync().ConfigureAwait(false);
             try
@@ -1176,6 +1396,30 @@ public sealed class ReplayBufferService : IAsyncDisposable
             _disposeCompletion.TrySetException(exception);
             throw;
         }
+        finally
+        {
+            DisposeInitialBufferMaintenanceCancellationWhenSafe();
+        }
+    }
+
+    private void DisposeInitialBufferMaintenanceCancellationWhenSafe()
+    {
+        if (_initialBufferMaintenanceTask.IsCompleted)
+        {
+            _initialBufferMaintenanceCancellation.Dispose();
+            return;
+        }
+
+        _ = _initialBufferMaintenanceTask.ContinueWith(
+            static (task, state) =>
+            {
+                _ = task.Exception;
+                ((CancellationTokenSource)state!).Dispose();
+            },
+            _initialBufferMaintenanceCancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private void CreateAudioPipes(CaptureConfiguration configuration)
@@ -1375,6 +1619,179 @@ public sealed class ReplayBufferService : IAsyncDisposable
         return true;
     }
 
+    private async Task<bool> TryRestoreDegradedCaptureAfterPromotionFailureAsync(
+        string ffmpegPath,
+        CaptureConfiguration configuration,
+        VideoEncodingStrategy degradedStrategy,
+        string segmentDirectory,
+        CancellationToken cancellationToken,
+        Exception promotionFailure)
+    {
+        Process? restoredProcess = null;
+        try
+        {
+            if (degradedStrategy.CaptureBackend != DesktopCaptureBackend.Gdi ||
+                !IsSafeActiveBufferDirectory(segmentDirectory))
+            {
+                return false;
+            }
+
+            int segmentStartNumber;
+            lock (_fileGate)
+            {
+                RefreshSegmentIndexLocked();
+                var failedGeneration = _activeCaptureGeneration;
+                for (var index = _segments.Count - 1; index >= 0; index--)
+                {
+                    var segment = _segments[index];
+                    if (segment.GenerationId != failedGeneration)
+                    {
+                        continue;
+                    }
+
+                    segment = segment with { IsTrusted = false };
+                    if (!_protectedSegments.Contains(segment.Path) &&
+                        TryDeleteFile(segment.Path))
+                    {
+                        _bufferBytes = Math.Max(0, _bufferBytes - segment.Length);
+                        _segments.RemoveAt(index);
+                    }
+                    else
+                    {
+                        _segments[index] = segment;
+                    }
+                }
+
+                _nextSegmentNumber = _segments.Count == 0
+                    ? 0
+                    : checked(_segments.Max(segment => segment.SegmentNumber) + 1);
+                segmentStartNumber = _nextSegmentNumber;
+                BeginCaptureGenerationLocked(segmentStartNumber);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            _sessionCancellation = new CancellationTokenSource();
+            _reportedDroppedAudioBlocks = 0;
+            Volatile.Write(ref _latestCaptureProgress, null);
+            _captureStarvationWatchdog = new CaptureStarvationWatchdog(
+                configuration.FramesPerSecond);
+            lock (_diagnosticGate)
+            {
+                _diagnosticLines.Clear();
+            }
+
+            CreateAudioPipes(configuration);
+            var arguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+                configuration,
+                _audioPipes.Select(pipe => pipe.Specification).ToArray(),
+                degradedStrategy,
+                segmentDirectory,
+                segmentStartNumber);
+            restoredProcess = CreateProcess(
+                ffmpegPath,
+                arguments,
+                redirectStandardInput: true,
+                redirectStandardOutput: true);
+            if (!restoredProcess.Start())
+            {
+                throw new InvalidOperationException(
+                    "Windows could not restore the previous GDI capture path.");
+            }
+
+            _captureProcessJob = CaptureProcessJob.Attach(restoredProcess);
+            _captureProcess = restoredProcess;
+            _ = ProcessTuning.TryApplyCapturePriority(
+                restoredProcess,
+                degradedStrategy,
+                CaptureGeometry.ResolveOutputSize(
+                    configuration.Display,
+                    configuration.Resolution).RequiresScaling);
+            restoredProcess.StandardInput.AutoFlush = true;
+            _diagnosticTask = PumpDiagnosticsAsync(restoredProcess);
+            _captureProgressTask = PumpCaptureProgressAsync(restoredProcess);
+            if (_audioPipes.Count > 0)
+            {
+                var connectionTasks = _audioPipes
+                    .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
+                    .ToArray();
+                await Task.WhenAll(connectionTasks)
+                    .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+            if (restoredProcess.HasExited)
+            {
+                throw new InvalidOperationException(BuildCaptureFailureMessage());
+            }
+
+            _ = ProcessTuning.TryApplyCapturePriority(
+                restoredProcess,
+                degradedStrategy,
+                CaptureGeometry.ResolveOutputSize(
+                    configuration.Display,
+                    configuration.Resolution).RequiresScaling);
+            _activeCaptureStrategy = degradedStrategy;
+            _activeEncoderDescription = degradedStrategy.Description;
+            Volatile.Write(ref _isStopping, 0);
+            Volatile.Write(ref _isRunning, 1);
+            Volatile.Write(
+                ref _lastCapturePlan,
+                new CaptureSessionPlan(
+                    configuration.Display,
+                    configuration.Resolution,
+                    degradedStrategy));
+            ScheduleNextDegradedCaptureReprobe();
+            _monitorTask = MonitorCaptureAsync(
+                restoredProcess,
+                configuration,
+                degradedStrategy,
+                _sessionCancellation.Token);
+            RecordCaptureRuntimeEvent(
+                "capture_promotion_rolled_back",
+                restoredProcess,
+                configuration,
+                degradedStrategy,
+                $"The optional WGC promotion failed and verified GDI was restored. {promotionFailure.GetBaseException().Message}");
+            EnqueueDiagnostic(
+                "The optional WGC promotion failed; ClipForge restored the verified GDI capture path and kept completed replay segments.");
+            RefreshBufferState();
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (restoredProcess is not null)
+            {
+                TryKill(restoredProcess);
+            }
+
+            _ = await StopCaptureResourcesForRefreshAsync().ConfigureAwait(false);
+            Volatile.Write(ref _isRunning, 0);
+            Volatile.Write(ref _isStopping, 0);
+            throw;
+        }
+        catch (Exception restoreFailure)
+        {
+            if (restoredProcess is not null)
+            {
+                TryKill(restoredProcess);
+            }
+
+            _ = await StopCaptureResourcesForRefreshAsync().ConfigureAwait(false);
+            EnqueueDiagnostic(
+                $"The optional WGC promotion failed and GDI restoration also failed: {restoreFailure.GetBaseException().Message}");
+            return false;
+        }
+        finally
+        {
+            if (restoredProcess is not null &&
+                !ReferenceEquals(_captureProcess, restoredProcess))
+            {
+                restoredProcess.Dispose();
+            }
+        }
+    }
+
     private async Task<bool> ObserveCaptureCleanupTaskAsync(Task task, string componentName)
     {
         try
@@ -1525,6 +1942,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _activeConfiguration = null;
         _activeCaptureStrategy = null;
         _activeFfmpegPath = null;
+        Volatile.Write(ref _activeStrategyUsesCapabilityProbe, 0);
+        ResetDegradedCaptureReprobe();
         if (hadSession)
         {
             RecordCaptureRuntimeEvent(
@@ -1682,6 +2101,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 RefreshBufferState();
+                var degradedReprobeDeadline = Volatile.Read(
+                    ref _degradedCaptureReprobeNotBeforeUtcTicks);
+                if (ShouldScheduleDegradedCaptureReprobe(
+                        strategy.CaptureBackend,
+                        Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
+                        degradedReprobeDeadline,
+                        DateTimeOffset.UtcNow.UtcDateTime.Ticks))
+                {
+                    _ = QueueDegradedCaptureReprobe(
+                        process.Id,
+                        "The active degraded-capability cache entry reached its retry deadline.");
+                }
 
                 if (Stopwatch.GetElapsedTime(lastPriorityRefresh) >=
                     CapturePriorityRefreshInterval)
@@ -1863,6 +2294,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return;
         }
 
+        if (!IsRunning)
+        {
+            if (lastSavedPath is not null)
+            {
+                Publish(BuildPostSaveSnapshot(_state, lastSavedPath));
+            }
+
+            return;
+        }
+
         TimeSpan available;
         TimeSpan retention;
         long bytes;
@@ -1997,6 +2438,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
             : available >= retention
                 ? ReplayState.Ready
                 : ReplayState.Buffering;
+        if (!IsRunning)
+        {
+            if (lastSavedPath is not null)
+            {
+                Publish(BuildPostSaveSnapshot(_state, lastSavedPath));
+            }
+
+            return;
+        }
+
         Publish(new ReplayStateSnapshot(
             replayState,
             available,
@@ -2008,6 +2459,31 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     ? "Saving your clip…"
                     : $"Instant Replay is filling its buffer using {_activeEncoderDescription}.",
             lastSavedPath ?? _lastSavedPath));
+    }
+
+    private void RefreshBufferStateAfterSave(string? lastSavedPath)
+    {
+        if (!IsRunning)
+        {
+            Publish(BuildPostSaveSnapshot(_state, lastSavedPath));
+            return;
+        }
+
+        RefreshBufferState(lastSavedPath);
+    }
+
+    internal static ReplayThreadPoolHopAwaitable SwitchToThreadPool() =>
+        default;
+
+    internal static ReplayStateSnapshot BuildPostSaveSnapshot(
+        ReplayStateSnapshot current,
+        string? lastSavedPath)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        return current with
+        {
+            LastSavedPath = lastSavedPath ?? current.LastSavedPath
+        };
     }
 
     internal static int CalculateSegmentDeleteAttemptBudget(
@@ -2438,6 +2914,228 @@ public sealed class ReplayBufferService : IAsyncDisposable
             CaptureProcessId,
             "Running one coalesced WGC refresh that arrived while another recovery request was active.");
     }
+
+    private bool QueueDegradedCaptureReprobe(
+        int? expectedProcessId,
+        string diagnostic)
+    {
+        var deadlineUtcTicks = Volatile.Read(
+            ref _degradedCaptureReprobeNotBeforeUtcTicks);
+        if (expectedProcessId is not { } processId ||
+            processId <= 0 ||
+            Volatile.Read(ref _disposed) != 0 ||
+            Volatile.Read(ref _isStopping) != 0 ||
+            !IsRunning ||
+            !ShouldScheduleDegradedCaptureReprobe(
+                _activeCaptureStrategy?.CaptureBackend,
+                Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
+                deadlineUtcTicks,
+                DateTimeOffset.UtcNow.UtcDateTime.Ticks) ||
+            CaptureProcessId != processId)
+        {
+            return false;
+        }
+
+        var queued = _degradedCaptureReprobeCoordinator.TrySchedule(
+            processId,
+            diagnostic);
+        if (queued)
+        {
+            EnqueueDiagnostic(
+                $"Queued a bounded WGC capability recheck for degraded capture process {processId}: {diagnostic}");
+            RecordCaptureRuntimeEvent(
+                "capture_degraded_reprobe_queued",
+                _captureProcess,
+                detail: diagnostic);
+        }
+
+        return queued;
+    }
+
+    private async Task RunDegradedCaptureReprobeAsync(
+        int expectedProcessId,
+        string diagnostic,
+        CancellationToken cancellationToken)
+    {
+        var configuration = _activeConfiguration;
+        var ffmpegPath = _activeFfmpegPath;
+        var currentStrategy = _activeCaptureStrategy;
+        if (!IsCurrentDegradedCapture(
+                expectedProcessId,
+                configuration,
+                ffmpegPath,
+                currentStrategy))
+        {
+            return;
+        }
+
+        RecordCaptureRuntimeEvent(
+            "capture_degraded_reprobe_started",
+            _captureProcess,
+            configuration,
+            currentStrategy,
+            diagnostic);
+        var verifiedFfmpegPath = _ffmpegSetupService.FindExecutable()
+            ?? throw new InvalidOperationException(
+                "The verified capture engine is unavailable for the background WGC recheck.");
+        if (!Path.GetFullPath(verifiedFfmpegPath).Equals(
+                Path.GetFullPath(ffmpegPath!),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SecurityException(
+                "The capture engine path changed during the background WGC recheck.");
+        }
+
+        using var verifiedExecutableLease =
+            _ffmpegSetupService.OpenVerifiedExecutableLease(verifiedFfmpegPath)
+            ?? throw new SecurityException(
+                "The capture engine failed its final pinned-file verification before the background WGC recheck.");
+        var selection = await _capabilityProbe.SelectAsync(
+                verifiedFfmpegPath,
+                configuration!,
+                cancellationToken)
+            .ConfigureAwait(false);
+        EnqueueDiagnostic(selection.Diagnostics);
+
+        if (!IsCurrentDegradedCapture(
+                expectedProcessId,
+                configuration,
+                ffmpegPath,
+                currentStrategy))
+        {
+            return;
+        }
+
+        if (selection.Strategy.CaptureBackend !=
+            DesktopCaptureBackend.WindowsGraphicsCapture)
+        {
+            ScheduleNextDegradedCaptureReprobe(selection.CacheExpiresAtUtc);
+            RecordCaptureRuntimeEvent(
+                "capture_degraded_reprobe_retained",
+                _captureProcess,
+                configuration,
+                selection.Strategy,
+                "WGC was still unavailable; the verified GDI session remains active.");
+            return;
+        }
+
+        var refreshed = await RefreshCaptureAsync(
+                expectedProcessId,
+                cancellationToken,
+                preserveCompletedSegments: true,
+                verifiedReplacement: selection)
+            .ConfigureAwait(false);
+        if (!refreshed)
+        {
+            if (IsCurrentDegradedCapture(
+                    expectedProcessId,
+                    configuration,
+                    ffmpegPath,
+                    currentStrategy))
+            {
+                ScheduleNextDegradedCaptureReprobe(selection.CacheExpiresAtUtc);
+            }
+
+            EnqueueDiagnostic(
+                $"Skipped stale degraded-capture promotion for process {expectedProcessId}.");
+        }
+    }
+
+    private bool IsCurrentDegradedCapture(
+        int expectedProcessId,
+        CaptureConfiguration? expectedConfiguration,
+        string? expectedFfmpegPath,
+        VideoEncodingStrategy? expectedStrategy) =>
+        IsRunning &&
+        Volatile.Read(ref _disposed) == 0 &&
+        Volatile.Read(ref _isStopping) == 0 &&
+        Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0 &&
+        CaptureProcessId == expectedProcessId &&
+        ReferenceEquals(_activeConfiguration, expectedConfiguration) &&
+        string.Equals(
+            _activeFfmpegPath,
+            expectedFfmpegPath,
+            StringComparison.OrdinalIgnoreCase) &&
+        ReferenceEquals(_activeCaptureStrategy, expectedStrategy) &&
+        expectedStrategy?.CaptureBackend == DesktopCaptureBackend.Gdi;
+
+    private void ResetDegradedCaptureReprobe()
+    {
+        Interlocked.Exchange(ref _degradedCaptureReprobeAttempt, 0);
+        Volatile.Write(
+            ref _degradedCaptureReprobeNotBeforeUtcTicks,
+            0);
+    }
+
+    private void ScheduleNextDegradedCaptureReprobe(
+        DateTimeOffset? capabilityCacheExpiresAtUtc = null)
+    {
+        var attempt = Math.Max(
+            0,
+            Interlocked.Increment(ref _degradedCaptureReprobeAttempt) - 1);
+        var serviceDeadline = DateTimeOffset.UtcNow +
+            GetDegradedCaptureReprobeDelay(attempt);
+        var deadline = capabilityCacheExpiresAtUtc is { } cacheDeadline &&
+                       cacheDeadline > serviceDeadline
+            ? cacheDeadline
+            : serviceDeadline;
+        Volatile.Write(
+            ref _degradedCaptureReprobeNotBeforeUtcTicks,
+            deadline.UtcDateTime.Ticks);
+    }
+
+    private void DeferDegradedCaptureReprobe() =>
+        ScheduleNextDegradedCaptureReprobe();
+
+    internal static TimeSpan GetDegradedCaptureReprobeDelay(int attempt)
+    {
+        if (attempt < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+
+        var exponent = Math.Min(attempt, 6);
+        var ticks = DegradedCaptureReprobeInitialDelay.Ticks * (1L << exponent);
+        return TimeSpan.FromTicks(Math.Min(
+            ticks,
+            DegradedCaptureReprobeMaximumDelay.Ticks));
+    }
+
+    internal static bool ShouldScheduleDegradedCaptureReprobe(
+        DesktopCaptureBackend? captureBackend,
+        bool strategyUsesCapabilityProbe,
+        long deadlineUtcTicks,
+        long nowUtcTicks) =>
+        captureBackend == DesktopCaptureBackend.Gdi &&
+        strategyUsesCapabilityProbe &&
+        deadlineUtcTicks > 0 &&
+        nowUtcTicks >= deadlineUtcTicks;
+
+    internal static bool CanPromoteDegradedCapture(
+        VideoEncodingStrategy currentStrategy,
+        VideoEncodingStrategy replacementStrategy,
+        bool strategyUsesCapabilityProbe)
+    {
+        ArgumentNullException.ThrowIfNull(currentStrategy);
+        ArgumentNullException.ThrowIfNull(replacementStrategy);
+        return strategyUsesCapabilityProbe &&
+               currentStrategy.CaptureBackend == DesktopCaptureBackend.Gdi &&
+               replacementStrategy.CaptureBackend ==
+               DesktopCaptureBackend.WindowsGraphicsCapture;
+    }
+
+    internal static bool ShouldDeferDegradedCapturePromotion(
+        bool promotesDegradedCapture,
+        bool reachedSegmentBoundary) =>
+        promotesDegradedCapture && !reachedSegmentBoundary;
+
+    internal static bool ShouldRetryCaptureLaunch(
+        bool allowFreshCapabilityRetry,
+        bool strategyUsesCapabilityProbe,
+        bool realCaptureLaunchFailed) =>
+        allowFreshCapabilityRetry &&
+        strategyUsesCapabilityProbe &&
+        realCaptureLaunchFailed;
 
     private bool QueueScheduledCaptureRefresh(
         int? expectedProcessId,
@@ -3216,8 +3914,24 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
+    private static bool HasProcessExitedSafely(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or
+                System.ComponentModel.Win32Exception or
+                NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     private async Task RunInitialBufferMaintenanceAsync(
-        Func<Task>? initialBufferMaintenanceOverride)
+        Func<Task>? initialBufferMaintenanceOverride,
+        CancellationToken cancellationToken)
     {
         if (initialBufferMaintenanceOverride is not null)
         {
@@ -3228,7 +3942,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // MainWindow creates this service only after primary single-instance
         // ownership is established, so pre-existing sessions in this Windows
         // session are crash residue.
-        CleanupStaleBuffers();
+        CleanupStaleBuffers(cancellationToken);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
         if (!IsDefaultBufferRoot(_bufferRoot) ||
             !TryGetBufferOwnerSessions(
                 out var activeOwnerSessionIds,
@@ -3238,49 +3957,185 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         var bufferParent = Path.GetDirectoryName(_bufferRoot);
-        if (!string.IsNullOrWhiteSpace(bufferParent))
+        if (!cancellationToken.IsCancellationRequested &&
+            !string.IsNullOrWhiteSpace(bufferParent))
         {
             _ = CleanupInactiveWindowsSessionBufferRoots(
                 bufferParent,
                 _bufferRoot,
                 DateTime.UtcNow,
                 activeOwnerSessionIds,
-                ownershipEstablished: true);
+                ownershipEstablished: true,
+                cancellationToken: cancellationToken);
         }
 
         // Old builds wrote session-* directly below Buffer. Preserve the older,
         // stricter all-owner gate for that unscoped layout.
-        if (!anotherPotentialOwnerIsRunning)
+        if (!cancellationToken.IsCancellationRequested &&
+            !anotherPotentialOwnerIsRunning)
         {
-            CleanupLegacyStaleBuffers(potentialOwnerRunning: false);
+            CleanupLegacyStaleBuffers(
+                potentialOwnerRunning: false,
+                cancellationToken);
         }
     }
 
-    private void CleanupStaleBuffers()
+    private void CleanupStaleBuffers(CancellationToken cancellationToken)
     {
-        if (!IsSafeBufferRootPath(_bufferRoot))
+        if (cancellationToken.IsCancellationRequested ||
+            !IsSafeBufferRootPath(_bufferRoot))
         {
             return;
         }
 
+        var startedAt = Stopwatch.GetTimestamp();
+        var directoriesInspected = 0;
+        var filesDeleted = 0;
         try
         {
-            foreach (var directory in Directory.EnumerateDirectories(_bufferRoot, "session-*"))
+            foreach (var directoryPath in Directory.EnumerateDirectories(
+                         _bufferRoot,
+                         "session-*",
+                         SearchOption.TopDirectoryOnly))
             {
+                if (cancellationToken.IsCancellationRequested ||
+                    !ShouldContinueCurrentSessionCleanup(
+                        directoriesInspected,
+                        filesDeleted,
+                        Stopwatch.GetElapsedTime(startedAt)))
+                {
+                    break;
+                }
+
+                directoriesInspected++;
                 // Single-instance ownership is established before this service
                 // is created, so every pre-existing session is crash residue.
-                // Purge it immediately instead of retaining screen/audio data.
-                TryDeleteBufferDirectory(directory);
+                // Delete only validated top-level replay files and stop at strict
+                // work/time limits. A later launch continues any residue instead
+                // of making Start Replay wait on an unbounded recursive delete.
+                TryDeleteCurrentSessionResidue(
+                    directoryPath,
+                    startedAt,
+                    ref filesDeleted,
+                    cancellationToken);
             }
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
         {
             // Stale cleanup must never prevent a new capture session.
         }
     }
 
-    private void CleanupLegacyStaleBuffers(bool potentialOwnerRunning)
+    internal static bool ShouldContinueCurrentSessionCleanup(
+        int directoriesInspected,
+        int filesDeleted,
+        TimeSpan elapsed) =>
+        directoriesInspected < MaximumCurrentSessionCleanupDirectoryCandidatesPerRun &&
+        filesDeleted < MaximumCurrentSessionCleanupFilesPerRun &&
+        elapsed < CurrentSessionCleanupTimeBudget;
+
+    private void TryDeleteCurrentSessionResidue(
+        string directoryPath,
+        long startedAt,
+        ref int filesDeleted,
+        CancellationToken cancellationToken)
     {
+        try
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            var directory = new DirectoryInfo(Path.GetFullPath(directoryPath));
+            directory.Refresh();
+            if (!directory.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    _bufferRoot,
+                    directory.FullName,
+                    directory.Attributes))
+            {
+                return;
+            }
+
+            foreach (var entryPath in Directory.EnumerateFileSystemEntries(
+                         directory.FullName,
+                         "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                if (cancellationToken.IsCancellationRequested ||
+                    !ShouldContinueCurrentSessionCleanup(
+                        directoriesInspected: 0,
+                        filesDeleted,
+                        Stopwatch.GetElapsedTime(startedAt)))
+                {
+                    return;
+                }
+
+                var normalizedEntry = Path.GetFullPath(entryPath);
+                var attributes = File.GetAttributes(normalizedEntry);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    !directory.FullName.Equals(
+                        Path.GetDirectoryName(normalizedEntry),
+                        StringComparison.OrdinalIgnoreCase) ||
+                    !IsReplayBufferFileName(Path.GetFileName(normalizedEntry)))
+                {
+                    // Unexpected or nested content is never followed or removed.
+                    return;
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                File.Delete(normalizedEntry);
+                filesDeleted++;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            directory.Refresh();
+            if (directory.Exists &&
+                IsSafeBufferDirectoryPath(
+                    _bufferRoot,
+                    directory.FullName,
+                    directory.Attributes) &&
+                !Directory.EnumerateFileSystemEntries(
+                    directory.FullName,
+                    "*",
+                    SearchOption.TopDirectoryOnly).Any())
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                Directory.Delete(directory.FullName, recursive: false);
+            }
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            // A later startup can continue or retry this validated residue.
+        }
+    }
+
+    private void CleanupLegacyStaleBuffers(
+        bool potentialOwnerRunning,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
         string expectedRoot;
         try
         {
@@ -3312,7 +4167,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _ = CleanupLegacyStaleBufferRoot(
             legacyRoot,
             DateTime.UtcNow,
-            potentialOwnerRunning: false);
+            potentialOwnerRunning: false,
+            cancellationToken: cancellationToken);
     }
 
     private static bool IsDefaultBufferRoot(string bufferRoot)
@@ -3371,12 +4227,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string currentBufferRoot,
         DateTime utcNow,
         IReadOnlySet<int> activeOwnerSessionIds,
-        bool ownershipEstablished)
+        bool ownershipEstablished,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(bufferParent);
         ArgumentException.ThrowIfNullOrWhiteSpace(currentBufferRoot);
         ArgumentNullException.ThrowIfNull(activeOwnerSessionIds);
-        if (!ownershipEstablished ||
+        if (cancellationToken.IsCancellationRequested ||
+            !ownershipEstablished ||
             !IsSafeBufferRootPath(bufferParent) ||
             !Path.IsPathFullyQualified(currentBufferRoot))
         {
@@ -3415,11 +4273,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 Directory.EnumerateDirectories(
                     normalizedParent,
                     BuildWindowsSessionCleanupSearchPattern(scanSuffix),
-                    SearchOption.TopDirectoryOnly));
+                    SearchOption.TopDirectoryOnly),
+                cancellationToken);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return 0;
+            }
+
             // Persist the next bounded bucket before deleting. A crash can skip
             // this page until the scan wraps, but can never pin every later
             // page behind the same unsafe prefix across process restarts.
-            if (!TryPersistWindowsSessionCleanupCursor(
+            if (cancellationToken.IsCancellationRequested ||
+                !TryPersistWindowsSessionCleanupCursor(
                     normalizedParent,
                     scan.NextSuffix))
             {
@@ -3429,7 +4294,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var removed = 0;
             foreach (var candidate in scan.Candidates)
             {
-                if (removed >= MaximumInactiveWindowsSessionRootsPerRun)
+                if (cancellationToken.IsCancellationRequested ||
+                    removed >= MaximumInactiveWindowsSessionRootsPerRun)
                 {
                     break;
                 }
@@ -3448,7 +4314,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 if (TryDeleteValidatedWindowsSessionBufferRoot(
                         normalizedParent,
                         candidate.Path,
-                        utcNow))
+                        utcNow,
+                        cancellationToken))
                 {
                     removed++;
                 }
@@ -3471,7 +4338,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             DateTime utcNow,
             IReadOnlySet<int> activeOwnerSessionIds,
             string scanSuffix,
-            IEnumerable<string> candidatePaths)
+            IEnumerable<string> candidatePaths,
+            CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedParent);
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedCurrent);
@@ -3484,10 +4352,38 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 nameof(scanSuffix));
         }
 
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return new WindowsSessionCleanupScanResult(
+                [],
+                scanSuffix,
+                EnumeratedCount: 0,
+                InspectedCount: 0);
+        }
+
         var now = utcNow.ToUniversalTime();
-        var enumeratedPaths = candidatePaths
-            .Take(MaximumWindowsSessionRootInspectionsPerRun + 1)
-            .ToArray();
+        var enumeratedPathsBuilder = new List<string>(
+            MaximumWindowsSessionRootInspectionsPerRun + 1);
+        foreach (var candidatePath in candidatePaths)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return new WindowsSessionCleanupScanResult(
+                    [],
+                    scanSuffix,
+                    enumeratedPathsBuilder.Count,
+                    InspectedCount: 0);
+            }
+
+            enumeratedPathsBuilder.Add(candidatePath);
+            if (enumeratedPathsBuilder.Count >
+                MaximumWindowsSessionRootInspectionsPerRun)
+            {
+                break;
+            }
+        }
+
+        var enumeratedPaths = enumeratedPathsBuilder.ToArray();
         var bucketOverflowed =
             enumeratedPaths.Length > MaximumWindowsSessionRootInspectionsPerRun;
         IReadOnlyList<string> pathsToInspect;
@@ -3509,6 +4405,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var inspectedCount = 0;
         foreach (var path in pathsToInspect)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return new WindowsSessionCleanupScanResult(
+                    [],
+                    scanSuffix,
+                    enumeratedPaths.Length,
+                    inspectedCount);
+            }
+
             try
             {
                 var normalizedCandidate = Path.TrimEndingDirectorySeparator(
@@ -3528,6 +4433,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 if (!TryInspectWindowsSessionBufferRoot(
                         normalizedParent,
                         normalizedCandidate,
+                        cancellationToken,
                         out var candidate) ||
                     activeOwnerSessionIds.Contains(candidate.SessionId) ||
                     now - candidate.LatestWriteTimeUtc <
@@ -3747,11 +4653,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private static bool TryInspectWindowsSessionBufferRoot(
         string bufferParent,
         string candidatePath,
+        CancellationToken cancellationToken,
         out WindowsSessionCleanupCandidate candidate)
     {
         candidate = default;
         try
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
             var root = new DirectoryInfo(Path.GetFullPath(candidatePath));
             root.Refresh();
             if (!root.Exists ||
@@ -3762,6 +4674,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 !TryParseWindowsSessionRootName(root.Name, out var sessionId) ||
                 !TryCollectWindowsSessionBufferEntries(
                     root,
+                    cancellationToken,
                     out _,
                     out _,
                     out var latestWriteTimeUtc))
@@ -3785,6 +4698,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private static bool TryCollectWindowsSessionBufferEntries(
         DirectoryInfo root,
+        CancellationToken cancellationToken,
         out string[] sessionDirectories,
         out string[] bufferFiles,
         out DateTime latestWriteTimeUtc)
@@ -3792,13 +4706,27 @@ public sealed class ReplayBufferService : IAsyncDisposable
         sessionDirectories = [];
         bufferFiles = [];
         latestWriteTimeUtc = root.LastWriteTimeUtc;
-        var rootEntries = Directory
-            .EnumerateFileSystemEntries(
-                root.FullName,
-                "*",
-                SearchOption.TopDirectoryOnly)
-            .Take(MaximumWindowsSessionDirectoriesPerRoot + 1)
-            .ToArray();
+        var rootEntriesBuilder = new List<string>(
+            MaximumWindowsSessionDirectoriesPerRoot + 1);
+        foreach (var rootEntry in Directory.EnumerateFileSystemEntries(
+                     root.FullName,
+                     "*",
+                     SearchOption.TopDirectoryOnly))
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            rootEntriesBuilder.Add(rootEntry);
+            if (rootEntriesBuilder.Count >
+                MaximumWindowsSessionDirectoriesPerRoot)
+            {
+                break;
+            }
+        }
+
+        var rootEntries = rootEntriesBuilder.ToArray();
         if (rootEntries.Length > MaximumWindowsSessionDirectoriesPerRoot)
         {
             return false;
@@ -3808,6 +4736,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var files = new List<string>();
         foreach (var sessionPath in rootEntries)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
             var session = new DirectoryInfo(Path.GetFullPath(sessionPath));
             session.Refresh();
             if (!session.Exists ||
@@ -3821,13 +4754,27 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             sessions.Add(session.FullName);
             latestWriteTimeUtc = Later(latestWriteTimeUtc, session.LastWriteTimeUtc);
-            var entries = Directory
-                .EnumerateFileSystemEntries(
-                    session.FullName,
-                    "*",
-                    SearchOption.TopDirectoryOnly)
-                .Take(MaximumWindowsSessionFilesPerDirectory + 1)
-                .ToArray();
+            var entriesBuilder = new List<string>(
+                MaximumWindowsSessionFilesPerDirectory + 1);
+            foreach (var entry in Directory.EnumerateFileSystemEntries(
+                         session.FullName,
+                         "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
+                entriesBuilder.Add(entry);
+                if (entriesBuilder.Count >
+                    MaximumWindowsSessionFilesPerDirectory)
+                {
+                    break;
+                }
+            }
+
+            var entries = entriesBuilder.ToArray();
             if (entries.Length > MaximumWindowsSessionFilesPerDirectory)
             {
                 return false;
@@ -3835,6 +4782,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             foreach (var entryPath in entries)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var normalizedEntry = Path.GetFullPath(entryPath);
                 var attributes = File.GetAttributes(normalizedEntry);
                 if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
@@ -3861,10 +4813,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private static bool TryDeleteValidatedWindowsSessionBufferRoot(
         string bufferParent,
         string candidatePath,
-        DateTime utcNow)
+        DateTime utcNow,
+        CancellationToken cancellationToken)
     {
         try
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
             var root = new DirectoryInfo(Path.GetFullPath(candidatePath));
             root.Refresh();
             if (!root.Exists ||
@@ -3874,6 +4832,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     root.Attributes) ||
                 !TryCollectWindowsSessionBufferEntries(
                     root,
+                    cancellationToken,
                     out var sessionDirectories,
                     out var bufferFiles,
                     out var latestWriteTimeUtc) ||
@@ -3885,6 +4844,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             foreach (var file in bufferFiles)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var parentPath = Path.GetDirectoryName(file);
                 if (string.IsNullOrWhiteSpace(parentPath))
                 {
@@ -3905,11 +4869,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     return false;
                 }
 
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 File.Delete(file);
             }
 
             foreach (var sessionPath in sessionDirectories)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var session = new DirectoryInfo(sessionPath);
                 session.Refresh();
                 if (!session.Exists ||
@@ -3925,7 +4899,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     return false;
                 }
 
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 Directory.Delete(session.FullName, recursive: false);
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
             }
 
             root.Refresh();
@@ -3938,6 +4922,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     root.FullName,
                     "*",
                     SearchOption.TopDirectoryOnly).Any())
+            {
+                return false;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
             {
                 return false;
             }
@@ -4018,27 +5007,49 @@ public sealed class ReplayBufferService : IAsyncDisposable
     internal static int CleanupLegacyStaleBufferRoot(
         string legacyRoot,
         DateTime utcNow,
-        bool potentialOwnerRunning)
+        bool potentialOwnerRunning,
+        CancellationToken cancellationToken = default)
     {
-        if (potentialOwnerRunning || !IsSafeBufferRootPath(legacyRoot))
+        if (cancellationToken.IsCancellationRequested ||
+            potentialOwnerRunning ||
+            !IsSafeBufferRootPath(legacyRoot))
         {
             return 0;
         }
 
         try
         {
-            var candidates = Directory
-                .EnumerateDirectories(legacyRoot, "session-*", SearchOption.TopDirectoryOnly)
-                .Take(MaximumLegacyDirectoryCandidates)
-                .Select(path => new DirectoryInfo(path))
-                .Where(directory =>
-                    directory.Exists &&
+            var candidatesBuilder = new List<DirectoryInfo>(
+                MaximumLegacyDirectoryCandidates);
+            foreach (var path in Directory.EnumerateDirectories(
+                         legacyRoot,
+                         "session-*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return 0;
+                }
+
+                var directory = new DirectoryInfo(path);
+                if (directory.Exists &&
                     IsSafeBufferDirectoryPath(
                         legacyRoot,
                         directory.FullName,
                         directory.Attributes) &&
                     utcNow.ToUniversalTime() - directory.LastWriteTimeUtc >=
                     LegacyBufferMinimumInactivity)
+                {
+                    candidatesBuilder.Add(directory);
+                }
+
+                if (candidatesBuilder.Count >= MaximumLegacyDirectoryCandidates)
+                {
+                    break;
+                }
+            }
+
+            var candidates = candidatesBuilder
                 .OrderBy(directory => directory.LastWriteTimeUtc)
                 .Take(MaximumLegacyCleanupDirectories)
                 .ToArray();
@@ -4046,7 +5057,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var removed = 0;
             foreach (var candidate in candidates)
             {
-                if (TryDeleteValidatedLegacyBufferDirectory(legacyRoot, candidate))
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (TryDeleteValidatedLegacyBufferDirectory(
+                        legacyRoot,
+                        candidate,
+                        cancellationToken))
                 {
                     removed++;
                 }
@@ -4064,10 +5083,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private static bool TryDeleteValidatedLegacyBufferDirectory(
         string legacyRoot,
-        DirectoryInfo candidate)
+        DirectoryInfo candidate,
+        CancellationToken cancellationToken)
     {
         try
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
             candidate.Refresh();
             if (!candidate.Exists ||
                 !IsSafeBufferDirectoryPath(
@@ -4078,13 +5103,27 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 return false;
             }
 
-            var entries = Directory
-                .EnumerateFileSystemEntries(
-                    candidate.FullName,
-                    "*",
-                    SearchOption.TopDirectoryOnly)
-                .Take(MaximumLegacyCleanupFilesPerDirectory + 1)
-                .ToArray();
+            var entriesBuilder = new List<string>(
+                MaximumLegacyCleanupFilesPerDirectory + 1);
+            foreach (var entry in Directory.EnumerateFileSystemEntries(
+                         candidate.FullName,
+                         "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
+                entriesBuilder.Add(entry);
+                if (entriesBuilder.Count >
+                    MaximumLegacyCleanupFilesPerDirectory)
+                {
+                    break;
+                }
+            }
+
+            var entries = entriesBuilder.ToArray();
             if (entries.Length > MaximumLegacyCleanupFilesPerDirectory)
             {
                 return false;
@@ -4094,6 +5133,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 Path.GetFullPath(candidate.FullName));
             foreach (var entry in entries)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var normalizedEntry = Path.GetFullPath(entry);
                 var attributes = File.GetAttributes(normalizedEntry);
                 var name = Path.GetFileName(normalizedEntry);
@@ -4109,13 +5153,28 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             foreach (var entry in entries)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var attributes = File.GetAttributes(entry);
                 if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
                 {
                     return false;
                 }
 
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 File.Delete(entry);
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
             }
 
             candidate.Refresh();
@@ -4124,6 +5183,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     legacyRoot,
                     candidate.FullName,
                     candidate.Attributes))
+            {
+                return false;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
             {
                 return false;
             }
@@ -4403,22 +5467,54 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private void Publish(ReplayStateSnapshot snapshot)
     {
-        _state = snapshot;
-        var handlers = StateChanged;
-        if (handlers is null)
+        lock (_statePublicationGate)
         {
-            return;
-        }
+            long publicationVersion;
+            lock (_stateGate)
+            {
+                // A save-buffer refresh can race the monitor's terminal transition.
+                // Once capture is no longer running, never replace an already
+                // published terminal state with Ready/Buffering/Saving; only carry
+                // the successful export path forward.
+                if (!IsRunning &&
+                    (snapshot.State is ReplayState.Ready or
+                        ReplayState.Buffering or
+                        ReplayState.Saving) &&
+                    (_state.State is ReplayState.Faulted or ReplayState.Stopped))
+                {
+                    snapshot = BuildPostSaveSnapshot(
+                        _state,
+                        snapshot.LastSavedPath);
+                }
 
-        foreach (EventHandler<ReplayStateSnapshot> handler in handlers.GetInvocationList())
-        {
-            try
-            {
-                handler(this, snapshot);
+                _state = snapshot;
+                publicationVersion = Interlocked.Increment(
+                    ref _statePublicationVersion);
             }
-            catch
+
+            var handlers = StateChanged;
+            if (handlers is null)
             {
-                // UI or telemetry subscribers must not be able to stop capture.
+                return;
+            }
+
+            foreach (EventHandler<ReplayStateSnapshot> handler in handlers.GetInvocationList())
+            {
+                if (publicationVersion != Volatile.Read(ref _statePublicationVersion))
+                {
+                    // A re-entrant subscriber published a newer state. Never
+                    // deliver the superseded snapshot to later subscribers.
+                    break;
+                }
+
+                try
+                {
+                    handler(this, snapshot);
+                }
+                catch
+                {
+                    // UI or telemetry subscribers must not be able to stop capture.
+                }
             }
         }
     }
@@ -4433,6 +5529,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
         int GenerationId,
         bool IsTrusted);
 
+    private sealed class RetryableCaptureLaunchException(
+        string message,
+        Exception innerException)
+        : Exception(message, innerException);
+
     internal readonly record struct WindowsSessionCleanupCandidate(
         string Path,
         int SessionId,
@@ -4443,6 +5544,32 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string NextSuffix,
         int EnumeratedCount,
         int InspectedCount);
+}
+
+internal readonly struct ReplayThreadPoolHopAwaitable
+{
+    public Awaiter GetAwaiter() => default;
+
+    internal readonly struct Awaiter : ICriticalNotifyCompletion
+    {
+        public bool IsCompleted => false;
+
+        public void GetResult()
+        {
+        }
+
+        public void OnCompleted(Action continuation) =>
+            UnsafeOnCompleted(continuation);
+
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            ArgumentNullException.ThrowIfNull(continuation);
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static callback => callback(),
+                continuation,
+                preferLocal: false);
+        }
+    }
 }
 
 internal readonly record struct ReplayCaptureGenerationSnapshot(

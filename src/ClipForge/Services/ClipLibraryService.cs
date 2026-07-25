@@ -7,7 +7,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Windows.Media.Imaging;
 using ClipForge.Models;
 using Microsoft.Win32.SafeHandles;
 
@@ -22,6 +21,7 @@ public sealed class ClipLibraryService
 
     private const int MaximumClipCount = 100;
     private const int MaximumDiscoveryCandidates = 4096;
+    private const int MaximumDiscoveryEntriesInspected = 16_384;
     private const int MinimumProbeCandidates = 20;
     private const int ProbeCandidatesPerRequestedClip = 4;
     private const int MaximumProbeCacheEntries = 512;
@@ -41,6 +41,7 @@ public sealed class ClipLibraryService
     private static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan DefaultThumbnailTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan DefaultMaximumTotalProbeDuration = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MaximumDiscoveryElapsed = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan DefaultInvalidProbeCacheDuration = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan InvalidThumbnailValidationCacheDuration = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MaximumTotalThumbnailDuration = TimeSpan.FromSeconds(20);
@@ -1237,11 +1238,26 @@ public sealed class ClipLibraryService
         }
 
         var newestCandidates = new PriorityQueue<ClipCandidate, long>();
+        var discoveryStarted = Stopwatch.GetTimestamp();
+        var inspectedEntries = 0;
         try
         {
             foreach (var path in Directory.EnumerateFiles(rootDirectory, "*", SearchOption.TopDirectoryOnly))
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                inspectedEntries++;
+                if (!ShouldContinueDiscovery(
+                        inspectedEntries,
+                        Stopwatch.GetElapsedTime(discoveryStarted)))
+                {
+                    // Enumeration order is not newest-first. Returning the
+                    // prefix here could hide the real newest clips and label an
+                    // arbitrary older subset as Recent. Fail without replacing
+                    // the caller's existing identity-bound snapshot instead.
+                    throw new InvalidOperationException(
+                        "The clips folder is too large or slow to scan safely in one refresh. Move recordings into a responsive local ClipForge folder and try again.");
+                }
+
                 if (!TryGetCurrentCandidate(rootDirectory, path, out var candidate) ||
                     !MatchesFilter(candidate.Kind, filter))
                 {
@@ -1268,6 +1284,12 @@ public sealed class ClipLibraryService
             .ToArray();
         return new DiscoveryResult(rootDirectory, ordered);
     }
+
+    internal static bool ShouldContinueDiscovery(
+        int inspectedEntries,
+        TimeSpan elapsed) =>
+        inspectedEntries <= MaximumDiscoveryEntriesInspected &&
+        elapsed <= MaximumDiscoveryElapsed;
 
     private static bool TryGetCurrentCandidate(
         string rootDirectory,
@@ -1990,37 +2012,12 @@ public sealed class ClipLibraryService
 
     internal static bool TryDecodeThumbnailForValidation(string path)
     {
-        try
-        {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
-                bufferSize: 64 * 1024,
-                FileOptions.SequentialScan);
-            var image = new BitmapImage();
-            image.BeginInit();
-            image.CacheOption = BitmapCacheOption.OnLoad;
-            image.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-            // A tiny decode still traverses the complete JPEG bitstream while
-            // bounding retained WIC/WPF pixels for a malformed cache entry.
-            image.DecodePixelWidth = 64;
-            image.DecodePixelHeight = 64;
-            image.StreamSource = stream;
-            image.EndInit();
-            image.Freeze();
-            return image.PixelWidth > 0 &&
-                   image.PixelHeight > 0 &&
-                   image.PixelWidth <= 64 &&
-                   image.PixelHeight <= 64;
-        }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or ArgumentException or
-                NotSupportedException or InvalidOperationException or FileFormatException)
-        {
-            return false;
-        }
+        // Validate with the exact WIC options used by the gallery presentation
+        // path and prime its frozen-image cache off the dispatcher. A JPEG must
+        // never be cached as valid when the UI cannot decode it, and binding the
+        // resulting card must not repeat a 640px WIC decode on the UI thread.
+        return global::ClipForge.ThumbnailPathConverter
+            .TryGetOrDecodeFrozenThumbnail(path) is not null;
     }
 
     private bool TryGetCachedThumbnailValidation(

@@ -4,6 +4,32 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.11] - 2026-07-25
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- Capability results are no longer trusted forever. Positive WGC selections expire after ten minutes, a confirmed real launch failure invalidates only the exact cached configuration and receives one fresh end-to-end probe, and long-running GDI fallback sessions recheck WGC with a five-to-thirty-minute backoff. An optional GDI-to-WGC promotion now stops the healthy recorder only at a completed segment boundary; a failed promotion restores verified GDI without discarding the retained ring.
+- Startup replay-residue cleanup is fully off the UI thread, bounded by candidates/files/time, and cooperatively cancelled before capture if a filesystem or antivirus filter exceeds the one-second start budget. A delayed enumerator can no longer delete the newly active session or continue bulk disk work alongside the recorder.
+- Save Clip leaves the WPF dispatcher before scanning the segment tail, and state publication is serialized so a late save completion cannot overwrite a newer Faulted or Stopped state. Shutdown independently persists settings, stops capture, disposes both maintenance schedulers, and completes best-effort cleanup even when one stage fails.
+- Recent and Library discovery fail closed instead of presenting an arbitrary directory prefix as the newest clips. Missing posters use bounded progressive passes and a shared frozen JPEG LRU; validation primes that cache off the dispatcher, long-running hydration yields, and playback cancels/waits for automatic media work before creating a decoder.
+- Main and Library media opens validate identity off the dispatcher with hard deadlines and generation checks. Player-open timeouts, deactivation, capture-critical transitions, failed media, and superseded selections release the exact playback suspension owner, while full refreshes remain deferred during playback. A paused Library clip keeps its position across a deferred refresh.
+- Autostart no longer detaches a non-cooperative gallery preload into live capture. It starts replay on a hard deadline and leaves Recent recovery to the bounded foreground/stopped lanes. Settings distinguish missing, invalid, and transiently unavailable files so a temporary read failure cannot overwrite valid configuration with defaults.
+- Save-directory and free-space work no longer performs avoidable synchronous directory creation or mapped/network-volume probing on the UI thread. Changing the save folder or Recent count invalidates the old snapshot immediately and schedules the correct replacement view.
+
+### Verification
+
+- Release builds complete with zero warnings/errors and the deterministic suite passes 71/71 tests. The exhaustive synthetic matrix passed 80 geometry checks and 160 real FFmpeg encodes across 16 source geometries, five presets, and both 30/60 FPS with no duplicated frames; the stretched 1290x980 source correctly remained native for Source and for larger no-upscale presets.
+- Controlled-motion desktop capture passed Source, 720p, 1080p, 1440p, and 2160p-up-to-native at 60 FPS through WGC/NVENC, plus representative Source and 1080p GDI fallback runs. Every case produced 120 frames over 1.999 seconds at 60.03 FPS with a 17 ms maximum packet gap and no identical run above 16.7 ms. A separate 30-second 1080p/60 system-audio-plus-microphone run produced 1,800 frames at 60.002 FPS and saved in about 748 ms.
+- All ten configured 30-second through one-hour replay lengths passed deterministic duration, frame, A/V, and export validation; the one-hour export completed in about 3.13 seconds. Concurrent replay/trim and concat timing smokes retained audio, exact trim bounds, monotonic timestamps, and left no partial or orphan helper. Release preparation verified a 489-file payload and rejected modified, extra, and missing-file tampering.
+- Synthetic and local desktop checks cannot reproduce every affected GPU driver, overlay, exclusive-fullscreen path, custom game resolution, or input-latency condition. Target-game testing on the affected PC remains required.
+
+## [1.9.0-beta.10] - 2026-07-25
+
 ### Fixed
 
 - Fixed-preset WGC downscaling now runs and is runtime-probed with the same CFR contract at Normal CPU/GPU scheduling priority. Source/native, already-fitting presets, GDI, and non-scaling compatibility paths remain Below Normal. A temporary scaled-WGC probe miss now uses a short 15-second exponential retry backoff capped at one minute, so a running app can automatically promote from GDI when WGC recovers.

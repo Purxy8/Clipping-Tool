@@ -12,7 +12,7 @@ namespace ClipForge;
 public sealed class ThumbnailPathConverter : IValueConverter
 {
     private const long MaximumThumbnailBytes = 16 * 1024 * 1024;
-    private const int DecodePixelWidth = 640;
+    internal const int DecodePixelWidth = 640;
     private const int MaximumCachedThumbnailKeys = 48;
     private const long MaximumCachedThumbnailPixels = 8L * 1024 * 1024;
     private static readonly object CacheGate = new();
@@ -33,6 +33,17 @@ public sealed class ThumbnailPathConverter : IValueConverter
             return null;
         }
 
+        return TryGetOrDecodeFrozenThumbnail(path);
+    }
+
+    public object ConvertBack(
+        object? value,
+        Type targetType,
+        object? parameter,
+        CultureInfo culture) => throw new NotSupportedException();
+
+    internal static BitmapSource? TryGetOrDecodeFrozenThumbnail(string path)
+    {
         try
         {
             var thumbnail = new FileInfo(Path.GetFullPath(path));
@@ -52,20 +63,12 @@ public sealed class ThumbnailPathConverter : IValueConverter
                 return cached;
             }
 
-            using var stream = new FileStream(
-                thumbnail.FullName,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
-                bufferSize: 64 * 1024,
-                FileOptions.SequentialScan);
-            var image = new BitmapImage();
-            image.BeginInit();
-            image.CacheOption = BitmapCacheOption.OnLoad;
-            image.DecodePixelWidth = DecodePixelWidth;
-            image.StreamSource = stream;
-            image.EndInit();
-            image.Freeze();
+            var image = TryDecodeFrozenThumbnail(thumbnail.FullName);
+            if (image is null)
+            {
+                return null;
+            }
+
             CacheThumbnail(cacheKey, image);
             return image;
         }
@@ -77,11 +80,36 @@ public sealed class ThumbnailPathConverter : IValueConverter
         }
     }
 
-    public object ConvertBack(
-        object? value,
-        Type targetType,
-        object? parameter,
-        CultureInfo culture) => throw new NotSupportedException();
+    internal static BitmapSource? TryDecodeFrozenThumbnail(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 64 * 1024,
+                FileOptions.SequentialScan);
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+            image.DecodePixelWidth = DecodePixelWidth;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image.PixelWidth > 0 && image.PixelHeight > 0
+                ? image
+                : null;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or InvalidOperationException or FileFormatException)
+        {
+            return null;
+        }
+    }
 
     private static bool TryGetCachedThumbnail(
         ThumbnailCacheKey key,

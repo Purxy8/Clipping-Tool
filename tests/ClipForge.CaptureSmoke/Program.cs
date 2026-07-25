@@ -56,6 +56,7 @@ try
             ffmpeg,
             artifactRoot,
             args.Contains("--matrix-exhaustive", StringComparer.OrdinalIgnoreCase),
+            GetOption(args, "--matrix-source"),
             GetOption(args, "--matrix-fps"),
             timeout.Token);
         return 0;
@@ -1011,6 +1012,7 @@ static async Task RunResolutionMatrixAsync(
     string ffmpeg,
     string artifactRoot,
     bool exhaustive,
+    string? sourceOption,
     string? framesPerSecondOption,
     CancellationToken cancellationToken)
 {
@@ -1020,6 +1022,7 @@ static async Task RunResolutionMatrixAsync(
     MatrixSource[] sources =
     [
         new("hd", 1280, 720),
+        new("stretched-1290x980", 1290, 980),
         new("laptop", 1366, 768),
         new("hd-plus", 1600, 900),
         new("full-hd", 1920, 1080),
@@ -1035,6 +1038,19 @@ static async Task RunResolutionMatrixAsync(
         new("odd-full-hd", 1919, 1079),
         new("odd-laptop", 1365, 767)
     ];
+    if (!string.IsNullOrWhiteSpace(sourceOption))
+    {
+        var selectedSource = sources.FirstOrDefault(source =>
+            source.Id.Equals(sourceOption, StringComparison.OrdinalIgnoreCase));
+        if (selectedSource is null)
+        {
+            throw new ArgumentException(
+                $"Unsupported matrix source '{sourceOption}'. Available sources: " +
+                $"{string.Join(", ", sources.Select(source => source.Id))}.");
+        }
+
+        sources = [selectedSource];
+    }
 
     var geometryCases = new List<ResolutionMatrixCase>();
     foreach (var source in sources)
@@ -1225,6 +1241,7 @@ static bool IsCuratedEncodedMatrixCase(ResolutionMatrixCase matrixCase) =>
     matrixCase.Source.Id switch
     {
         "full-hd" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
+        "stretched-1290x980" => matrixCase.Resolution.Id is "source" or "1080p" or "1440p",
         "sixteen-ten" => matrixCase.Resolution.Id is "1080p",
         "ultrawide" => matrixCase.Resolution.Id is "source" or "720p" or "1080p",
         "super-ultrawide" => matrixCase.Resolution.Id is "1080p",
@@ -1311,6 +1328,38 @@ static async Task RunInteractiveCaptureMatrixAsync(
         throw new InvalidOperationException("Could not locate the capture smoke assembly for child runs.");
     }
 
+    ControlledMotionSurfaceSession? motionSurface = null;
+    if (arguments.Contains("--self-motion-surface", StringComparer.OrdinalIgnoreCase))
+    {
+        if (!arguments.Contains("--motion-validation", StringComparer.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException(
+                "--self-motion-surface requires --motion-validation.");
+        }
+
+        var saveSeconds = int.TryParse(
+            GetOption(arguments, "--save-seconds"),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var parsedSaveSeconds)
+            ? Math.Clamp(parsedSaveSeconds, 2, 3_600)
+            : 6;
+        var surfaceLifetime = TimeSpan.FromSeconds(Math.Clamp(
+            resolutions.Length * (saveSeconds + 90) + 30,
+            60,
+            4_200));
+        Console.WriteLine("Starting controlled motion surface on the primary captured display...");
+        motionSurface = await ControlledMotionSurfaceSession.StartAsync(
+                surfaceLifetime,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var surfaceDisplay = motionSurface.Display;
+        Console.WriteLine(
+            $"Controlled motion surface is ready on {surfaceDisplay.DeviceName} " +
+            $"({surfaceDisplay.Width}x{surfaceDisplay.Height}). " +
+            "It will be stopped automatically after the matrix.");
+    }
+
     Console.WriteLine(
         "LIVE WGC MATRIX: this validates the currently selected display and active fullscreen surface. " +
         "It cannot change a game's internal/custom resolution; repeat it after changing that resolution.");
@@ -1320,61 +1369,72 @@ static async Task RunInteractiveCaptureMatrixAsync(
             "MOTION VALIDATION IS ENABLED: keep a continuously moving game, video, or test pattern visible " +
             "through every case. A static/paused surface intentionally fails duplicate-frame validation.");
     }
-    foreach (var resolution in resolutions)
+    try
     {
-        var startInfo = new ProcessStartInfo
+        foreach (var resolution in resolutions)
         {
-            FileName = executable,
-            UseShellExecute = false,
-            CreateNoWindow = false
-        };
-        if (hostedByDotnet)
-        {
-            startInfo.ArgumentList.Add(entryAssembly!);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                UseShellExecute = false,
+                CreateNoWindow = false
+            };
+            if (hostedByDotnet)
+            {
+                startInfo.ArgumentList.Add(entryAssembly!);
+            }
+
+            foreach (var value in new[]
+                     {
+                         "--resolution", resolution.Id,
+                         "--fps", GetOption(arguments, "--fps") ?? "60",
+                         "--artifacts", artifactRoot
+                     })
+            {
+                startInfo.ArgumentList.Add(value);
+            }
+
+            foreach (var switchName in
+                     CaptureSmokeArgumentPolicy.GetInteractiveMatrixForwardedSwitches(
+                         arguments))
+            {
+                startInfo.ArgumentList.Add(switchName);
+            }
+
+            if (GetOption(arguments, "--countdown") is { } countdown)
+            {
+                startInfo.ArgumentList.Add("--countdown");
+                startInfo.ArgumentList.Add(countdown);
+            }
+            if (GetOption(arguments, "--save-seconds") is { } saveSeconds)
+            {
+                startInfo.ArgumentList.Add("--save-seconds");
+                startInfo.ArgumentList.Add(saveSeconds);
+            }
+
+            Console.WriteLine($"Starting live capture case {resolution.Id}...");
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException(
+                    $"Could not start WGC matrix case {resolution.Id}.");
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidDataException(
+                    $"Live WGC matrix case {resolution.Id} failed with exit code {process.ExitCode}.");
+            }
         }
 
-        foreach (var value in new[]
-                 {
-                     "--resolution", resolution.Id,
-                     "--fps", GetOption(arguments, "--fps") ?? "60",
-                     "--artifacts", artifactRoot
-                 })
+        Console.WriteLine(
+            $"PASS live WGC matrix: {resolutions.Length} preset(s). " +
+            "An exclusive-fullscreen game, its custom mode, driver, and affected GPU must still be tested on the target PC.");
+    }
+    finally
+    {
+        if (motionSurface is not null)
         {
-            startInfo.ArgumentList.Add(value);
-        }
-
-        foreach (var switchName in
-                 CaptureSmokeArgumentPolicy.GetInteractiveMatrixForwardedSwitches(
-                     arguments))
-        {
-            startInfo.ArgumentList.Add(switchName);
-        }
-
-        if (GetOption(arguments, "--countdown") is { } countdown)
-        {
-            startInfo.ArgumentList.Add("--countdown");
-            startInfo.ArgumentList.Add(countdown);
-        }
-        if (GetOption(arguments, "--save-seconds") is { } saveSeconds)
-        {
-            startInfo.ArgumentList.Add("--save-seconds");
-            startInfo.ArgumentList.Add(saveSeconds);
-        }
-
-        Console.WriteLine($"Starting live capture case {resolution.Id}...");
-        using var process = Process.Start(startInfo)
-            ?? throw new InvalidOperationException($"Could not start WGC matrix case {resolution.Id}.");
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidDataException(
-                $"Live WGC matrix case {resolution.Id} failed with exit code {process.ExitCode}.");
+            await motionSurface.DisposeAsync().ConfigureAwait(false);
         }
     }
-
-    Console.WriteLine(
-        $"PASS live WGC matrix: {resolutions.Length} preset(s). " +
-        "An exclusive-fullscreen game, its custom mode, driver, and affected GPU must still be tested on the target PC.");
 }
 
 static async Task RunReplayConcurrentTrimSmokeAsync(
