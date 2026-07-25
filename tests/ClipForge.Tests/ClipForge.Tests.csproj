@@ -7,5 +7,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ClipForge\ClipForge.csproj" />
+    <Compile Include="..\ClipForge.CaptureSmoke\CaptureSmokeArgumentPolicy.cs"
+             Link="CaptureSmokeArgumentPolicy.cs" />
+    <Compile Include="..\ClipForge.CaptureSmoke\RenewalSegmentSequence.cs"
+             Link="RenewalSegmentSequence.cs" />
   </ItemGroup>
 </Project>

@@ -220,8 +220,20 @@ internal static class FfmpegArgumentBuilder
         // Exercise the same timestamp-normalization graph as live capture. A
         // capability probe must not approve a simpler D3D11-to-encoder path than
         // the one that will run continuously.
+        arguments.AddRange(["-vf", "setpts=PTS-STARTPTS"]);
+        if (output.RequiresScaling)
+        {
+            // Live replay is constant-frame-rate. Without this production output
+            // contract, a quiet desktop or an application that repaints below
+            // the requested rate makes WGC's change-driven input appear slow and
+            // falsely locks fixed presets onto the heavier GDI fallback.
+            arguments.AddRange([
+                "-fps_mode", "cfr",
+                "-r", Invariant(configuration.FramesPerSecond)
+            ]);
+        }
+
         arguments.AddRange([
-            "-vf", "setpts=PTS-STARTPTS",
             "-frames:v", Invariant(probeFrames),
             "-an"
         ]);

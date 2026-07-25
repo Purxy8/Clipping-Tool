@@ -18,6 +18,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private const int MaximumLegacyCleanupDirectories = 2;
     private const int MaximumLegacyDirectoryCandidates = 64;
     private const int MaximumLegacyCleanupFilesPerDirectory = 10_000;
+    private const int MaximumInactiveWindowsSessionRootsPerRun = 2;
+    private const int MaximumWindowsSessionRootCandidates = 16;
+    private const int MaximumWindowsSessionRootInspectionsPerRun = 64;
+    private const int MaximumWindowsSessionCleanupSuffixLength = 10;
+    private const string WindowsSessionCleanupCursorFileName =
+        ".windows-session-cleanup.cursor";
+    private const int MaximumWindowsSessionDirectoriesPerRoot = 8;
+    private const int MaximumWindowsSessionFilesPerDirectory = 4_096;
+    internal const int MaximumSegmentDeleteAttemptsPerRefresh = 64;
     private static readonly TimeSpan CaptureHealthPollInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan BufferRefreshInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CapturePriorityRefreshInterval = TimeSpan.FromSeconds(30);
@@ -49,7 +58,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly ScheduledCaptureRefreshCoordinator _scheduledCaptureRefreshCoordinator;
     private readonly TaskCompletionSource _disposeCompletion = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly Task _legacyBufferCleanupTask;
+    private readonly Task _initialBufferMaintenanceTask;
 
     private Process? _captureProcess;
     private CaptureProcessJob? _captureProcessJob;
@@ -78,6 +87,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _nextSegmentNumber;
     private int _activeCaptureGeneration;
     private int _quarantinedGenerationHeadSegmentNumber = -1;
+    private int _untrustedDeleteCursorSegmentNumber = -1;
+    private int _trustedDeleteCursorSegmentNumber = -1;
     private int _isRunning;
     private int _isSaving;
     private int _saveOperationPending;
@@ -91,7 +102,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
     public ReplayBufferService(
         FfmpegSetupService? ffmpegSetupService = null,
         string? bufferRoot = null)
+        : this(
+            ffmpegSetupService,
+            bufferRoot,
+            initialBufferMaintenanceOverride: null,
+            initialize: true)
     {
+    }
+
+    private ReplayBufferService(
+        FfmpegSetupService? ffmpegSetupService,
+        string? bufferRoot,
+        Func<Task>? initialBufferMaintenanceOverride,
+        bool initialize)
+    {
+        _ = initialize;
         _ffmpegSetupService = ffmpegSetupService ?? new FfmpegSetupService();
         _bufferRoot = Path.GetFullPath(bufferRoot ?? GetDefaultBufferRoot());
         _scheduledCaptureRefreshCoordinator = new ScheduledCaptureRefreshCoordinator(
@@ -101,22 +126,25 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     $"Background WGC renewal for process {processId} failed: " +
                     $"{diagnostic} {exception.GetBaseException().Message}"));
 
-        // MainWindow creates this service only after primary single-instance
-        // ownership is established, so pre-existing sessions are crash residue.
-        CleanupStaleBuffers();
-        if (IsDefaultBufferRoot(_bufferRoot) && !HasPossibleLegacyBufferOwner())
-        {
-            // Snapshot ownership before automatic replay can start. Old builds
-            // could leave thousands of two-second files directly below Buffer,
-            // so perform the bounded work off the WPF thread and make StartAsync
-            // wait for it rather than overlapping disk/AV maintenance with capture.
-            _legacyBufferCleanupTask = Task.Run(() =>
-                CleanupLegacyStaleBuffers(potentialOwnerRunning: false));
-        }
-        else
-        {
-            _legacyBufferCleanupTask = Task.CompletedTask;
-        }
+        // Crash residue can contain thousands of large two-second segments.
+        // Never enumerate or recursively delete it on the WPF constructor path.
+        // StartAsync awaits this worker before it creates a new session, so
+        // capture and disk/AV maintenance still cannot overlap.
+        _initialBufferMaintenanceTask = Task.Run(
+            () => RunInitialBufferMaintenanceAsync(initialBufferMaintenanceOverride));
+    }
+
+    internal ReplayBufferService(
+        FfmpegSetupService ffmpegSetupService,
+        string bufferRoot,
+        Func<Task> initialBufferMaintenanceOverride)
+        : this(
+            ffmpegSetupService,
+            bufferRoot,
+            initialBufferMaintenanceOverride ??
+            throw new ArgumentNullException(nameof(initialBufferMaintenanceOverride)),
+            initialize: true)
+    {
     }
 
     internal ReplayBufferService(
@@ -140,6 +168,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
             $"WindowsSession-{process.SessionId}");
     }
 
+    internal Task WaitForInitialBufferMaintenanceAsync() =>
+        _initialBufferMaintenanceTask;
+
     public event EventHandler<ReplayStateSnapshot>? StateChanged;
 
     internal event EventHandler<CaptureRecoveryRequestedEventArgs>? CaptureRecoveryRequested;
@@ -149,6 +180,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
     public string? ActiveEncoderDescription => _activeEncoderDescription;
 
     internal CaptureSessionPlan? LastCapturePlan => Volatile.Read(ref _lastCapturePlan);
+
+    // Capture smoke tests must distinguish a real numbering hole from a
+    // generation head that the engine deliberately quarantined and deleted.
+    // Return only provenance; the mutable segment index remains encapsulated.
+    internal ReplayCaptureGenerationSnapshot ReadCaptureGenerationSnapshotForTesting()
+    {
+        lock (_fileGate)
+        {
+            return new ReplayCaptureGenerationSnapshot(
+                _activeCaptureGeneration,
+                _quarantinedGenerationHeadSegmentNumber);
+        }
+    }
 
     internal static bool ShouldScheduleCaptureRefresh(
         DesktopCaptureBackend captureBackend,
@@ -196,7 +240,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
         ThrowIfDisposed();
         try
         {
-            await _legacyBufferCleanupTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _initialBufferMaintenanceTask
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -208,7 +254,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             // filesystem failures are already contained inside the worker; an
             // unexpected fault is retained as a diagnostic and replay continues.
             EnqueueDiagnostic(
-                $"Legacy replay maintenance did not complete: {exception.GetBaseException().Message}");
+                $"Initial replay maintenance did not complete: {exception.GetBaseException().Message}");
         }
 
         await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -829,12 +875,65 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 "Replay length must be between two seconds and one hour.");
         }
 
+        ReplayStateSnapshot snapshot;
         lock (_fileGate)
         {
             _retention = retention;
+            snapshot = BuildRetentionUpdateSnapshot(
+                _state,
+                retention,
+                IsRunning,
+                _activeEncoderDescription);
         }
 
-        RefreshBufferState();
+        // Pruning can require deleting almost 1,800 files after a 1h -> 30s
+        // change. Publish the clamped state in O(1) and let MonitorCaptureAsync
+        // perform bounded deletion batches away from the WPF event handler.
+        Publish(snapshot);
+    }
+
+    internal static ReplayStateSnapshot BuildRetentionUpdateSnapshot(
+        ReplayStateSnapshot current,
+        TimeSpan retention,
+        bool isRunning,
+        string? encoderDescription)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        if (retention < TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds) ||
+            retention > TimeSpan.FromHours(1))
+        {
+            throw new ArgumentOutOfRangeException(nameof(retention));
+        }
+
+        var available = current.AvailableDuration > retention
+            ? retention
+            : current.AvailableDuration;
+        var state = current.State;
+        if (isRunning && state is ReplayState.Buffering or ReplayState.Ready)
+        {
+            state = available >= retention
+                ? ReplayState.Ready
+                : ReplayState.Buffering;
+        }
+
+        var engine = string.IsNullOrWhiteSpace(encoderDescription)
+            ? "the capture engine"
+            : encoderDescription;
+        var message = state switch
+        {
+            ReplayState.Ready when isRunning =>
+                $"Instant Replay is ready using {engine}.",
+            ReplayState.Buffering when isRunning =>
+                $"Instant Replay is filling its buffer using {engine}.",
+            _ => current.Message
+        };
+        return current with
+        {
+            State = state,
+            AvailableDuration = available,
+            Retention = retention,
+            Message = message
+        };
     }
 
     /// <summary>
@@ -1765,55 +1864,122 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         TimeSpan available;
+        TimeSpan retention;
         long bytes;
 
         lock (_fileGate)
         {
             RefreshSegmentIndexLocked();
+            retention = _retention;
             var maximumCompletedSegments = checked((int)Math.Ceiling(
-                _retention.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
-
+                retention.TotalSeconds / FfmpegArgumentBuilder.SegmentSeconds));
+            var completedRangeLength = Math.Max(0, _segments.Count - 1);
+            var trustedCompletedCount = _segments
+                .Take(completedRangeLength)
+                .Count(segment => segment.Length > 0 && segment.IsTrusted);
+            var removableUntrustedSegments = _segments
+                .Take(completedRangeLength)
+                .Where(segment =>
+                    !segment.IsTrusted &&
+                    !_protectedSegments.Contains(segment.Path))
+                .ToArray();
+            var deleteAttemptBudgets = CalculateSegmentDeleteAttemptBudgets(
+                trustedCompletedCount,
+                maximumCompletedSegments,
+                removableUntrustedSegments.Length);
             // Once a later segment exists, a quarantined generation head is
             // closed and can be removed. If Windows temporarily keeps the file
             // open, it remains untrusted but does not consume replay capacity.
-            for (var index = _segments.Count - 2; index >= 0; index--)
+            // Separate shares of the bounded per-refresh budget prevent many
+            // undeletable quarantined heads from starving trusted retention
+            // pruning. Unused capacity is lent to the other class.
+            var untrustedStartIndex = FindCyclicCandidateStartIndex(
+                removableUntrustedSegments
+                    .Select(segment => segment.SegmentNumber)
+                    .ToArray(),
+                _untrustedDeleteCursorSegmentNumber);
+            var untrustedPage = BuildCyclicCandidatePage(
+                removableUntrustedSegments.Length,
+                deleteAttemptBudgets.UntrustedAttempts,
+                untrustedStartIndex);
+            if (untrustedPage.CandidateIndices.Length > 0)
             {
-                var segment = _segments[index];
-                if (segment.IsTrusted ||
-                    _protectedSegments.Contains(segment.Path) ||
-                    !TryDeleteFile(segment.Path))
+                _untrustedDeleteCursorSegmentNumber =
+                    removableUntrustedSegments[untrustedPage.NextOffset]
+                        .SegmentNumber;
+            }
+            foreach (var candidateIndex in untrustedPage.CandidateIndices)
+            {
+                var segment = removableUntrustedSegments[candidateIndex];
+                if (!TryDeleteFile(segment.Path))
+                {
+                    continue;
+                }
+
+                var currentIndex = _segments.FindIndex(candidate =>
+                    candidate.Path.Equals(
+                        segment.Path,
+                        StringComparison.OrdinalIgnoreCase));
+                if (currentIndex < 0)
                 {
                     continue;
                 }
 
                 _bufferBytes = Math.Max(0, _bufferBytes - segment.Length);
-                _segments.RemoveAt(index);
+                _segments.RemoveAt(currentIndex);
             }
 
-            var trustedCompletedCount = _segments
+            var trustedCompletedSegments = _segments
                 .Take(Math.Max(0, _segments.Count - 1))
-                .Count(segment => segment.Length > 0 && segment.IsTrusted);
-            while (trustedCompletedCount > maximumCompletedSegments)
+                .Where(segment =>
+                    segment.Length > 0 &&
+                    segment.IsTrusted)
+                .ToArray();
+            var trustedExcessSegmentNumbers =
+                SelectTrustedExcessSegmentNumbers(
+                    trustedCompletedSegments
+                        .Select(segment => segment.SegmentNumber)
+                        .ToArray(),
+                    maximumCompletedSegments)
+                .ToHashSet();
+            var trustedCandidates = trustedCompletedSegments
+                .Where(segment =>
+                    trustedExcessSegmentNumbers.Contains(
+                        segment.SegmentNumber) &&
+                    !_protectedSegments.Contains(segment.Path))
+                .ToArray();
+            var trustedStartIndex = FindCyclicCandidateStartIndex(
+                trustedCandidates.Select(segment => segment.SegmentNumber).ToArray(),
+                _trustedDeleteCursorSegmentNumber);
+            var trustedPage = BuildCyclicCandidatePage(
+                trustedCandidates.Length,
+                deleteAttemptBudgets.TrustedAttempts,
+                trustedStartIndex);
+            if (trustedPage.CandidateIndices.Length > 0)
             {
-                var candidateIndex = _segments.FindIndex(
-                    0,
-                    Math.Max(0, _segments.Count - 1),
-                    segment => segment.Length > 0 &&
-                               segment.IsTrusted &&
-                               !_protectedSegments.Contains(segment.Path));
-                if (candidateIndex < 0)
-                {
-                    break;
-                }
+                _trustedDeleteCursorSegmentNumber =
+                    trustedCandidates[trustedPage.NextOffset].SegmentNumber;
+            }
 
-                var candidate = _segments[candidateIndex];
+            foreach (var candidateIndex in trustedPage.CandidateIndices)
+            {
+                var candidate = trustedCandidates[candidateIndex];
                 if (!TryDeleteFile(candidate.Path))
                 {
-                    break;
+                    continue;
+                }
+
+                var currentIndex = _segments.FindIndex(segment =>
+                    segment.Path.Equals(
+                        candidate.Path,
+                        StringComparison.OrdinalIgnoreCase));
+                if (currentIndex < 0)
+                {
+                    continue;
                 }
 
                 _bufferBytes = Math.Max(0, _bufferBytes - candidate.Length);
-                _segments.RemoveAt(candidateIndex);
+                _segments.RemoveAt(currentIndex);
                 trustedCompletedCount--;
             }
 
@@ -1821,20 +1987,20 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 .Take(Math.Max(0, _segments.Count - 1))
                 .Count(segment => segment.Length > 0 && segment.IsTrusted);
             available = TimeSpan.FromSeconds(Math.Min(
-                _retention.TotalSeconds,
+                retention.TotalSeconds,
                 completedCount * FfmpegArgumentBuilder.SegmentSeconds));
             bytes = _bufferBytes;
         }
 
         var replayState = Volatile.Read(ref _isSaving) != 0
             ? ReplayState.Saving
-            : available >= _retention
+            : available >= retention
                 ? ReplayState.Ready
                 : ReplayState.Buffering;
         Publish(new ReplayStateSnapshot(
             replayState,
             available,
-            _retention,
+            retention,
             bytes,
             replayState == ReplayState.Ready
                 ? $"Instant Replay is ready using {_activeEncoderDescription}."
@@ -1842,6 +2008,150 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     ? "Saving your clip…"
                     : $"Instant Replay is filling its buffer using {_activeEncoderDescription}.",
             lastSavedPath ?? _lastSavedPath));
+    }
+
+    internal static int CalculateSegmentDeleteAttemptBudget(
+        int trustedCompletedCount,
+        int maximumCompletedSegments,
+        int removableUntrustedCount)
+    {
+        var budgets = CalculateSegmentDeleteAttemptBudgets(
+            trustedCompletedCount,
+            maximumCompletedSegments,
+            removableUntrustedCount);
+        return budgets.UntrustedAttempts + budgets.TrustedAttempts;
+    }
+
+    internal static (
+        int UntrustedAttempts,
+        int TrustedAttempts) CalculateSegmentDeleteAttemptBudgets(
+        int trustedCompletedCount,
+        int maximumCompletedSegments,
+        int removableUntrustedCount)
+    {
+        if (trustedCompletedCount < 0 ||
+            maximumCompletedSegments < 0 ||
+            removableUntrustedCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(trustedCompletedCount),
+                "Segment counts cannot be negative.");
+        }
+
+        var excessTrusted = Math.Max(
+            0L,
+            (long)trustedCompletedCount - maximumCompletedSegments);
+        if (excessTrusted == 0)
+        {
+            return (
+                Math.Min(
+                    MaximumSegmentDeleteAttemptsPerRefresh,
+                    removableUntrustedCount),
+                0);
+        }
+
+        if (removableUntrustedCount == 0)
+        {
+            return (
+                0,
+                (int)Math.Min(
+                    MaximumSegmentDeleteAttemptsPerRefresh,
+                    excessTrusted));
+        }
+
+        var fairShare = MaximumSegmentDeleteAttemptsPerRefresh / 2;
+        var untrustedAttempts = Math.Min(
+            fairShare,
+            removableUntrustedCount);
+        var trustedAttempts = (int)Math.Min(fairShare, excessTrusted);
+        var remaining = MaximumSegmentDeleteAttemptsPerRefresh -
+                        untrustedAttempts -
+                        trustedAttempts;
+
+        var additionalTrusted = (int)Math.Min(
+            remaining,
+            excessTrusted - trustedAttempts);
+        trustedAttempts += additionalTrusted;
+        remaining -= additionalTrusted;
+
+        untrustedAttempts += Math.Min(
+            remaining,
+            removableUntrustedCount - untrustedAttempts);
+        return (untrustedAttempts, trustedAttempts);
+    }
+
+    internal static (
+        int[] CandidateIndices,
+        int NextOffset) BuildCyclicCandidatePage(
+        int candidateCount,
+        int maximumAttempts,
+        int startOffset)
+    {
+        if (candidateCount < 0 || maximumAttempts < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(candidateCount),
+                "Candidate counts and attempt limits cannot be negative.");
+        }
+
+        if (candidateCount == 0 || maximumAttempts == 0)
+        {
+            return ([], 0);
+        }
+
+        var normalizedStart = (int)(
+            ((long)startOffset % candidateCount + candidateCount) %
+            candidateCount);
+        var attemptCount = Math.Min(candidateCount, maximumAttempts);
+        var indices = new int[attemptCount];
+        for (var offset = 0; offset < attemptCount; offset++)
+        {
+            indices[offset] = (normalizedStart + offset) % candidateCount;
+        }
+
+        return (
+            indices,
+            (normalizedStart + attemptCount) % candidateCount);
+    }
+
+    internal static int FindCyclicCandidateStartIndex(
+        IReadOnlyList<int> orderedCandidateIds,
+        int nextCandidateId)
+    {
+        ArgumentNullException.ThrowIfNull(orderedCandidateIds);
+        if (orderedCandidateIds.Count == 0 || nextCandidateId < 0)
+        {
+            return 0;
+        }
+
+        for (var index = 0; index < orderedCandidateIds.Count; index++)
+        {
+            if (orderedCandidateIds[index] >= nextCandidateId)
+            {
+                return index;
+            }
+        }
+
+        return 0;
+    }
+
+    internal static IReadOnlyList<int> SelectTrustedExcessSegmentNumbers(
+        IReadOnlyList<int> orderedTrustedSegmentNumbers,
+        int maximumCompletedSegments)
+    {
+        ArgumentNullException.ThrowIfNull(orderedTrustedSegmentNumbers);
+        if (maximumCompletedSegments < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumCompletedSegments));
+        }
+
+        var excessCount = Math.Max(
+            0,
+            orderedTrustedSegmentNumbers.Count - maximumCompletedSegments);
+        return orderedTrustedSegmentNumbers
+            .Take(excessCount)
+            .ToArray();
     }
 
     private List<string> GetCompletedSegmentsLocked(int maximumCount)
@@ -1937,6 +2247,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _nextSegmentNumber = 0;
         _activeCaptureGeneration = 0;
         _quarantinedGenerationHeadSegmentNumber = -1;
+        _untrustedDeleteCursorSegmentNumber = -1;
+        _trustedDeleteCursorSegmentNumber = -1;
     }
 
     private void BeginCaptureGenerationLocked(int firstSegmentNumber)
@@ -2904,6 +3216,46 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
+    private async Task RunInitialBufferMaintenanceAsync(
+        Func<Task>? initialBufferMaintenanceOverride)
+    {
+        if (initialBufferMaintenanceOverride is not null)
+        {
+            await initialBufferMaintenanceOverride().ConfigureAwait(false);
+            return;
+        }
+
+        // MainWindow creates this service only after primary single-instance
+        // ownership is established, so pre-existing sessions in this Windows
+        // session are crash residue.
+        CleanupStaleBuffers();
+        if (!IsDefaultBufferRoot(_bufferRoot) ||
+            !TryGetBufferOwnerSessions(
+                out var activeOwnerSessionIds,
+                out var anotherPotentialOwnerIsRunning))
+        {
+            return;
+        }
+
+        var bufferParent = Path.GetDirectoryName(_bufferRoot);
+        if (!string.IsNullOrWhiteSpace(bufferParent))
+        {
+            _ = CleanupInactiveWindowsSessionBufferRoots(
+                bufferParent,
+                _bufferRoot,
+                DateTime.UtcNow,
+                activeOwnerSessionIds,
+                ownershipEstablished: true);
+        }
+
+        // Old builds wrote session-* directly below Buffer. Preserve the older,
+        // stricter all-owner gate for that unscoped layout.
+        if (!anotherPotentialOwnerIsRunning)
+        {
+            CleanupLegacyStaleBuffers(potentialOwnerRunning: false);
+        }
+    }
+
     private void CleanupStaleBuffers()
     {
         if (!IsSafeBufferRootPath(_bufferRoot))
@@ -2978,6 +3330,684 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return false;
         }
     }
+
+    internal static bool IsSafeWindowsSessionBufferRootPath(
+        string bufferParent,
+        string candidatePath,
+        FileAttributes attributes)
+    {
+        if ((attributes & FileAttributes.Directory) == 0 ||
+            (attributes & FileAttributes.ReparsePoint) != 0 ||
+            !IsSafeBufferRootPath(bufferParent) ||
+            !Path.IsPathFullyQualified(bufferParent) ||
+            !Path.IsPathFullyQualified(candidatePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedParent = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(bufferParent));
+            var normalizedCandidate = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(candidatePath));
+            return normalizedParent.Equals(
+                       Path.GetDirectoryName(normalizedCandidate),
+                       StringComparison.OrdinalIgnoreCase) &&
+                   TryParseWindowsSessionRootName(
+                       Path.GetFileName(normalizedCandidate),
+                       out _);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or IOException or
+                UnauthorizedAccessException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    internal static int CleanupInactiveWindowsSessionBufferRoots(
+        string bufferParent,
+        string currentBufferRoot,
+        DateTime utcNow,
+        IReadOnlySet<int> activeOwnerSessionIds,
+        bool ownershipEstablished)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(bufferParent);
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentBufferRoot);
+        ArgumentNullException.ThrowIfNull(activeOwnerSessionIds);
+        if (!ownershipEstablished ||
+            !IsSafeBufferRootPath(bufferParent) ||
+            !Path.IsPathFullyQualified(currentBufferRoot))
+        {
+            return 0;
+        }
+
+        try
+        {
+            var normalizedParent = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(bufferParent));
+            var normalizedCurrent = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(currentBufferRoot));
+            if (!normalizedParent.Equals(
+                    Path.GetDirectoryName(normalizedCurrent),
+                    StringComparison.OrdinalIgnoreCase) ||
+                !TryParseWindowsSessionRootName(
+                    Path.GetFileName(normalizedCurrent),
+                    out _))
+            {
+                return 0;
+            }
+
+            if (!TryReadWindowsSessionCleanupCursor(
+                    normalizedParent,
+                    out var scanSuffix))
+            {
+                return 0;
+            }
+
+            var scan = SelectInactiveWindowsSessionBufferRootCandidates(
+                normalizedParent,
+                normalizedCurrent,
+                utcNow,
+                activeOwnerSessionIds,
+                scanSuffix,
+                Directory.EnumerateDirectories(
+                    normalizedParent,
+                    BuildWindowsSessionCleanupSearchPattern(scanSuffix),
+                    SearchOption.TopDirectoryOnly));
+            // Persist the next bounded bucket before deleting. A crash can skip
+            // this page until the scan wraps, but can never pin every later
+            // page behind the same unsafe prefix across process restarts.
+            if (!TryPersistWindowsSessionCleanupCursor(
+                    normalizedParent,
+                    scan.NextSuffix))
+            {
+                return 0;
+            }
+
+            var removed = 0;
+            foreach (var candidate in scan.Candidates)
+            {
+                if (removed >= MaximumInactiveWindowsSessionRootsPerRun)
+                {
+                    break;
+                }
+
+                // Re-check process ownership immediately before each deletion.
+                // A new process in this Windows session makes the stale snapshot
+                // ineligible even if it appeared after enumeration began.
+                if (!TryGetBufferOwnerSessions(
+                        out var refreshedOwnerSessionIds,
+                        out _) ||
+                    refreshedOwnerSessionIds.Contains(candidate.SessionId))
+                {
+                    continue;
+                }
+
+                if (TryDeleteValidatedWindowsSessionBufferRoot(
+                        normalizedParent,
+                        candidate.Path,
+                        utcNow))
+                {
+                    removed++;
+                }
+            }
+
+            return removed;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return 0;
+        }
+    }
+
+    internal static WindowsSessionCleanupScanResult
+        SelectInactiveWindowsSessionBufferRootCandidates(
+            string normalizedParent,
+            string normalizedCurrent,
+            DateTime utcNow,
+            IReadOnlySet<int> activeOwnerSessionIds,
+            string scanSuffix,
+            IEnumerable<string> candidatePaths)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(normalizedParent);
+        ArgumentException.ThrowIfNullOrWhiteSpace(normalizedCurrent);
+        ArgumentNullException.ThrowIfNull(activeOwnerSessionIds);
+        ArgumentNullException.ThrowIfNull(candidatePaths);
+        if (!IsValidWindowsSessionCleanupSuffix(scanSuffix))
+        {
+            throw new ArgumentException(
+                "The Windows-session cleanup suffix is invalid.",
+                nameof(scanSuffix));
+        }
+
+        var now = utcNow.ToUniversalTime();
+        var enumeratedPaths = candidatePaths
+            .Take(MaximumWindowsSessionRootInspectionsPerRun + 1)
+            .ToArray();
+        var bucketOverflowed =
+            enumeratedPaths.Length > MaximumWindowsSessionRootInspectionsPerRun;
+        IReadOnlyList<string> pathsToInspect;
+        if (bucketOverflowed)
+        {
+            // Children "*0{suffix}" through "*9{suffix}" partition every
+            // longer decimal session ID. Inspect the exact suffix separately
+            // before descending, because it belongs to no child bucket.
+            pathsToInspect = scanSuffix.Length == 0
+                ? []
+                : [Path.Combine(normalizedParent, $"WindowsSession-{scanSuffix}")];
+        }
+        else
+        {
+            pathsToInspect = enumeratedPaths;
+        }
+
+        var eligibleCandidates = new List<WindowsSessionCleanupCandidate>();
+        var inspectedCount = 0;
+        foreach (var path in pathsToInspect)
+        {
+            try
+            {
+                var normalizedCandidate = Path.TrimEndingDirectorySeparator(
+                    Path.GetFullPath(path));
+                var candidateName = Path.GetFileName(normalizedCandidate);
+                if (normalizedCandidate.Equals(
+                        normalizedCurrent,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    !IsWindowsSessionRootInCleanupBucket(
+                        candidateName,
+                        scanSuffix))
+                {
+                    continue;
+                }
+
+                inspectedCount++;
+                if (!TryInspectWindowsSessionBufferRoot(
+                        normalizedParent,
+                        normalizedCandidate,
+                        out var candidate) ||
+                    activeOwnerSessionIds.Contains(candidate.SessionId) ||
+                    now - candidate.LatestWriteTimeUtc <
+                    LegacyBufferMinimumInactivity)
+                {
+                    continue;
+                }
+
+                eligibleCandidates.Add(candidate);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or
+                    ArgumentException or NotSupportedException or SecurityException)
+            {
+                // One malformed/inaccessible sibling cannot escape the bounded
+                // page or hide the next durable bucket.
+            }
+        }
+
+        var nextSuffix = bucketOverflowed &&
+                         scanSuffix.Length <
+                         MaximumWindowsSessionCleanupSuffixLength
+            ? $"0{scanSuffix}"
+            : AdvanceWindowsSessionCleanupSuffix(scanSuffix);
+        return new WindowsSessionCleanupScanResult(
+            eligibleCandidates
+                .OrderBy(item => item.LatestWriteTimeUtc)
+                .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+                .Take(MaximumWindowsSessionRootCandidates)
+                .ToArray(),
+            nextSuffix,
+            enumeratedPaths.Length,
+            inspectedCount);
+    }
+
+    private static string BuildWindowsSessionCleanupSearchPattern(
+        string scanSuffix) =>
+        scanSuffix.Length == 0
+            ? "WindowsSession-*"
+            : $"WindowsSession-*{scanSuffix}";
+
+    private static bool IsWindowsSessionRootInCleanupBucket(
+        string name,
+        string scanSuffix)
+    {
+        if (!TryParseWindowsSessionRootName(name, out var sessionId))
+        {
+            return false;
+        }
+
+        return sessionId
+            .ToString(CultureInfo.InvariantCulture)
+            .EndsWith(scanSuffix, StringComparison.Ordinal);
+    }
+
+    private static bool IsValidWindowsSessionCleanupSuffix(string suffix) =>
+        suffix.Length <= MaximumWindowsSessionCleanupSuffixLength &&
+        suffix.All(character => character is >= '0' and <= '9');
+
+    internal static string AdvanceWindowsSessionCleanupSuffix(string suffix)
+    {
+        if (!IsValidWindowsSessionCleanupSuffix(suffix))
+        {
+            throw new ArgumentException(
+                "The Windows-session cleanup suffix is invalid.",
+                nameof(suffix));
+        }
+
+        var current = suffix;
+        while (current.Length > 0)
+        {
+            var childDigit = current[0];
+            var parent = current[1..];
+            if (childDigit < '9')
+            {
+                return $"{(char)(childDigit + 1)}{parent}";
+            }
+
+            current = parent;
+        }
+
+        return string.Empty;
+    }
+
+    private static bool TryReadWindowsSessionCleanupCursor(
+        string normalizedParent,
+        out string scanSuffix)
+    {
+        scanSuffix = string.Empty;
+        try
+        {
+            var cursorPath = Path.GetFullPath(Path.Combine(
+                normalizedParent,
+                WindowsSessionCleanupCursorFileName));
+            if (!normalizedParent.Equals(
+                    Path.GetDirectoryName(cursorPath),
+                    StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(cursorPath))
+            {
+                return true;
+            }
+
+            var cursor = new FileInfo(cursorPath);
+            cursor.Refresh();
+            if (!cursor.Exists ||
+                (cursor.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            if (cursor.Length > MaximumWindowsSessionCleanupSuffixLength)
+            {
+                // Treat a corrupt regular cursor as the root bucket. The
+                // subsequent atomic write repairs it without trusting content.
+                return true;
+            }
+
+            using var stream = new FileStream(
+                cursorPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 64,
+                FileOptions.SequentialScan);
+            if (stream.Length > MaximumWindowsSessionCleanupSuffixLength)
+            {
+                return true;
+            }
+
+            var bytes = new byte[checked((int)stream.Length)];
+            stream.ReadExactly(bytes);
+            var persisted = Encoding.ASCII.GetString(bytes);
+            if (IsValidWindowsSessionCleanupSuffix(persisted))
+            {
+                scanSuffix = persisted;
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryPersistWindowsSessionCleanupCursor(
+        string normalizedParent,
+        string scanSuffix)
+    {
+        if (!IsValidWindowsSessionCleanupSuffix(scanSuffix) ||
+            !IsSafeBufferRootPath(normalizedParent))
+        {
+            return false;
+        }
+
+        string? temporaryPath = null;
+        try
+        {
+            var cursorPath = Path.GetFullPath(Path.Combine(
+                normalizedParent,
+                WindowsSessionCleanupCursorFileName));
+            if (!normalizedParent.Equals(
+                    Path.GetDirectoryName(cursorPath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (File.Exists(cursorPath))
+            {
+                var attributes = File.GetAttributes(cursorPath);
+                if ((attributes &
+                     (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+            }
+
+            temporaryPath = Path.Combine(
+                normalizedParent,
+                $".windows-session-cleanup-{Guid.NewGuid():N}.tmp");
+            var bytes = Encoding.ASCII.GetBytes(scanSuffix);
+            using (var stream = new FileStream(
+                       temporaryPath,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       bufferSize: 64,
+                       FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+
+            File.Move(temporaryPath, cursorPath, overwrite: true);
+            temporaryPath = null;
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (temporaryPath is not null)
+            {
+                TryDeleteFile(temporaryPath);
+            }
+        }
+    }
+
+    private static bool TryInspectWindowsSessionBufferRoot(
+        string bufferParent,
+        string candidatePath,
+        out WindowsSessionCleanupCandidate candidate)
+    {
+        candidate = default;
+        try
+        {
+            var root = new DirectoryInfo(Path.GetFullPath(candidatePath));
+            root.Refresh();
+            if (!root.Exists ||
+                !IsSafeWindowsSessionBufferRootPath(
+                    bufferParent,
+                    root.FullName,
+                    root.Attributes) ||
+                !TryParseWindowsSessionRootName(root.Name, out var sessionId) ||
+                !TryCollectWindowsSessionBufferEntries(
+                    root,
+                    out _,
+                    out _,
+                    out var latestWriteTimeUtc))
+            {
+                return false;
+            }
+
+            candidate = new WindowsSessionCleanupCandidate(
+                root.FullName,
+                sessionId,
+                latestWriteTimeUtc);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryCollectWindowsSessionBufferEntries(
+        DirectoryInfo root,
+        out string[] sessionDirectories,
+        out string[] bufferFiles,
+        out DateTime latestWriteTimeUtc)
+    {
+        sessionDirectories = [];
+        bufferFiles = [];
+        latestWriteTimeUtc = root.LastWriteTimeUtc;
+        var rootEntries = Directory
+            .EnumerateFileSystemEntries(
+                root.FullName,
+                "*",
+                SearchOption.TopDirectoryOnly)
+            .Take(MaximumWindowsSessionDirectoriesPerRoot + 1)
+            .ToArray();
+        if (rootEntries.Length > MaximumWindowsSessionDirectoriesPerRoot)
+        {
+            return false;
+        }
+
+        var sessions = new List<string>(rootEntries.Length);
+        var files = new List<string>();
+        foreach (var sessionPath in rootEntries)
+        {
+            var session = new DirectoryInfo(Path.GetFullPath(sessionPath));
+            session.Refresh();
+            if (!session.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    root.FullName,
+                    session.FullName,
+                    session.Attributes))
+            {
+                return false;
+            }
+
+            sessions.Add(session.FullName);
+            latestWriteTimeUtc = Later(latestWriteTimeUtc, session.LastWriteTimeUtc);
+            var entries = Directory
+                .EnumerateFileSystemEntries(
+                    session.FullName,
+                    "*",
+                    SearchOption.TopDirectoryOnly)
+                .Take(MaximumWindowsSessionFilesPerDirectory + 1)
+                .ToArray();
+            if (entries.Length > MaximumWindowsSessionFilesPerDirectory)
+            {
+                return false;
+            }
+
+            foreach (var entryPath in entries)
+            {
+                var normalizedEntry = Path.GetFullPath(entryPath);
+                var attributes = File.GetAttributes(normalizedEntry);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    !session.FullName.Equals(
+                        Path.GetDirectoryName(normalizedEntry),
+                        StringComparison.OrdinalIgnoreCase) ||
+                    !IsReplayBufferFileName(Path.GetFileName(normalizedEntry)))
+                {
+                    return false;
+                }
+
+                files.Add(normalizedEntry);
+                latestWriteTimeUtc = Later(
+                    latestWriteTimeUtc,
+                    File.GetLastWriteTimeUtc(normalizedEntry));
+            }
+        }
+
+        sessionDirectories = sessions.ToArray();
+        bufferFiles = files.ToArray();
+        return true;
+    }
+
+    private static bool TryDeleteValidatedWindowsSessionBufferRoot(
+        string bufferParent,
+        string candidatePath,
+        DateTime utcNow)
+    {
+        try
+        {
+            var root = new DirectoryInfo(Path.GetFullPath(candidatePath));
+            root.Refresh();
+            if (!root.Exists ||
+                !IsSafeWindowsSessionBufferRootPath(
+                    bufferParent,
+                    root.FullName,
+                    root.Attributes) ||
+                !TryCollectWindowsSessionBufferEntries(
+                    root,
+                    out var sessionDirectories,
+                    out var bufferFiles,
+                    out var latestWriteTimeUtc) ||
+                utcNow.ToUniversalTime() - latestWriteTimeUtc <
+                LegacyBufferMinimumInactivity)
+            {
+                return false;
+            }
+
+            foreach (var file in bufferFiles)
+            {
+                var parentPath = Path.GetDirectoryName(file);
+                if (string.IsNullOrWhiteSpace(parentPath))
+                {
+                    return false;
+                }
+
+                var parent = new DirectoryInfo(parentPath);
+                parent.Refresh();
+                var attributes = File.GetAttributes(file);
+                if (!parent.Exists ||
+                    !IsSafeBufferDirectoryPath(
+                        root.FullName,
+                        parent.FullName,
+                        parent.Attributes) ||
+                    (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    !IsReplayBufferFileName(Path.GetFileName(file)))
+                {
+                    return false;
+                }
+
+                File.Delete(file);
+            }
+
+            foreach (var sessionPath in sessionDirectories)
+            {
+                var session = new DirectoryInfo(sessionPath);
+                session.Refresh();
+                if (!session.Exists ||
+                    !IsSafeBufferDirectoryPath(
+                        root.FullName,
+                        session.FullName,
+                        session.Attributes) ||
+                    Directory.EnumerateFileSystemEntries(
+                        session.FullName,
+                        "*",
+                        SearchOption.TopDirectoryOnly).Any())
+                {
+                    return false;
+                }
+
+                Directory.Delete(session.FullName, recursive: false);
+            }
+
+            root.Refresh();
+            if (!root.Exists ||
+                !IsSafeWindowsSessionBufferRootPath(
+                    bufferParent,
+                    root.FullName,
+                    root.Attributes) ||
+                Directory.EnumerateFileSystemEntries(
+                    root.FullName,
+                    "*",
+                    SearchOption.TopDirectoryOnly).Any())
+            {
+                return false;
+            }
+
+            Directory.Delete(root.FullName, recursive: false);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseWindowsSessionRootName(
+        string name,
+        out int sessionId)
+    {
+        const string prefix = "WindowsSession-";
+        sessionId = -1;
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) ||
+            !int.TryParse(
+                name.AsSpan(prefix.Length),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out sessionId) ||
+            sessionId < 0)
+        {
+            return false;
+        }
+
+        return name.Equals(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{prefix}{sessionId}"),
+            StringComparison.Ordinal);
+    }
+
+    private static bool IsReplayBufferFileName(string name)
+    {
+        const string segmentPrefix = "segment-";
+        const string segmentExtension = ".mkv";
+        if (name.StartsWith(segmentPrefix, StringComparison.Ordinal) &&
+            name.EndsWith(segmentExtension, StringComparison.Ordinal) &&
+            name.Length == segmentPrefix.Length + 9 + segmentExtension.Length)
+        {
+            return int.TryParse(
+                name.AsSpan(segmentPrefix.Length, 9),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out _);
+        }
+
+        const string exportPrefix = "export-";
+        const string exportExtension = ".txt";
+        if (!name.StartsWith(exportPrefix, StringComparison.Ordinal) ||
+            !name.EndsWith(exportExtension, StringComparison.Ordinal) ||
+            name.Length != exportPrefix.Length + 32 + exportExtension.Length)
+        {
+            return false;
+        }
+
+        return name.AsSpan(exportPrefix.Length, 32)
+            .IndexOfAnyExcept(
+                "0123456789abcdefABCDEF".AsSpan()) < 0;
+    }
+
+    private static DateTime Later(DateTime first, DateTime second) =>
+        first >= second ? first : second;
 
     /// <summary>
     /// Deletes only the obsolete pre-WindowsSession layout. Cleanup is
@@ -3115,8 +4145,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         name.StartsWith("export-", StringComparison.OrdinalIgnoreCase) &&
         name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
 
-    private static bool HasPossibleLegacyBufferOwner()
+    private static bool TryGetBufferOwnerSessions(
+        out HashSet<int> activeSessionIds,
+        out bool anotherPotentialOwnerIsRunning)
     {
+        activeSessionIds = [];
+        anotherPotentialOwnerIsRunning = false;
         using var current = Process.GetCurrentProcess();
         foreach (var processName in new[] { "ClipForge", "ffmpeg" })
         {
@@ -3130,8 +4164,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     NotSupportedException)
             {
                 // Fail closed: if process ownership cannot be established, leave
-                // legacy buffers untouched for a later startup.
-                return true;
+                // session-scoped and legacy buffers untouched for a later startup.
+                activeSessionIds.Clear();
+                anotherPotentialOwnerIsRunning = true;
+                return false;
             }
 
             foreach (var process in processes)
@@ -3140,9 +4176,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 {
                     try
                     {
+                        activeSessionIds.Add(process.SessionId);
                         if (process.Id != current.Id)
                         {
-                            return true;
+                            anotherPotentialOwnerIsRunning = true;
                         }
                     }
                     catch (Exception exception) when (
@@ -3150,14 +4187,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             NotSupportedException)
                     {
                         // Fail closed. A racing or inaccessible process may still
-                        // own a buffer written by an older ClipForge build.
-                        return true;
+                        // own a replay buffer in the session being inspected.
+                        activeSessionIds.Clear();
+                        anotherPotentialOwnerIsRunning = true;
+                        return false;
                     }
                 }
             }
         }
 
-        return false;
+        return true;
     }
 
     private void TryDeleteBufferDirectory(string? path)
@@ -3393,7 +4432,22 @@ public sealed class ReplayBufferService : IAsyncDisposable
         int SegmentNumber,
         int GenerationId,
         bool IsTrusted);
+
+    internal readonly record struct WindowsSessionCleanupCandidate(
+        string Path,
+        int SessionId,
+        DateTime LatestWriteTimeUtc);
+
+    internal readonly record struct WindowsSessionCleanupScanResult(
+        IReadOnlyList<WindowsSessionCleanupCandidate> Candidates,
+        string NextSuffix,
+        int EnumeratedCount,
+        int InspectedCount);
 }
+
+internal readonly record struct ReplayCaptureGenerationSnapshot(
+    int GenerationId,
+    int QuarantinedHeadSegmentNumber);
 
 /// <summary>
 /// Owns one scheduled capture-maintenance operation on the thread pool. The

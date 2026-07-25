@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using ClipForge.Models;
+using ClipForge.Services;
 
 namespace ClipForge.Capture;
 
@@ -30,6 +31,10 @@ internal sealed record FfmpegCapabilitySelection(
 /// </summary>
 internal sealed class FfmpegCapabilityProbe
 {
+    private static readonly TimeSpan DefaultDegradedCacheInitialDuration =
+        TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DefaultDegradedCacheMaximumDuration =
+        TimeSpan.FromMinutes(1);
     private static readonly VideoEncoderKind[] HardwarePreference =
     [
         VideoEncoderKind.NvidiaNvenc,
@@ -38,13 +43,39 @@ internal sealed class FfmpegCapabilityProbe
     ];
 
     private readonly IFfmpegProbeRunner _runner;
+    private readonly TimeSpan _degradedCacheInitialDuration;
+    private readonly TimeSpan _degradedCacheMaximumDuration;
+    private readonly Func<DateTimeOffset> _getUtcNow;
     private readonly SemaphoreSlim _probeGate = new(1, 1);
-    private readonly Dictionary<string, FfmpegCapabilitySelection> _cache =
+    private readonly Dictionary<string, CachedCapabilitySelection> _cache =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public FfmpegCapabilityProbe(IFfmpegProbeRunner? runner = null)
+    public FfmpegCapabilityProbe(
+        IFfmpegProbeRunner? runner = null,
+        TimeSpan? degradedCacheInitialDuration = null,
+        TimeSpan? degradedCacheMaximumDuration = null,
+        Func<DateTimeOffset>? getUtcNow = null)
     {
         _runner = runner ?? new FfmpegProbeRunner();
+        _degradedCacheInitialDuration =
+            degradedCacheInitialDuration ?? DefaultDegradedCacheInitialDuration;
+        _degradedCacheMaximumDuration =
+            degradedCacheMaximumDuration ?? DefaultDegradedCacheMaximumDuration;
+        _getUtcNow = getUtcNow ?? (static () => DateTimeOffset.UtcNow);
+
+        if (_degradedCacheInitialDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(degradedCacheInitialDuration),
+                "The degraded capability cache duration must be positive.");
+        }
+
+        if (_degradedCacheMaximumDuration < _degradedCacheInitialDuration)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(degradedCacheMaximumDuration),
+                "The degraded capability cache maximum must not be shorter than its initial duration.");
+        }
     }
 
     public async Task<FfmpegCapabilitySelection> SelectAsync(
@@ -59,14 +90,44 @@ internal sealed class FfmpegCapabilityProbe
         await _probeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (_cache.TryGetValue(cacheKey, out var cached))
+            _cache.TryGetValue(cacheKey, out var previous);
+            if (previous is not null &&
+                (previous.ExpiresAtUtc is null ||
+                 _getUtcNow() < previous.ExpiresAtUtc))
             {
-                return cached;
+                return previous.Selection;
             }
 
             var selection = await ProbeCoreAsync(ffmpegPath, configuration, cancellationToken)
                 .ConfigureAwait(false);
-            _cache[cacheKey] = selection;
+            // A GDI result can be caused by a transient cadence miss while a
+            // fullscreen game, DWM, or another capture probe is briefly busy.
+            // A short, bounded backoff prevents rapid replay restarts from
+            // repeating several expensive probes on machines where WGC is
+            // permanently unavailable, while still retrying transient failures.
+            if (selection.Strategy.CaptureBackend ==
+                DesktopCaptureBackend.WindowsGraphicsCapture)
+            {
+                _cache[cacheKey] = new CachedCapabilitySelection(
+                    selection,
+                    ExpiresAtUtc: null,
+                    ConsecutiveDegradedSelections: 0);
+            }
+            else
+            {
+                var consecutiveDegradedSelections = previous is null
+                    ? 1
+                    : previous.ConsecutiveDegradedSelections == int.MaxValue
+                        ? int.MaxValue
+                        : previous.ConsecutiveDegradedSelections + 1;
+                var cacheDuration = GetDegradedCacheDuration(
+                    consecutiveDegradedSelections);
+                _cache[cacheKey] = new CachedCapabilitySelection(
+                    selection,
+                    _getUtcNow() + cacheDuration,
+                    consecutiveDegradedSelections);
+            }
+
             return selection;
         }
         finally
@@ -93,6 +154,28 @@ internal sealed class FfmpegCapabilityProbe
         return amfAvailable
             ? VideoEncoderKind.AmdAmf
             : VideoEncoderKind.SoftwareX264;
+    }
+
+    private TimeSpan GetDegradedCacheDuration(
+        int consecutiveDegradedSelections)
+    {
+        var durationTicks = _degradedCacheInitialDuration.Ticks;
+        for (var selection = 1;
+             selection < consecutiveDegradedSelections &&
+             durationTicks < _degradedCacheMaximumDuration.Ticks;
+             selection++)
+        {
+            if (durationTicks >= _degradedCacheMaximumDuration.Ticks / 2)
+            {
+                return _degradedCacheMaximumDuration;
+            }
+
+            durationTicks *= 2;
+        }
+
+        return TimeSpan.FromTicks(Math.Min(
+            durationTicks,
+            _degradedCacheMaximumDuration.Ticks));
     }
 
     private async Task<FfmpegCapabilitySelection> ProbeCoreAsync(
@@ -288,6 +371,11 @@ internal sealed class FfmpegCapabilityProbe
         outputSize.RequiresScaling
             ? $"low-overhead point scaling to {outputSize.Width}x{outputSize.Height}"
             : $"native {outputSize.Width}x{outputSize.Height} surfaces";
+
+    private sealed record CachedCapabilitySelection(
+        FfmpegCapabilitySelection Selection,
+        DateTimeOffset? ExpiresAtUtc,
+        int ConsecutiveDegradedSelections);
 }
 
 internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
@@ -295,6 +383,12 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
     private const int MaximumDiagnosticLines = 12;
     private const int MaximumDiagnosticCharactersPerLine = 512;
+    private readonly Action<int>? _processOwnershipEstablished;
+
+    internal FfmpegProbeRunner(Action<int>? processOwnershipEstablished = null)
+    {
+        _processOwnershipEstablished = processOwnershipEstablished;
+    }
 
     public async Task<FfmpegProbeExecution> RunAsync(
         string executable,
@@ -321,7 +415,11 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             return new FfmpegProbeExecution(false, "Windows could not start FFmpeg.");
         }
 
-        _ = ProcessTuning.TryApplyLowImpactPriority(process);
+        using var processJob = AttachProcessLifetime(process);
+        _processOwnershipEstablished?.Invoke(process.Id);
+        _ = FindScaledGraphicsCaptureFilter(arguments) is not null
+            ? ProcessTuning.TryApplyScaledGraphicsProbePriority(process)
+            : ProcessTuning.TryApplyLowImpactPriority(process);
         var diagnosticsTask = ReadDiagnosticTailAsync(process.StandardError);
         var progressTask = ReadProgressObservationAsync(
             process.StandardOutput,
@@ -398,6 +496,43 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             : new FfmpegProbeExecution(false, cadenceDiagnostic);
     }
 
+    private static CaptureProcessJob? AttachProcessLifetime(Process process)
+    {
+        try
+        {
+            return CaptureProcessJob.Attach(process);
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or Win32Exception)
+        {
+            var processHasExited = false;
+            try
+            {
+                processHasExited = process.HasExited;
+            }
+            catch (Exception statusException) when (
+                statusException is InvalidOperationException or Win32Exception)
+            {
+                // Preserve the original ownership failure below.
+            }
+
+            if (CaptureProcessJob.IsBenignExitedProcessAttachFailure(
+                    exception,
+                    processHasExited))
+            {
+                return null;
+            }
+
+            TryKill(process);
+            throw;
+        }
+        catch
+        {
+            TryKill(process);
+            throw;
+        }
+    }
+
     internal static bool IsProbeCadenceAcceptable(
         IReadOnlyList<string> arguments,
         FfmpegProbeCadenceObservation? observation,
@@ -405,9 +540,7 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
     {
         ArgumentNullException.ThrowIfNull(arguments);
         diagnostic = string.Empty;
-        var graphicsFilter = arguments.FirstOrDefault(argument =>
-            argument.Contains("gfxcapture=", StringComparison.Ordinal) &&
-            argument.Contains(":resize_mode=scale", StringComparison.Ordinal));
+        var graphicsFilter = FindScaledGraphicsCaptureFilter(arguments);
         if (graphicsFilter is null)
         {
             return true;
@@ -459,6 +592,12 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             $"the required minimum is {minimumFramesPerSecond:0.##} FPS");
         return false;
     }
+
+    private static string? FindScaledGraphicsCaptureFilter(
+        IReadOnlyList<string> arguments) =>
+        arguments.FirstOrDefault(argument =>
+            argument.Contains("gfxcapture=", StringComparison.Ordinal) &&
+            argument.Contains(":resize_mode=scale", StringComparison.Ordinal));
 
     private static async Task<FfmpegProbeCadenceObservation?> ReadProgressObservationAsync(
         StreamReader reader,
