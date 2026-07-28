@@ -4,6 +4,28 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.12] - 2026-07-28
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Fixed
+
+- Replay export now stops at the newest contiguous trusted generation. It no longer skips a quarantined head or numbering gap and then joins segments from two FFmpeg processes, which could produce a nominally valid 60 FPS clip with visibly held or repeated video after a renewal or custom-resolution transition.
+- Display, HDR, resume, unlock, and graphics-device transitions immediately block the pre-transition generation and cancel a save that already selected it, before the display debounce runs. Same-size WGC and GDI transitions create a clean generation, while queued work is bound to the exact capture session so it cannot replace a newer manual restart.
+- Custom or stretched fullscreen detection uses live monitor geometry, Per-Monitor-V2 coordinates, coverage, anchoring, aspect mismatch, and recent keyboard, mouse, or controller input. Native capture can make one boundary-safe promotion to the Resilient profile; ambiguous duplicate-only content cannot destructively restart scaled or already-resilient capture.
+- Objective output throughput and confirmed progress gaps remain recoverable, but queued FFmpeg progress after a temporary ClipForge pause is allowed to drain and catch up before it can be classified as a freeze. Deferred recovery no longer cancels itself when it stops the old FFmpeg process, and every accepted destructive recovery consumes the bounded two-attempt session budget.
+- Native and already-fitting capture use the low-impact queue and priority policy, while paths that really scale use the resilient queue and Normal scheduling policy. Capability caches are separated by that profile, GDI-to-WGC rechecks run only during stable idle and cancel if input resumes, and a promoted no-scale profile survives automatic display restarts.
+- Same-geometry retry work now ends after a failed restart reaches Stopped or Faulted instead of waking the UI every 250 ms indefinitely. Runtime diagnostics include the selected source, output, profile, cadence context, and display-transition generations needed to investigate a remaining target-PC issue.
+
+### Verification
+
+- Release builds complete with zero warnings or errors and the deterministic suite passes 72/72 tests, including custom geometry, Source/1080p/1440p policy, trusted-generation suffixes, display-transition coalescing, progress backlog recovery, profile-specific capability invalidation, and bounded recovery.
+- Release preparation verified the complete 489-file payload and rejected modified, extra, and missing-file tampering before packaging.
+- A competing live capture matrix was not started while the installed ClipForge recorder was active. Synthetic and local tests cannot reproduce every affected Apex or CS2 GPU driver, overlay, exclusive-fullscreen path, or stretched internal resolution; motion-hash validation on the affected PC remains required.
+
 ## [1.9.0-beta.11] - 2026-07-25
 
 ### Release status

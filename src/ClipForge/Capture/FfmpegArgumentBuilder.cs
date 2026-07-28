@@ -10,7 +10,7 @@ internal static class FfmpegArgumentBuilder
     internal const int ScaledVideoInputQueuePackets = 4;
     internal const int CompatibilityVideoInputQueuePackets = 8;
     internal const int AudioInputQueuePackets = 64;
-    internal const int ScaledGraphicsProbeSeconds = 3;
+    internal const int CaptureProbeSeconds = 3;
 
     public static IReadOnlyList<string> BuildCaptureArguments(
         CaptureConfiguration configuration,
@@ -27,7 +27,8 @@ internal static class FfmpegArgumentBuilder
         IReadOnlyList<AudioInputSpecification> audioInputs,
         VideoEncodingStrategy encodingStrategy,
         string segmentDirectory,
-        int segmentStartNumber = 0)
+        int segmentStartNumber = 0,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(audioInputs);
@@ -56,7 +57,7 @@ internal static class FfmpegArgumentBuilder
             "-hide_banner",
             "-loglevel", "warning",
             "-nostats",
-            "-stats_period", "1",
+            "-stats_period", "0.25",
             "-progress", "pipe:1"
         };
 
@@ -72,7 +73,7 @@ internal static class FfmpegArgumentBuilder
             ]);
         }
 
-        AddVideoInput(arguments, configuration, encodingStrategy);
+        AddVideoInput(arguments, configuration, encodingStrategy, performanceProfile);
 
         foreach (var audioInput in audioInputs)
         {
@@ -182,7 +183,9 @@ internal static class FfmpegArgumentBuilder
 
     public static IReadOnlyList<string> BuildGraphicsCaptureProbeArguments(
         CaptureConfiguration configuration,
-        VideoEncodingStrategy encodingStrategy)
+        VideoEncodingStrategy encodingStrategy,
+        CapturePerformanceProfile performanceProfile =
+            CapturePerformanceProfile.LowImpact)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(encodingStrategy);
@@ -210,28 +213,25 @@ internal static class FfmpegArgumentBuilder
             ]);
         }
 
-        AddVideoInput(arguments, configuration, encodingStrategy);
-        var output = CaptureGeometry.ResolveOutputSize(
-            configuration.Display,
-            configuration.Resolution);
-        var probeFrames = output.RequiresScaling
-            ? checked(configuration.FramesPerSecond * ScaledGraphicsProbeSeconds)
-            : 2;
+        AddVideoInput(
+            arguments,
+            configuration,
+            encodingStrategy,
+            performanceProfile);
+        var probeFrames = checked(
+            configuration.FramesPerSecond * CaptureProbeSeconds);
         // Exercise the same timestamp-normalization graph as live capture. A
         // capability probe must not approve a simpler D3D11-to-encoder path than
         // the one that will run continuously.
         arguments.AddRange(["-vf", "setpts=PTS-STARTPTS"]);
-        if (output.RequiresScaling)
-        {
-            // Live replay is constant-frame-rate. Without this production output
-            // contract, a quiet desktop or an application that repaints below
-            // the requested rate makes WGC's change-driven input appear slow and
-            // falsely locks fixed presets onto the heavier GDI fallback.
-            arguments.AddRange([
-                "-fps_mode", "cfr",
-                "-r", Invariant(configuration.FramesPerSecond)
-            ]);
-        }
+        // Live replay is constant-frame-rate. Without this production output
+        // contract, a quiet desktop or an application that repaints below the
+        // requested rate makes WGC's change-driven input appear slow. Exercise
+        // the complete three-second graph for Source as well as scaled presets.
+        arguments.AddRange([
+            "-fps_mode", "cfr",
+            "-r", Invariant(configuration.FramesPerSecond)
+        ]);
 
         arguments.AddRange([
             "-frames:v", Invariant(probeFrames),
@@ -239,6 +239,67 @@ internal static class FfmpegArgumentBuilder
         ]);
         AddEncoderArguments(arguments, encodingStrategy);
         arguments.AddRange(["-f", "null", "NUL"]);
+        return arguments;
+    }
+
+    public static IReadOnlyList<string> BuildGdiCaptureProbeArguments(
+        CaptureConfiguration configuration,
+        VideoEncodingStrategy encodingStrategy)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(encodingStrategy);
+        if (encodingStrategy.CaptureBackend != DesktopCaptureBackend.Gdi)
+        {
+            throw new ArgumentException(
+                "A GDI capture probe requires the GDI capture backend.",
+                nameof(encodingStrategy));
+        }
+
+        if (configuration.FramesPerSecond is < 1 or > 240)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(configuration),
+                "The frame rate must be between 1 and 240 frames per second.");
+        }
+
+        var arguments = new List<string>
+        {
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-nostats",
+            "-stats_period", "0.25",
+            "-progress", "pipe:1"
+        };
+        AddVideoInput(
+            arguments,
+            configuration,
+            encodingStrategy);
+
+        var encoderPixelFormat =
+            encodingStrategy.Encoder == VideoEncoderKind.SoftwareX264
+                ? "yuv420p"
+                : "nv12";
+        arguments.AddRange([
+            "-vf",
+            $"{BuildVideoFilter(configuration)},format={encoderPixelFormat},setpts=PTS-STARTPTS"
+        ]);
+
+        AddEncoderArguments(arguments, encodingStrategy);
+        var keyFrameInterval = checked(
+            configuration.FramesPerSecond * SegmentSeconds);
+        var probeFrames = checked(
+            configuration.FramesPerSecond * CaptureProbeSeconds);
+        arguments.AddRange([
+            "-fps_mode", "cfr",
+            "-r", Invariant(configuration.FramesPerSecond),
+            "-g", Invariant(keyFrameInterval),
+            "-keyint_min", Invariant(keyFrameInterval),
+            "-force_key_frames", $"expr:gte(t,n_forced*{SegmentSeconds})",
+            "-frames:v", Invariant(probeFrames),
+            "-an",
+            "-f", "null", "NUL"
+        ]);
         return arguments;
     }
 
@@ -477,7 +538,8 @@ internal static class FfmpegArgumentBuilder
     private static void AddVideoInput(
         List<string> arguments,
         CaptureConfiguration configuration,
-        VideoEncodingStrategy encodingStrategy)
+        VideoEncodingStrategy encodingStrategy,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
     {
         var display = configuration.Display;
 
@@ -486,14 +548,15 @@ internal static class FfmpegArgumentBuilder
             var output = CaptureGeometry.ResolveOutputSize(
                 configuration.Display,
                 configuration.Resolution);
-            var queuePackets = output.RequiresScaling
+            var queuePackets = output.RequiresScaling ||
+                               performanceProfile == CapturePerformanceProfile.Resilient
                 ? ScaledVideoInputQueuePackets
                 : VideoInputQueuePackets;
             arguments.AddRange([
-                // Source/native keeps the two-frame low-latency budget that
-                // prevents long-session desktop lag. A fixed downscale gets two
-                // extra, already output-sized frames so the capture shader can
-                // absorb short fullscreen GPU stalls without starving CFR.
+                // Source/native begins with the two-frame low-impact budget that
+                // prevents long-session desktop lag. Fixed downscale and a Source
+                // session promoted after measured starvation get two extra frames
+                // to absorb short fullscreen GPU stalls without starving CFR.
                 "-thread_queue_size", Invariant(queuePackets),
                 "-f", "lavfi",
                 "-i", BuildGraphicsCaptureFilter(configuration, encodingStrategy)
