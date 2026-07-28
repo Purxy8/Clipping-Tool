@@ -2,6 +2,8 @@ namespace ClipForge.Capture;
 
 internal enum CaptureRecoveryReason
 {
+    SourceProfilePromotion,
+    SourcePressure,
     SourceStarvation,
     CaptureHang,
     ScheduledRefresh

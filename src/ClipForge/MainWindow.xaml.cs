@@ -84,6 +84,7 @@ public partial class MainWindow : Window
     private bool _captureRestartInProgress;
     private bool _captureRecoveryQueued;
     private bool _automaticCaptureSourceFallback;
+    private bool _preferResilientSourceCapture;
     private bool _replayStartRequested;
     private bool _playerSourceReleasedForBackground;
     private int _clipPlayerHostIndex = 1;
@@ -121,6 +122,8 @@ public partial class MainWindow : Window
     private long _storageStatusGeneration;
     private CancellationTokenSource? _displayModeChangeCancellation;
     private int _displayModeWgcRenewalRequested;
+    private int _sameGeometryWgcRefreshPending;
+    private int _sameGeometryWgcRefreshRetryScheduled;
     private bool _refreshingDisplaySelection;
     private string? _lastTrayStatus;
     private bool? _lastTrayCanSave;
@@ -607,7 +610,8 @@ public partial class MainWindow : Window
              _captureRestartInProgress ||
              _replayStartRequested))
         {
-            ResetAutomaticCaptureRecovery();
+            ResetAutomaticCaptureRecovery(
+                resetProfilePreference: false);
             await RunCaptureCommandAsync(async () =>
             {
                 if (_isClosing)
@@ -619,10 +623,31 @@ public partial class MainWindow : Window
                 SetCaptureCriticalPresentationState(isActive: true);
                 try
                 {
+                    // Snapshot the live profile before StopAsync resets service
+                    // state. This also preserves a Resilient promotion that
+                    // completed through the service's delayed retry path.
+                    var selectedDisplay =
+                        DisplayComboBox.SelectedItem as DisplayOption;
+                    var selectedResolution =
+                        ResolutionComboBox.SelectedItem as ResolutionOption;
+                    var outputRequiresScaling =
+                        selectedDisplay is null ||
+                        selectedResolution is null ||
+                        CaptureGeometry.ResolveOutputSize(
+                            selectedDisplay,
+                            selectedResolution).RequiresScaling;
+                    var retainResilientProfile =
+                        ShouldRetainResilientCaptureProfile(
+                            _preferResilientSourceCapture,
+                            _replayBufferService
+                                .ActiveCapturePerformanceProfile,
+                            outputRequiresScaling);
                     await _replayBufferService.StopAsync();
                     if (!_isClosing && _replayStartRequested)
                     {
-                        await StartReplayCoreAsync();
+                        await StartReplayCoreAsync(
+                            retainResilientProfile:
+                                retainResilientProfile);
                     }
                 }
                 finally
@@ -630,6 +655,7 @@ public partial class MainWindow : Window
                     _captureRestartInProgress = false;
                     SetCaptureCriticalPresentationState(
                         IsCapturePresentationSuspendedState(_latestState));
+                    TryDispatchPendingSameGeometryWgcRefresh();
                 }
             });
         }
@@ -821,7 +847,8 @@ public partial class MainWindow : Window
 
     private async Task StartReplayCoreAsync(
         bool sourceSafetyMode = false,
-        VideoEncodingStrategy? sessionStrategyOverride = null)
+        VideoEncodingStrategy? sessionStrategyOverride = null,
+        bool retainResilientProfile = false)
     {
         if (_clipTrimService.HasReplayBlockingTrimWork)
         {
@@ -869,7 +896,9 @@ public partial class MainWindow : Window
             // ffprobe/thumbnail helper from overlapping the first replay frames.
             await WaitForAutomaticLibraryWorkIdleAsync(_lifetimeCancellation.Token);
             _replayStartRequested = true;
-            if (sessionStrategyOverride is null && !sourceSafetyMode)
+            if (sessionStrategyOverride is null &&
+                !sourceSafetyMode &&
+                !retainResilientProfile)
             {
                 await _replayBufferService.StartAsync(
                     configuration,
@@ -881,7 +910,19 @@ public partial class MainWindow : Window
                     configuration,
                     _lifetimeCancellation.Token,
                     sessionStrategyOverride,
-                    sourceSafetyMode);
+                    sourceSafetyMode,
+                    sourceSafetyMode || retainResilientProfile
+                        ? CapturePerformanceProfile.Resilient
+                        : null);
+            }
+
+            if (sourceSafetyMode || retainResilientProfile)
+            {
+                // A successful safety/profile-retaining start is itself proof
+                // that this Source session needs resilient scheduling. Unlike
+                // WGC-only safety fallback, profile retention still permits a
+                // runtime-verified GDI backend.
+                _preferResilientSourceCapture = true;
             }
         }
         catch
@@ -957,7 +998,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: false));
+        _ = Dispatcher.BeginInvoke(() => QueueDisplayModeRefresh(forceWgcRenewal: true));
     }
 
     private void SystemEvents_PowerModeChanged(object sender, PowerModeChangedEventArgs e)
@@ -1005,6 +1046,8 @@ public partial class MainWindow : Window
         if (forceWgcRenewal)
         {
             Volatile.Write(ref _displayModeWgcRenewalRequested, 1);
+            _replayBufferService.InvalidateCaptureGenerationForDisplayTransition(
+                "Windows reported a display, resume, or graphics-device transition; media from the previous capture generation was blocked before display discovery.");
         }
 
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
@@ -1153,19 +1196,118 @@ public partial class MainWindow : Window
 
     private void QueueSameGeometryWgcRefresh()
     {
-        if (_isClosing ||
-            _captureRestartInProgress ||
-            !_replayStartRequested ||
-            !_replayBufferService.IsRunning ||
-            _replayBufferService.LastCapturePlan?.Strategy.CaptureBackend !=
-                DesktopCaptureBackend.WindowsGraphicsCapture ||
-            _replayBufferService.CaptureProcessId is null)
+        Volatile.Write(ref _sameGeometryWgcRefreshPending, 1);
+        TryDispatchPendingSameGeometryWgcRefresh();
+    }
+
+    private void TryDispatchPendingSameGeometryWgcRefresh()
+    {
+        if (Volatile.Read(ref _sameGeometryWgcRefreshPending) == 0)
         {
             return;
         }
 
-        _replayBufferService.RequestScheduledCaptureRefresh(
-            "Windows reported a same-size display or graphics-device transition; renewing WGC prevents the old frame pool from becoming stale.");
+        if (_isClosing || !_replayStartRequested)
+        {
+            Volatile.Write(ref _sameGeometryWgcRefreshPending, 0);
+            return;
+        }
+
+        if (_captureRestartInProgress)
+        {
+            SchedulePendingSameGeometryWgcRefreshRetry();
+            return;
+        }
+
+        if (!_replayBufferService.IsRunning)
+        {
+            if (ShouldRetryPendingDisplayRefresh(
+                    captureRestartInProgress: false,
+                    replayRunning: false,
+                    _latestState.State))
+            {
+                SchedulePendingSameGeometryWgcRefreshRetry();
+            }
+            else
+            {
+                // A requested restart can settle in Stopped/Faulted when its
+                // capture launch fails. Do not keep a display-transition intent
+                // alive as an unbounded 250 ms UI retry loop after that failure.
+                Volatile.Write(ref _sameGeometryWgcRefreshPending, 0);
+            }
+
+            return;
+        }
+
+        if (_replayBufferService.LastCapturePlan?.Strategy.CaptureBackend is not
+                { } captureBackend ||
+            !ReplayBufferService.CanRefreshCaptureBackend(captureBackend))
+        {
+            Volatile.Write(ref _sameGeometryWgcRefreshPending, 0);
+            return;
+        }
+
+        if (_replayBufferService.CaptureProcessId is null)
+        {
+            // A service-owned refresh has a short interval with no active
+            // process. Keep the display-transition intent until the replacement
+            // process is published.
+            SchedulePendingSameGeometryWgcRefreshRetry();
+            return;
+        }
+
+        if (_replayBufferService.RequestDiscontinuousCaptureRefresh(
+                "Windows reported a same-size display or graphics-device transition; renewing the capture source prevents stale frames and starts a clean replay generation."))
+        {
+            Volatile.Write(ref _sameGeometryWgcRefreshPending, 0);
+            return;
+        }
+
+        SchedulePendingSameGeometryWgcRefreshRetry();
+    }
+
+    private void SchedulePendingSameGeometryWgcRefreshRetry()
+    {
+        if (Interlocked.CompareExchange(
+                ref _sameGeometryWgcRefreshRetryScheduled,
+                1,
+                0) != 0)
+        {
+            return;
+        }
+
+        _ = RetryPendingSameGeometryWgcRefreshAsync();
+    }
+
+    private async Task RetryPendingSameGeometryWgcRefreshAsync()
+    {
+        try
+        {
+            await Task.Delay(
+                TimeSpan.FromMilliseconds(250),
+                _lifetimeCancellation.Token);
+            if (!_isClosing &&
+                !Dispatcher.HasShutdownStarted &&
+                !Dispatcher.HasShutdownFinished)
+            {
+                await Dispatcher.InvokeAsync(
+                    TryDispatchPendingSameGeometryWgcRefresh);
+            }
+        }
+        catch (OperationCanceledException) when (
+            _lifetimeCancellation.IsCancellationRequested)
+        {
+            // Application shutdown supersedes the pending display transition.
+        }
+        finally
+        {
+            Volatile.Write(ref _sameGeometryWgcRefreshRetryScheduled, 0);
+            if (!_isClosing &&
+                Volatile.Read(ref _sameGeometryWgcRefreshPending) != 0)
+            {
+                SchedulePendingSameGeometryWgcRefreshRetry();
+            }
+        }
     }
 
     internal static bool ShouldRestartReplayAfterDisplayChange(
@@ -1193,6 +1335,14 @@ public partial class MainWindow : Window
                    capturePlan,
                    currentDisplay);
     }
+
+    internal static bool ShouldRetryPendingDisplayRefresh(
+        bool captureRestartInProgress,
+        bool replayRunning,
+        ReplayState replayState) =>
+        captureRestartInProgress ||
+        !replayRunning &&
+        replayState is ReplayState.Starting or ReplayState.Stopping;
 
     private void SyncSettingsFromControls()
     {
@@ -1633,7 +1783,8 @@ public partial class MainWindow : Window
             }
 
             var strategy = _replayBufferService.LastCapturePlan?.Strategy;
-            if (strategy?.CaptureBackend != DesktopCaptureBackend.WindowsGraphicsCapture)
+            if (strategy is null ||
+                !SupportsAutomaticCaptureRecovery(strategy.CaptureBackend))
             {
                 return;
             }
@@ -1648,25 +1799,45 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                var scheduledRefresh = !UsesAutomaticCaptureRecoveryBudget(eventArgs.Reason);
-                if (!scheduledRefresh && _automaticCaptureRecoveryCount >= 2)
+                var scheduledRefresh =
+                    eventArgs.Reason == CaptureRecoveryReason.ScheduledRefresh;
+                var usesRecoveryBudget =
+                    UsesAutomaticCaptureRecoveryBudget(eventArgs.Reason);
+                if (usesRecoveryBudget && _automaticCaptureRecoveryCount >= 2)
                 {
                     _ = _replayBufferService.SuppressCaptureFaultRecovery(
                         eventArgs);
+                    // The engine has already made the proven-bad generation
+                    // unexportable. Leaving the process marked Running here
+                    // would present a replay session that can never save,
+                    // especially on GDI where no age-based WGC renewal exists.
+                    _replayStartRequested = false;
+                    await _replayBufferService.StopAsync();
                     ShowError(
                         "Capture pacing is still unstable after automatic recovery. " +
-                        "ClipForge kept replay running and will not restart it repeatedly. " +
-                        "Routine capture-engine refresh remains active.");
+                        "ClipForge stopped Instant Replay safely instead of saving " +
+                        "a damaged clip or restarting in a loop. Start replay again " +
+                        "after closing other capture tools or changing the game display mode.");
                     return;
                 }
 
                 var activePlan = _replayBufferService.LastCapturePlan;
-                var scaledWgcPath = activePlan is not null &&
+                var isWgcPath = activePlan?.Strategy.CaptureBackend ==
+                    DesktopCaptureBackend.WindowsGraphicsCapture;
+                var scaledWgcPath = isWgcPath &&
+                    activePlan is not null &&
                     CaptureGeometry.ResolveOutputSize(
                         activePlan.Display,
                         activePlan.Resolution).RequiresScaling;
-                var useSourceSafetyMode = !scheduledRefresh &&
-                    (_automaticCaptureRecoveryCount == 1 || scaledWgcPath);
+                var useSourceSafetyMode = ShouldUseSourceSafetyRecovery(
+                    activePlan?.Strategy.CaptureBackend,
+                    usesRecoveryBudget,
+                    _automaticCaptureRecoveryCount,
+                    scaledWgcPath);
+                var promoteCaptureProfile =
+                    eventArgs.Reason is
+                        CaptureRecoveryReason.SourceProfilePromotion or
+                        CaptureRecoveryReason.SourcePressure;
 
                 var suspendPresentation = !scheduledRefresh;
                 _captureRestartInProgress = suspendPresentation;
@@ -1675,22 +1846,62 @@ public partial class MainWindow : Window
                     SetCaptureCriticalPresentationState(isActive: true);
                 }
 
+                if (usesRecoveryBudget)
+                {
+                    // Consume the bounded attempt when recovery takes ownership,
+                    // not only after an immediate replacement succeeds. The
+                    // service can defer a verified preflight/boundary retry; that
+                    // later destructive replacement must not become invisible
+                    // to the two-attempt session budget.
+                    _automaticCaptureRecoveryCount++;
+                }
+
                 try
                 {
-                    if (scheduledRefresh || !useSourceSafetyMode)
+                    if (promoteCaptureProfile)
+                    {
+                        // Native capture starts in the low-impact profile so it
+                        // cannot steal time from the game. Confirmed scheduling
+                        // or throughput pressure promotes the recorder to the
+                        // resilient queue/priority policy. This also gives a
+                        // verified GDI compatibility path one safe promotion
+                        // before bounded restart recovery.
+                        if (eventArgs.Reason ==
+                            CaptureRecoveryReason.SourceProfilePromotion)
+                        {
+                            // A boundary-safe promotion may be deferred and
+                            // completed by the service retry after this UI
+                            // callback returns. Preserve the intended profile
+                            // across any later automatic session restart.
+                            _preferResilientSourceCapture = true;
+                        }
+
+                        var refreshed = await _replayBufferService.RefreshCaptureAsync(
+                            eventArgs.ProcessId,
+                            _lifetimeCancellation.Token,
+                            preserveCompletedSegments:
+                                eventArgs.Reason ==
+                                CaptureRecoveryReason.SourceProfilePromotion,
+                            performanceProfileOverride:
+                                CapturePerformanceProfile.Resilient,
+                            requireCompletedSegmentBoundary:
+                                eventArgs.Reason ==
+                                CaptureRecoveryReason.SourceProfilePromotion);
+                        if (refreshed)
+                        {
+                            _preferResilientSourceCapture = true;
+                        }
+                    }
+                    else if (scheduledRefresh || !useSourceSafetyMode)
                     {
                         // A boundary-aligned routine renewal can keep its trusted
                         // completed segments. A health recovery invalidates the
                         // old generation because audio may have continued while
                         // video was already stalled.
-                        var refreshed = await _replayBufferService.RefreshCaptureAsync(
+                        _ = await _replayBufferService.RefreshCaptureAsync(
                             eventArgs.ProcessId,
                             _lifetimeCancellation.Token,
                             preserveCompletedSegments: scheduledRefresh);
-                        if (refreshed && !scheduledRefresh)
-                        {
-                            _automaticCaptureRecoveryCount++;
-                        }
                     }
                     else
                     {
@@ -1705,7 +1916,6 @@ public partial class MainWindow : Window
                                 sourceSafetyMode: true,
                                 sessionStrategyOverride: null);
                             _automaticCaptureSourceFallback = true;
-                            _automaticCaptureRecoveryCount++;
                         }
                     }
                 }
@@ -1717,6 +1927,8 @@ public partial class MainWindow : Window
                         SetCaptureCriticalPresentationState(
                             IsCapturePresentationSuspendedState(_latestState));
                     }
+
+                    TryDispatchPendingSameGeometryWgcRefresh();
                 }
             });
         }
@@ -1731,14 +1943,42 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ResetAutomaticCaptureRecovery()
+    private void ResetAutomaticCaptureRecovery(
+        bool resetProfilePreference = true)
     {
         _automaticCaptureRecoveryCount = 0;
         _automaticCaptureSourceFallback = false;
+        if (resetProfilePreference)
+        {
+            _preferResilientSourceCapture = false;
+        }
     }
 
     internal static bool UsesAutomaticCaptureRecoveryBudget(CaptureRecoveryReason reason) =>
-        reason != CaptureRecoveryReason.ScheduledRefresh;
+        reason is CaptureRecoveryReason.SourceStarvation or
+            CaptureRecoveryReason.CaptureHang;
+
+    internal static bool SupportsAutomaticCaptureRecovery(
+        DesktopCaptureBackend captureBackend) =>
+        captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.Gdi;
+
+    internal static bool ShouldUseSourceSafetyRecovery(
+        DesktopCaptureBackend? captureBackend,
+        bool usesRecoveryBudget,
+        int completedRecoveryCount,
+        bool outputRequiresScaling) =>
+        captureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+        usesRecoveryBudget &&
+        (completedRecoveryCount == 1 || outputRequiresScaling);
+
+    internal static bool ShouldRetainResilientCaptureProfile(
+        bool profileWasPromoted,
+        CapturePerformanceProfile activeProfile,
+        bool outputRequiresScaling) =>
+        (profileWasPromoted ||
+         activeProfile == CapturePerformanceProfile.Resilient) &&
+        !outputRequiresScaling;
 
     private void ReplayBufferService_StateChanged(object? sender, ReplayStateSnapshot snapshot)
     {

@@ -51,7 +51,8 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
         int? height = null,
         int? framesPerSecond = null,
         bool? captureCursor = null,
-        string? detail = null)
+        string? detail = null,
+        bool includeResourceSnapshots = true)
     {
         if (Volatile.Read(ref _disposed) != 0 || string.IsNullOrWhiteSpace(eventName))
         {
@@ -66,9 +67,11 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
             safeDetail = safeDetail[^MaximumDetailCharacters..];
         }
 
-        using var host = Process.GetCurrentProcess();
+        using var host = includeResourceSnapshots
+            ? Process.GetCurrentProcess()
+            : null;
         var entry = new CaptureRuntimeEvent(
-            Schema: 2,
+            Schema: 3,
             TimestampUtc: DateTimeOffset.UtcNow,
             Event: eventName.Trim(),
             Backend: string.IsNullOrWhiteSpace(backend) ? null : backend.Trim(),
@@ -77,10 +80,16 @@ internal sealed class CaptureRuntimeJournal : IAsyncDisposable
             FramesPerSecond: framesPerSecond,
             CaptureCursor: captureCursor,
             Detail: safeDetail,
-            Host: TrySnapshot(host),
-            Capture: TrySnapshot(captureProcess),
-            DesktopWindowManager: TrySnapshotSystemProcess("dwm", host.SessionId),
-            AudioEngine: TrySnapshotSystemProcess("audiodg", host.SessionId));
+            Host: includeResourceSnapshots ? TrySnapshot(host) : null,
+            Capture: includeResourceSnapshots
+                ? TrySnapshot(captureProcess)
+                : null,
+            DesktopWindowManager: includeResourceSnapshots && host is not null
+                ? TrySnapshotSystemProcess("dwm", host.SessionId)
+                : null,
+            AudioEngine: includeResourceSnapshots && host is not null
+                ? TrySnapshotSystemProcess("audiodg", host.SessionId)
+                : null);
         _events.Writer.TryWrite(entry);
     }
 

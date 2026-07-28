@@ -20,35 +20,45 @@ internal static class ProcessTuning
     public static bool TryApplyCapturePriority(
         Process process,
         VideoEncodingStrategy strategy,
-        bool captureOutputRequiresScaling = false)
+        bool captureOutputRequiresScaling = false,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
     {
         ArgumentNullException.ThrowIfNull(strategy);
-        var priority = GetCaptureCpuPriority(strategy, captureOutputRequiresScaling);
+        var priority = GetCaptureCpuPriority(
+            strategy,
+            captureOutputRequiresScaling,
+            performanceProfile);
         var cpuPriorityApplied = TryApplyPriority(process, priority);
         var graphicsPriorityApplied = TryApplyGraphicsPriority(
             process,
-            GetCaptureGraphicsPriority(strategy, captureOutputRequiresScaling));
+            GetCaptureGraphicsPriority(
+                strategy,
+                captureOutputRequiresScaling,
+                performanceProfile));
         return cpuPriorityApplied && graphicsPriorityApplied;
     }
 
     public static bool TryEnsureCapturePriority(
         Process process,
         VideoEncodingStrategy strategy,
-        bool captureOutputRequiresScaling = false)
+        bool captureOutputRequiresScaling = false,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
     {
         ArgumentNullException.ThrowIfNull(process);
         ArgumentNullException.ThrowIfNull(strategy);
 
         var expectedCpuPriority = GetCaptureCpuPriority(
             strategy,
-            captureOutputRequiresScaling);
+            captureOutputRequiresScaling,
+            performanceProfile);
         var cpuPriorityApplied =
             (TryReadPriority(process, out var observedCpuPriority) &&
              observedCpuPriority == expectedCpuPriority) ||
             TryApplyPriority(process, expectedCpuPriority);
         var expectedGraphicsPriority = GetCaptureGraphicsPriority(
             strategy,
-            captureOutputRequiresScaling);
+            captureOutputRequiresScaling,
+            performanceProfile);
         var graphicsPriorityApplied =
             (TryReadGraphicsPriority(process, out var observedGraphicsPriority) &&
              observedGraphicsPriority == expectedGraphicsPriority) ||
@@ -90,17 +100,19 @@ internal static class ProcessTuning
 
     internal static ProcessPriorityClass GetCaptureCpuPriority(
         VideoEncodingStrategy strategy,
-        bool captureOutputRequiresScaling)
+        bool captureOutputRequiresScaling,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
     {
         ArgumentNullException.ThrowIfNull(strategy);
-        if (strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
-            captureOutputRequiresScaling)
+        if (captureOutputRequiresScaling ||
+            performanceProfile == CapturePerformanceProfile.Resilient)
         {
             // gfxcapture's fixed-output resizer can fall below real-time cadence
             // when Windows schedules its coordination thread at BelowNormal,
-            // even though measured CPU use is very small. Keep only this scaled
-            // WGC process at Normal; native Source and GDI continue yielding to
-            // the foreground game.
+            // even though measured CPU use is very small. Scaled WGC and a
+            // native Source/GDI session promoted after measured starvation run
+            // at Normal. Low-impact native capture continues yielding to the
+            // game.
             return ScaledCapturePriority;
         }
 
@@ -113,13 +125,15 @@ internal static class ProcessTuning
 
     internal static GraphicsSchedulingPriorityClass GetCaptureGraphicsPriority(
         VideoEncodingStrategy strategy,
-        bool captureOutputRequiresScaling) =>
-        strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
-        captureOutputRequiresScaling
+        bool captureOutputRequiresScaling,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact) =>
+        captureOutputRequiresScaling ||
+        performanceProfile == CapturePerformanceProfile.Resilient
             // The fixed-resolution WGC path performs capture, D3D resize, and
             // hardware encode in the same FFmpeg process. BelowNormal can starve
-            // that scaler while a fullscreen game saturates the GPU even though
-            // native Source capture remains healthy.
+            // that scaler while a fullscreen game saturates the GPU. A native
+            // Source/GDI session opts into this class only after measured
+            // pressure.
             ? ScaledCaptureGraphicsPriority
             : CaptureGraphicsPriority;
 
