@@ -9,6 +9,13 @@ public partial class App : System.Windows.Application
     [STAThread]
     private static void Main(string[] args)
     {
+        // This WPF application uses WinForms display/device APIs but owns its
+        // custom entry point rather than ApplicationConfiguration.Initialize().
+        // Set the process context before Velopack, MessageBox, or any HWND can
+        // be created so Screen, GetWindowRect, and monitor bounds all use the
+        // same physical Per-Monitor-V2 coordinate space.
+        _ = System.Windows.Forms.Application.SetHighDpiMode(
+            System.Windows.Forms.HighDpiMode.PerMonitorV2);
         ProcessSecurityService.Apply();
         // Applying an update is always initiated explicitly from ClipForge's update panel.
         // This prevents a previously staged package from being applied implicitly at startup.

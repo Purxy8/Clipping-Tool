@@ -53,6 +53,7 @@ internal static class Program
             ("Capture starvation watchdog", TestCaptureStarvationWatchdogAsync),
             ("Capture recovery request gate", TestCaptureRecoveryRequestGateAsync),
             ("Scheduled capture refresh coordinator", TestScheduledCaptureRefreshCoordinatorAsync),
+            ("Discontinuous capture refresh coalescing", TestDiscontinuousCaptureRefreshCoalescingAsync),
             ("Replay capture fallback recovery policy", TestReplayCaptureFallbackRecoveryPolicyAsync),
             ("Replay post-save state and scheduler", TestReplayPostSaveStateAndSchedulerAsync),
             ("Renewal segment quarantine provenance", TestRenewalSegmentQuarantineProvenanceAsync),
@@ -164,6 +165,46 @@ internal static class Program
                 knownGenerationHeads,
                 "with a reused id"),
             "A duplicate or reused segment id must fail renewal provenance.");
+
+        static IReadOnlyList<int> Select(
+            IReadOnlyList<(int Number, bool Trusted)> segments,
+            int maximumCount = 10) =>
+            ReplayBufferService.SelectNewestContiguousTrustedSuffix(
+                    segments,
+                    segments.Count,
+                    maximumCount,
+                    static segment => segment.Number,
+                    static segment => segment.Trusted)
+                .Select(segment => segment.Number)
+                .ToArray();
+
+        Assert.SequenceEqual(
+            [4, 5],
+            Select([(1, true), (2, true), (3, false), (4, true), (5, true)]),
+            "Export crossed an untrusted capture-generation head.");
+        Assert.SequenceEqual(
+            [4, 5],
+            Select([(1, true), (2, true), (4, true), (5, true)]),
+            "Export crossed an unexplained segment-number gap.");
+        Assert.SequenceEqual(
+            [2, 3],
+            Select([(1, true), (2, true), (3, true)], maximumCount: 2),
+            "The newest bounded contiguous suffix was not selected.");
+        Assert.SequenceEqual(
+            Array.Empty<int>(),
+            Select([(1, true), (2, false)]),
+            "An untrusted newest completed segment fell back to an older generation.");
+        Assert.True(
+            ReplayBufferService.IsCaptureGenerationExportable(
+                selectedGeneration: 5,
+                blockedGeneration: 4) &&
+            !ReplayBufferService.IsCaptureGenerationExportable(
+                selectedGeneration: 5,
+                blockedGeneration: 5) &&
+            !ReplayBufferService.IsCaptureGenerationExportable(
+                selectedGeneration: -1,
+                blockedGeneration: -1),
+            "A save could commit an invalid or cadence-blocked capture generation.");
 
         return Task.CompletedTask;
     }
@@ -1519,6 +1560,86 @@ internal static class Program
             arguments.Count(argument => argument == "-filter_complex_threads"),
             "Direct WGC hardware capture must create one bounded complex-filter pool.");
         Assert.ContainsSequence(arguments, "-fps_mode", "cfr", "-r", "60");
+        Assert.ContainsSequence(arguments, "-stats_period", "0.25");
+
+        var sourceConfiguration = configuration with
+        {
+            Resolution = ResolutionOption.All.Single(option => option.Id == "source")
+        };
+        var lowImpactSourceArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            sourceConfiguration,
+            [],
+            strategy,
+            @"C:\Buffer",
+            performanceProfile: CapturePerformanceProfile.LowImpact);
+        Assert.ContainsSequence(
+            lowImpactSourceArguments,
+            "-thread_queue_size", "2",
+            "-f", "lavfi");
+        var resilientSourceArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            sourceConfiguration,
+            [],
+            strategy,
+            @"C:\Buffer",
+            performanceProfile: CapturePerformanceProfile.Resilient);
+        Assert.ContainsSequence(
+            resilientSourceArguments,
+            "-thread_queue_size", "4",
+            "-f", "lavfi");
+        Assert.Equal(
+            ProcessPriorityClass.Normal,
+            ProcessTuning.GetCaptureCpuPriority(
+                strategy,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient),
+            "A Source session promoted after measured pressure must use resilient CPU scheduling.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.Normal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                strategy,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient),
+            "A Source session promoted after measured pressure must use resilient GPU scheduling.");
+
+        var sourceProbeArguments =
+            FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
+                sourceConfiguration,
+                strategy);
+        Assert.ContainsSequence(
+            sourceProbeArguments,
+            "-fps_mode", "cfr",
+            "-r", "60",
+            "-frames:v", "180");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                sourceProbeArguments,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.1),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(6.1)),
+                out var sourceProbeDiagnostic) &&
+            sourceProbeDiagnostic.Contains("required minimum", StringComparison.Ordinal),
+            "A Source WGC path sustaining only about 30 FPS must not pass capability selection.");
+        Assert.True(
+            FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                sourceProbeArguments,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.Zero,
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(3)),
+                out _),
+            "A Source WGC path sustaining about 60 FPS was rejected.");
+        var resilientSourceProbeArguments =
+            FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
+                sourceConfiguration,
+                strategy,
+                CapturePerformanceProfile.Resilient);
+        Assert.ContainsSequence(
+            resilientSourceProbeArguments,
+            "-thread_queue_size", "4",
+            "-f", "lavfi");
 
         var cursorArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration with { CaptureCursor = true },
@@ -1941,6 +2062,68 @@ internal static class Program
             HasRecentInput: true);
         var fullscreenIdle = fullscreenRecent with { HasRecentInput = false };
         var windowedRecent = fullscreenRecent with { IsFullscreenOnCapturedDisplay = false };
+        Assert.True(
+            CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.60,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9),
+            "A stretched borderless game anchored to the captured monitor was not recognized.");
+        Assert.True(
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.60,
+                monitorMatches: true,
+                isBorderless: false,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9) &&
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.60,
+                monitorMatches: false,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9) &&
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.44,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 16d / 9,
+                monitorAspectRatio: 16d / 9) &&
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.44,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9),
+            "An ordinary native-aspect or 4:3 partial window was mistaken for a custom fullscreen game.");
+        Assert.True(
+            CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.50,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9) &&
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.49,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: true,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9) &&
+            !CaptureForegroundContextProbe.IsFullscreenCandidate(
+                capturedDisplayCoverage: 0.72,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToMonitor: false,
+                foregroundAspectRatio: 4d / 3,
+                monitorAspectRatio: 16d / 9),
+            "The custom-fullscreen boundary admitted an undersized or unanchored window.");
 
         var healthy = new CaptureStarvationWatchdog(60);
         for (var second = 0; second <= 12; second++)
@@ -2171,7 +2354,8 @@ internal static class Program
             _ = healthyThenAltTabThenLowCadence.Observe(
                 CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
                 fullscreenRecent,
-                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second));
+                captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second),
+                allowChronicLowCadence: true);
         }
 
         for (var second = 13; second <= 17; second++)
@@ -2180,7 +2364,8 @@ internal static class Program
                 healthyThenAltTabThenLowCadence.Observe(
                     CreateProgressSample(second, frame: 60L * second, duplicatedFrames: 0),
                     windowedRecent,
-                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second),
+                    allowChronicLowCadence: true) is null,
                 "Leaving fullscreen must not trigger capture recovery.");
         }
 
@@ -2194,8 +2379,9 @@ internal static class Program
                         frame: 60L * second,
                         duplicatedFrames: 44L * lowCadenceSeconds),
                     fullscreenRecent,
-                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second)) is null,
-                "A sustained alt-tab must clear the old content's healthy-cadence latch.");
+                    captureUptime: TimeSpan.FromHours(2) + TimeSpan.FromSeconds(second),
+                    allowChronicLowCadence: true) is null,
+                "A game that was previously healthy must not be reclassified as startup-low cadence after an alt-tab.");
         }
 
         var healthyThenSeventeenFramesPerSecond = new CaptureStarvationWatchdog(60);
@@ -2261,6 +2447,284 @@ internal static class Program
             }
         }
 
+        foreach (var uniqueFramesPerSecond in new[] { 16, 24, 30 })
+        {
+            var legitimateLowImpactCadence = new CaptureStarvationWatchdog(60);
+            for (var second = 0; second <= 24; second++)
+            {
+                var duplicatedFrames =
+                    (60L - uniqueFramesPerSecond) * second;
+                Assert.True(
+                    legitimateLowImpactCadence.Observe(
+                        CreateProgressSample(
+                            second,
+                            frame: 60L * second,
+                            duplicatedFrames),
+                        fullscreenRecent,
+                        captureUptime:
+                            TimeSpan.FromHours(2) +
+                            TimeSpan.FromSeconds(second),
+                        allowSchedulingPressure: true) is null,
+                    $"A stable {uniqueFramesPerSecond} FPS game was mistaken for capture scheduling pressure.");
+            }
+        }
+
+        var chronicLowImpactCadence = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? chronicAssessment = null;
+        for (var second = 0; second <= 12; second++)
+        {
+            chronicAssessment ??= chronicLowImpactCadence.Observe(
+                CreateProgressSample(
+                    second,
+                    frame: 60L * second,
+                    duplicatedFrames: 30L * second),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(second),
+                allowChronicLowCadence: true);
+        }
+
+        Assert.True(
+            chronicAssessment is
+            {
+                Kind: CaptureStarvationKind.ChronicLowCadence
+            },
+            "Native LowImpact capture stuck near 30 FPS from startup did not request its one-way resilient promotion.");
+
+        var healthyThenThirtyFramesPerSecond =
+            new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 12; second++)
+        {
+            Assert.True(
+                healthyThenThirtyFramesPerSecond.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 0),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowChronicLowCadence: true) is null,
+                "Healthy initial cadence must arm, not trigger, recovery.");
+        }
+
+        for (var second = 13; second <= 32; second++)
+        {
+            Assert.True(
+                healthyThenThirtyFramesPerSecond.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 30L * (second - 12)),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowChronicLowCadence: true) is null,
+                "A later legitimate 30 FPS cap was mistaken for initial recorder pressure.");
+        }
+
+        var progressGap = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 8; second++)
+        {
+            Assert.True(
+                progressGap.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 0),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true) is null,
+                "Healthy progress unexpectedly triggered gap recovery.");
+        }
+
+        var healthyTelemetryGap = progressGap.Observe(
+            CreateProgressSample(
+                seconds: 12,
+                frame: 720,
+                duplicatedFrames: 0),
+            fullscreenRecent,
+            captureUptime: TimeSpan.FromSeconds(12),
+            allowOutputThroughput: true);
+        Assert.True(
+            healthyTelemetryGap is null,
+            "A missing progress report invalidated capture even though frame and media counters advanced in real time.");
+
+        var lowFpsTelemetryGap = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 8; second++)
+        {
+            Assert.True(
+                lowFpsTelemetryGap.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 52L * second),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true) is null,
+                "Stable low-FPS content unexpectedly triggered objective throughput recovery.");
+        }
+
+        Assert.True(
+            lowFpsTelemetryGap.Observe(
+                CreateProgressSample(
+                    seconds: 12,
+                    frame: 720,
+                    duplicatedFrames: 624),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(12),
+                allowOutputThroughput: true) is null,
+            "A telemetry gap over stable low-FPS content was mistaken for a stalled output graph.");
+
+        var firstGapCandidate = progressGap.Observe(
+            new CaptureProgressSample(
+                Frame: 750,
+                DuplicatedFrames: 0,
+                DroppedFrames: 0,
+                OutputTimeMicroseconds: 12_500_000,
+                Timestamp: checked(16L * Stopwatch.Frequency)),
+            fullscreenRecent,
+            captureUptime: TimeSpan.FromSeconds(16),
+            allowOutputThroughput: true);
+        Assert.True(
+            firstGapCandidate is null,
+            "One delayed progress receipt was treated as an objective capture freeze before pipe catch-up could be observed.");
+        var gapAssessment = progressGap.Observe(
+            new CaptureProgressSample(
+                Frame: 780,
+                DuplicatedFrames: 0,
+                DroppedFrames: 0,
+                OutputTimeMicroseconds: 13_000_000,
+                Timestamp: checked(20L * Stopwatch.Frequency)),
+            fullscreenRecent,
+            captureUptime: TimeSpan.FromSeconds(20),
+            allowOutputThroughput: true);
+        Assert.True(
+            gapAssessment is
+            {
+                Kind: CaptureStarvationKind.ProgressGap,
+                Window.TotalSeconds: >= 3.9
+            },
+            "A visible multi-second capture progress freeze escaped cadence recovery.");
+
+        var parentPipeBacklog = new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 8; second++)
+        {
+            Assert.True(
+                parentPipeBacklog.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 0),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true) is null,
+                "Healthy pre-backlog progress unexpectedly triggered recovery.");
+        }
+
+        Assert.True(
+            parentPipeBacklog.Observe(
+                new CaptureProgressSample(
+                    Frame: 495,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 8_250_000,
+                    Timestamp: checked(12L * Stopwatch.Frequency)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(12),
+                allowOutputThroughput: true) is null,
+            "The first stale progress block after a parent-process pause was treated as a capture fault.");
+        Assert.True(
+            parentPipeBacklog.Observe(
+                new CaptureProgressSample(
+                    Frame: 510,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 8_500_000,
+                    Timestamp: checked(
+                        12L * Stopwatch.Frequency +
+                        Stopwatch.Frequency / 200)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(12.005),
+                allowOutputThroughput: true) is null,
+            "A queued progress burst triggered recovery before its cumulative counters could catch up.");
+        Assert.True(
+            parentPipeBacklog.Observe(
+                new CaptureProgressSample(
+                    Frame: 720,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 12_000_000,
+                    Timestamp: checked(
+                        12L * Stopwatch.Frequency +
+                        Stopwatch.Frequency / 100)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(12.01),
+                allowOutputThroughput: true) is null,
+            "Queued FFmpeg progress that caught up immediately after the parent resumed still triggered recovery.");
+
+        var longParentPipeBacklog =
+            new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 8; second++)
+        {
+            Assert.True(
+                longParentPipeBacklog.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 0),
+                    fullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true) is null,
+                "Healthy progress before the long pipe backlog unexpectedly triggered recovery.");
+        }
+
+        Assert.True(
+            longParentPipeBacklog.Observe(
+                new CaptureProgressSample(
+                    Frame: 495,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 8_250_000,
+                    Timestamp: checked(32L * Stopwatch.Frequency)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(32),
+                allowOutputThroughput: true) is null,
+            "The first stale record from a long bounded progress backlog triggered recovery.");
+        for (var queuedSample = 1; queuedSample <= 80; queuedSample++)
+        {
+            Assert.True(
+                longParentPipeBacklog.Observe(
+                    new CaptureProgressSample(
+                        Frame: 495L + 15L * queuedSample,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds:
+                            8_250_000L + 250_000L * queuedSample,
+                        Timestamp: checked(
+                            32L * Stopwatch.Frequency +
+                            queuedSample *
+                            (long)Stopwatch.Frequency / 1000)),
+                    fullscreenRecent,
+                    captureUptime:
+                        TimeSpan.FromSeconds(
+                            32 + queuedSample / 1000d),
+                    allowOutputThroughput: true) is null,
+                $"Queued progress sample {queuedSample} was classified before the bounded pipe backlog drained.");
+        }
+
+        Assert.True(
+            longParentPipeBacklog.Observe(
+                new CaptureProgressSample(
+                    Frame: 1_926,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 32_100_000,
+                    Timestamp: checked(
+                        32L * Stopwatch.Frequency +
+                        Stopwatch.Frequency / 10)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(32.1),
+                allowOutputThroughput: true) is null,
+            "A fully caught-up long bounded progress backlog still triggered destructive recovery.");
+
         var agedModerateIdle = new CaptureStarvationWatchdog(60);
         for (var second = 0; second <= 24; second++)
         {
@@ -2272,16 +2736,330 @@ internal static class Program
                 "An aged but idle fullscreen scene must not trigger moderate recovery.");
         }
 
+        var burstPressure = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? burstPressureAssessment = null;
+        long burstDuplicates = 0;
+        for (var quarter = 0; quarter <= 32; quarter++)
+        {
+            if (quarter is 8 or 9 or 16 or 17)
+            {
+                burstDuplicates += 15;
+            }
+
+            var timestamp = checked(
+                quarter * (long)Stopwatch.Frequency / 4);
+            burstPressureAssessment ??= burstPressure.Observe(
+                new CaptureProgressSample(
+                    Frame: 15L * quarter,
+                    DuplicatedFrames: burstDuplicates,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 250_000L * quarter,
+                    Timestamp: timestamp),
+                fullscreenRecent,
+                allowSchedulingPressure: true);
+        }
+
+        Assert.True(
+            burstPressureAssessment is
+            {
+                Kind: CaptureStarvationKind.SchedulingPressure
+            },
+            "Short repeated Source stalls were hidden by one-second progress sampling.");
+
+        var slowOutput = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? slowOutputAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            slowOutputAssessment ??= slowOutput.Observe(
+                new CaptureProgressSample(
+                    Frame: 30L * second,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 500_000L * second,
+                    Timestamp: checked(second * (long)Stopwatch.Frequency)),
+                fullscreenRecent,
+                allowSchedulingPressure: true);
+        }
+
+        Assert.True(
+            slowOutputAssessment is
+            {
+                Kind: CaptureStarvationKind.OutputThroughput,
+                OutputSpeedRatio: < 0.85
+            },
+            "A Source graph running below real time did not request the resilient profile.");
+
+        var duplicateAndSlowOutput = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? duplicateAndSlowAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            duplicateAndSlowAssessment ??= duplicateAndSlowOutput.Observe(
+                new CaptureProgressSample(
+                    Frame: 60L * second,
+                    DuplicatedFrames: 58L * second,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 500_000L * second,
+                    Timestamp: checked(second * (long)Stopwatch.Frequency)),
+                fullscreenRecent,
+                captureUptime: TimeSpan.FromSeconds(second),
+                allowSchedulingPressure: true,
+                allowOutputThroughput: true);
+        }
+
+        Assert.True(
+            duplicateAndSlowAssessment is
+            {
+                Kind: CaptureStarvationKind.OutputThroughput,
+                OutputSpeedRatio: < 0.85
+            },
+            "Content duplication hid objective below-real-time output throughput.");
+
+        var customFullscreenRecent =
+            new CaptureForegroundContext(
+                IsFullscreenOnCapturedDisplay: true,
+                HasRecentInput: true,
+                CapturedDisplayCoverage: 0.72,
+                UsedCustomFullscreenFallback: true);
+        var exactFullscreenRecent =
+            new CaptureForegroundContext(
+                IsFullscreenOnCapturedDisplay: true,
+                HasRecentInput: true,
+                CapturedDisplayCoverage: 1,
+                UsedCustomFullscreenFallback: false);
+        var customHistoryWithExactProbeFlicker =
+            new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? flickerAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            flickerAssessment ??=
+                customHistoryWithExactProbeFlicker.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 58L * second),
+                    second == 8
+                        ? exactFullscreenRecent
+                        : customFullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: second == 8);
+        }
+
+        Assert.True(
+            flickerAssessment is
+            {
+                Kind: CaptureStarvationKind.Severe,
+                UsedCustomFullscreenFallback: true
+            } &&
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.Resilient,
+                flickerAssessment.Kind,
+                flickerAssessment.UsedCustomFullscreenFallback) is null,
+            "One exact-fullscreen probe flicker discarded the custom/stretched history and enabled destructive duplicate-only recovery.");
+
+        var customObjectiveThroughput =
+            new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? customObjectiveAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            customObjectiveAssessment ??=
+                customObjectiveThroughput.Observe(
+                    new CaptureProgressSample(
+                        Frame: 30L * second,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds:
+                            500_000L * second,
+                        Timestamp: checked(
+                            second *
+                            (long)Stopwatch.Frequency)),
+                    customFullscreenRecent,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: false);
+        }
+
+        Assert.True(
+            customObjectiveAssessment is
+            {
+                Kind: CaptureStarvationKind.OutputThroughput,
+                UsedCustomFullscreenFallback: true
+            } &&
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.Resilient,
+                customObjectiveAssessment.Kind,
+                customObjectiveAssessment
+                    .UsedCustomFullscreenFallback) ==
+                CaptureRecoveryReason.SourceStarvation,
+            "Window-level custom ambiguity incorrectly suppressed objective below-real-time output recovery.");
+
+        Assert.Equal(
+            CaptureRecoveryReason.SourcePressure,
+            ReplayBufferService.SelectCadenceRecoveryReason(
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact),
+            "The first native LowImpact cadence fault did not promote its capture profile.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceProfilePromotion,
+            ReplayBufferService.SelectCadenceRecoveryReason(
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact,
+                CaptureStarvationKind.ChronicLowCadence),
+            "Ambiguous initial low cadence was treated as a destructive capture fault.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceStarvation,
+            ReplayBufferService.SelectCadenceRecoveryReason(
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient),
+            "Persistent cadence failure after promotion did not enter bounded recovery.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceStarvation,
+            ReplayBufferService.SelectCadenceRecoveryReason(
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.LowImpact),
+            "A scaled WGC graph running below real time was mistaken for native profile pressure.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceProfilePromotion,
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact,
+                CaptureStarvationKind.Severe,
+                usedCustomFullscreenFallback: true),
+            "Ambiguous custom fullscreen cadence did not use the non-destructive native profile promotion.");
+        Assert.True(
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient,
+                CaptureStarvationKind.Severe,
+                usedCustomFullscreenFallback: true) is null &&
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.LowImpact,
+                CaptureStarvationKind.SchedulingPressure,
+                usedCustomFullscreenFallback: true) is null,
+            "Ambiguous custom fullscreen content cadence remained destructive after promotion or scaling.");
+        Assert.Equal(
+            CaptureRecoveryReason.SourceStarvation,
+            ReplayBufferService.SelectSafeCadenceRecoveryReason(
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.Resilient,
+                CaptureStarvationKind.OutputThroughput,
+                usedCustomFullscreenFallback: true),
+            "Objective custom-fullscreen throughput failure was incorrectly suppressed.");
+        Assert.True(
+            ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
+                usedCustomFullscreenFallback: true,
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient,
+                deferredRecoveryIsPending: false) &&
+            ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
+                usedCustomFullscreenFallback: true,
+                outputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact,
+                deferredRecoveryIsPending: true) &&
+            ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
+                usedCustomFullscreenFallback: false,
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.Resilient,
+                deferredRecoveryIsPending: true) &&
+            !ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
+                usedCustomFullscreenFallback: false,
+                outputRequiresScaling: true,
+                CapturePerformanceProfile.Resilient,
+                deferredRecoveryIsPending: false),
+            "A pending promotion can still latch non-objective cadence, or normal non-custom monitoring stayed suppressed afterward.");
+        Assert.True(
+            ReplayBufferService.CanRecoverySupersedeDeferredMaintenance(
+                CaptureRecoveryReason.SourcePressure) &&
+            ReplayBufferService.CanRecoverySupersedeDeferredMaintenance(
+                CaptureRecoveryReason.SourceStarvation) &&
+            ReplayBufferService.CanRecoverySupersedeDeferredMaintenance(
+                CaptureRecoveryReason.CaptureHang) &&
+            !ReplayBufferService.CanRecoverySupersedeDeferredMaintenance(
+                CaptureRecoveryReason.SourceProfilePromotion),
+            "A deferred profile retry can hide an objective capture fault or be superseded by another ambiguous promotion.");
+        Assert.True(
+            ReplayBufferService.HasCaptureRecoveryRetryCapacity(
+                attempt: 1) &&
+            ReplayBufferService.HasCaptureRecoveryRetryCapacity(
+                attempt: 2) &&
+            !ReplayBufferService.HasCaptureRecoveryRetryCapacity(
+                attempt: 3),
+            "Deferred capture verification can retry forever or lost its bounded recovery window.");
+
         Assert.True(
             !MainWindow.UsesAutomaticCaptureRecoveryBudget(
-                CaptureRecoveryReason.ScheduledRefresh),
-            "Routine WGC process renewal must remain unlimited for an indefinite replay session.");
+                CaptureRecoveryReason.ScheduledRefresh) &&
+            !MainWindow.UsesAutomaticCaptureRecoveryBudget(
+                CaptureRecoveryReason.SourcePressure) &&
+            !MainWindow.UsesAutomaticCaptureRecoveryBudget(
+                CaptureRecoveryReason.SourceProfilePromotion),
+            "Routine renewal and one-way Source profile promotion must not consume fault retries.");
         Assert.True(
             MainWindow.UsesAutomaticCaptureRecoveryBudget(
                 CaptureRecoveryReason.SourceStarvation) &&
             MainWindow.UsesAutomaticCaptureRecoveryBudget(
                 CaptureRecoveryReason.CaptureHang),
             "Fault recovery must remain bounded independently from scheduled WGC renewal.");
+        Assert.True(
+            MainWindow.SupportsAutomaticCaptureRecovery(
+                DesktopCaptureBackend.WindowsGraphicsCapture) &&
+            MainWindow.SupportsAutomaticCaptureRecovery(
+                DesktopCaptureBackend.Gdi),
+            "A verified desktop capture backend was excluded from bounded recovery.");
+        Assert.True(
+            ReplayBufferService.CanRefreshCaptureBackend(
+                DesktopCaptureBackend.WindowsGraphicsCapture) &&
+            ReplayBufferService.CanRefreshCaptureBackend(
+                DesktopCaptureBackend.Gdi),
+            "A monitored desktop backend cannot execute its requested capture refresh.");
+        Assert.True(
+            !ReplayBufferService.ShouldInvalidateCaptureGeneration(
+                CaptureRecoveryReason.SourceProfilePromotion) &&
+            ReplayBufferService.ShouldInvalidateCaptureGeneration(
+                CaptureRecoveryReason.SourcePressure) &&
+            ReplayBufferService.ShouldInvalidateCaptureGeneration(
+                CaptureRecoveryReason.SourceStarvation) &&
+            ReplayBufferService.ShouldInvalidateCaptureGeneration(
+                CaptureRecoveryReason.CaptureHang),
+            "Ambiguous profile promotion invalidated media, or a proven capture fault left media exportable.");
+        Assert.True(
+            MainWindow.ShouldUseSourceSafetyRecovery(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                usesRecoveryBudget: true,
+                completedRecoveryCount: 0,
+                outputRequiresScaling: true) &&
+            MainWindow.ShouldUseSourceSafetyRecovery(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                usesRecoveryBudget: true,
+                completedRecoveryCount: 1,
+                outputRequiresScaling: false) &&
+            !MainWindow.ShouldUseSourceSafetyRecovery(
+                DesktopCaptureBackend.Gdi,
+                usesRecoveryBudget: true,
+                completedRecoveryCount: 1,
+                outputRequiresScaling: true),
+            "GDI recovery could enter the WGC-only Source safety fallback.");
+        Assert.True(
+            MainWindow.ShouldRetainResilientCaptureProfile(
+                profileWasPromoted: true,
+                CapturePerformanceProfile.LowImpact,
+                outputRequiresScaling: false) &&
+            MainWindow.ShouldRetainResilientCaptureProfile(
+                profileWasPromoted: false,
+                CapturePerformanceProfile.Resilient,
+                outputRequiresScaling: false) &&
+            !MainWindow.ShouldRetainResilientCaptureProfile(
+                profileWasPromoted: false,
+                CapturePerformanceProfile.LowImpact,
+                outputRequiresScaling: false) &&
+            !MainWindow.ShouldRetainResilientCaptureProfile(
+                profileWasPromoted: true,
+                CapturePerformanceProfile.Resilient,
+                outputRequiresScaling: true),
+            "Automatic restarts did not retain a promoted no-scale profile or incorrectly retained it for an already-normal scaled graph.");
 
         return Task.CompletedTask;
     }
@@ -2506,6 +3284,131 @@ internal static class Program
             "A disposed coordinator accepted another refresh.");
     }
 
+    private static Task TestDiscontinuousCaptureRefreshCoalescingAsync()
+    {
+        Assert.True(
+            ReplayBufferService.ShouldScheduleDiscontinuousRefreshContinuation(
+                refreshWasQueued: false),
+            "A request racing the end of an active refresh did not retain a continuation.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleDiscontinuousRefreshContinuation(
+                refreshWasQueued: true),
+            "A successfully queued discontinuous refresh scheduled a redundant continuation.");
+
+        Assert.True(
+            ReplayBufferService.IsDiscontinuousRefreshQuiescent(
+                hasActionablePendingRequest: false,
+                coordinatorIsActive: false,
+                continuationIsScheduled: false),
+            "A fully drained discontinuous refresh pipeline did not report quiescence.");
+        Assert.True(
+            !ReplayBufferService.IsDiscontinuousRefreshQuiescent(
+                hasActionablePendingRequest: true,
+                coordinatorIsActive: false,
+                continuationIsScheduled: false),
+            "Wait-for-idle ignored an actionable pending display transition.");
+        Assert.True(
+            !ReplayBufferService.IsDiscontinuousRefreshQuiescent(
+                hasActionablePendingRequest: false,
+                coordinatorIsActive: true,
+                continuationIsScheduled: false),
+            "Wait-for-idle ignored an active display-transition worker.");
+        Assert.True(
+            !ReplayBufferService.IsDiscontinuousRefreshQuiescent(
+                hasActionablePendingRequest: false,
+                coordinatorIsActive: false,
+                continuationIsScheduled: true),
+            "Wait-for-idle ignored a coalescing continuation.");
+
+        Assert.Equal(
+            ReplayBufferService.DiscontinuousRefreshReadiness.Wait,
+            ReplayBufferService.GetDiscontinuousRefreshReadiness(
+                hasCurrentPendingRequest: true,
+                isDisposed: false,
+                isRunning: true,
+                isStopping: true,
+                hasCaptureProcess: false,
+                canRefreshCaptureBackend: true),
+            "A same-session display epoch lost its continuation while another refresh temporarily owned the process.");
+        Assert.Equal(
+            ReplayBufferService.DiscontinuousRefreshReadiness.Wait,
+            ReplayBufferService.GetDiscontinuousRefreshReadiness(
+                hasCurrentPendingRequest: true,
+                isDisposed: false,
+                isRunning: true,
+                isStopping: false,
+                hasCaptureProcess: false,
+                canRefreshCaptureBackend: true),
+            "A process-null replacement race was treated as a terminal display epoch.");
+        Assert.Equal(
+            ReplayBufferService.DiscontinuousRefreshReadiness.Actionable,
+            ReplayBufferService.GetDiscontinuousRefreshReadiness(
+                hasCurrentPendingRequest: true,
+                isDisposed: false,
+                isRunning: true,
+                isStopping: false,
+                hasCaptureProcess: true,
+                canRefreshCaptureBackend: true),
+            "A live pending display epoch did not become actionable after replacement.");
+        Assert.Equal(
+            ReplayBufferService.DiscontinuousRefreshReadiness.Terminal,
+            ReplayBufferService.GetDiscontinuousRefreshReadiness(
+                hasCurrentPendingRequest: true,
+                isDisposed: false,
+                isRunning: false,
+                isStopping: false,
+                hasCaptureProcess: false,
+                canRefreshCaptureBackend: true),
+            "A settled stopped session retained a display continuation forever.");
+        Assert.Equal(
+            ReplayBufferService.DiscontinuousRefreshReadiness.Terminal,
+            ReplayBufferService.GetDiscontinuousRefreshReadiness(
+                hasCurrentPendingRequest: true,
+                isDisposed: true,
+                isRunning: true,
+                isStopping: true,
+                hasCaptureProcess: false,
+                canRefreshCaptureBackend: true),
+            "A disposed service retained a display continuation.");
+        Assert.True(
+            ReplayBufferService.IsCurrentCaptureRecoveryRetry(
+                currentGeneration: 12,
+                taskGeneration: 12),
+            "A retry registered for the current generation was treated as stale.");
+        Assert.True(
+            !ReplayBufferService.IsCurrentCaptureRecoveryRetry(
+                currentGeneration: 13,
+                taskGeneration: 12),
+            "A superseded retry task was allowed to delay a newer display epoch.");
+
+        var firstAssessment = new CaptureStarvationAssessment(
+            0.85,
+            8,
+            TimeSpan.FromSeconds(8),
+            CaptureStarvationKind.SchedulingPressure);
+        var laterAssessment = new CaptureStarvationAssessment(
+            0.95,
+            3,
+            TimeSpan.FromSeconds(8),
+            CaptureStarvationKind.Severe);
+        Assert.True(
+            ReferenceEquals(
+                firstAssessment,
+                ReplayBufferService.RetainFirstCaptureAssessment(
+                    firstAssessment,
+                    laterAssessment)),
+            "The progress drain replaced the first actionable assessment in a batch.");
+        Assert.True(
+            ReferenceEquals(
+                laterAssessment,
+                ReplayBufferService.RetainFirstCaptureAssessment(
+                    retained: null,
+                    laterAssessment)),
+            "The progress drain failed to retain its first actionable assessment.");
+
+        return Task.CompletedTask;
+    }
+
     private static Task TestReplayCaptureFallbackRecoveryPolicyAsync()
     {
         var deadline = new DateTimeOffset(
@@ -2551,6 +3454,51 @@ internal static class Program
                 deadlineUtcTicks: 0,
                 deadline),
             "A degraded capture without an actual cache expiry entered a reprobe loop.");
+        Assert.True(
+            ReplayBufferService.ShouldMaintainDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true) &&
+            !ReplayBufferService.ShouldMaintainDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: false) &&
+            !ReplayBufferService.ShouldMaintainDegradedCaptureReprobe(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                strategyUsesCapabilityProbe: true),
+            "A GDI refresh lost or incorrectly enabled its background WGC promotion opportunity.");
+        Assert.True(
+            !ReplayBufferService.ShouldRunDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline,
+                new CaptureForegroundContext(
+                    IsFullscreenOnCapturedDisplay: true,
+                    HasRecentInput: true)) &&
+            ReplayBufferService.ShouldRunDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline,
+                new CaptureForegroundContext(
+                    IsFullscreenOnCapturedDisplay: true,
+                    HasRecentInput: false)) &&
+            !ReplayBufferService.ShouldRunDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline,
+                new CaptureForegroundContext(
+                    IsFullscreenOnCapturedDisplay: false,
+                    HasRecentInput: true)) &&
+            ReplayBufferService.ShouldRunDegradedCaptureReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                deadline,
+                deadline,
+                new CaptureForegroundContext(
+                    IsFullscreenOnCapturedDisplay: false,
+                    HasRecentInput: false)),
+            "The real capture/encode reprobe can compete with recent foreground input or never resumes while idle.");
         Assert.Equal(
             TimeSpan.FromMinutes(5),
             ReplayBufferService.GetDegradedCaptureReprobeDelay(attempt: 0),
@@ -3507,6 +4455,34 @@ internal static class Program
                 capturePlan: wgcSourcePlan,
                 currentDisplay: fixedOutputDisplay),
             "An explicit user stop must win over a late display-change event.");
+        Assert.True(
+            MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: true,
+                replayRunning: false,
+                ReplayState.Faulted) &&
+            MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: false,
+                replayRunning: false,
+                ReplayState.Starting) &&
+            MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: false,
+                replayRunning: false,
+                ReplayState.Stopping),
+            "A pending same-geometry refresh was dropped during an active capture transition.");
+        Assert.True(
+            !MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: false,
+                replayRunning: false,
+                ReplayState.Faulted) &&
+            !MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: false,
+                replayRunning: false,
+                ReplayState.Stopped) &&
+            !MainWindow.ShouldRetryPendingDisplayRefresh(
+                captureRestartInProgress: false,
+                replayRunning: true,
+                ReplayState.Ready),
+            "A settled or already-running replay kept an unnecessary 250 ms display-refresh retry alive.");
         return Task.CompletedTask;
     }
 
@@ -3697,7 +4673,7 @@ internal static class Program
             "-fps_mode", "cfr",
             "-r", configuration.FramesPerSecond.ToString(CultureInfo.InvariantCulture),
             "-frames:v",
-            (configuration.FramesPerSecond * FfmpegArgumentBuilder.ScaledGraphicsProbeSeconds)
+            (configuration.FramesPerSecond * FfmpegArgumentBuilder.CaptureProbeSeconds)
                 .ToString(CultureInfo.InvariantCulture),
             "-an");
         Assert.True(
@@ -3738,6 +4714,137 @@ internal static class Program
                 out var missingProgressDiagnostic) &&
             missingProgressDiagnostic.Contains("frame-progress", StringComparison.Ordinal),
             "A scaled graphics probe without progress evidence was accepted.");
+
+        var gdiNvencStrategy = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.Gdi);
+        var gdiProbe = FfmpegArgumentBuilder.BuildGdiCaptureProbeArguments(
+            configuration,
+            gdiNvencStrategy);
+        Assert.ContainsSequence(
+            gdiProbe,
+            "-nostats",
+            "-stats_period", "0.25",
+            "-progress", "pipe:1");
+        Assert.ContainsSequence(
+            gdiProbe,
+            "-thread_queue_size",
+            FfmpegArgumentBuilder.CompatibilityVideoInputQueuePackets.ToString(
+                CultureInfo.InvariantCulture),
+            "-f", "gdigrab",
+            "-draw_mouse", "0",
+            "-framerate", "60",
+            "-offset_x", "0",
+            "-offset_y", "0",
+            "-video_size", "2560x1440",
+            "-i", "desktop");
+        Assert.True(
+            gdiProbe.Any(argument => argument.Equals(
+                "scale=1920:1080:flags=fast_bilinear,format=nv12,setpts=PTS-STARTPTS",
+                StringComparison.Ordinal)),
+            "The GDI fallback probe did not exercise the production scaling and hardware pixel-format graph.");
+        Assert.ContainsSequence(
+            gdiProbe,
+            "-fps_mode", "cfr",
+            "-r", "60",
+            "-g", "120",
+            "-keyint_min", "120",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-frames:v", "180",
+            "-an",
+            "-f", "null", "NUL");
+        Assert.True(
+            !gdiProbe.Any(argument => argument.Contains(
+                "gfxcapture=",
+                StringComparison.Ordinal)),
+            "The production GDI probe unexpectedly started a WGC source.");
+        Assert.True(
+            FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                gdiProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.25),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(3.25)),
+                out _),
+            "A production GDI graph sustaining about 60 FPS was rejected.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                gdiProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.25),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(6.25)),
+                out var slowGdiDiagnostic) &&
+            slowGdiDiagnostic.Contains(
+                "required minimum",
+                StringComparison.Ordinal),
+            "A production GDI graph sustaining only about 30 FPS was accepted.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                gdiProbe,
+                observation: null,
+                out var missingGdiProgressDiagnostic) &&
+            missingGdiProgressDiagnostic.Contains(
+                "frame-progress",
+                StringComparison.Ordinal),
+            "A GDI fallback probe without throughput evidence was accepted.");
+        Assert.True(
+            FfmpegProbeRunner.TryResolveCaptureProbePolicy(
+                gdiProbe,
+                out var resolvedGdiProbeStrategy,
+                out var resolvedGdiScaling,
+                out var resolvedGdiProfile) &&
+            resolvedGdiProbeStrategy == gdiNvencStrategy &&
+            resolvedGdiScaling &&
+            resolvedGdiProfile == CapturePerformanceProfile.LowImpact,
+            "The GDI fallback probe did not resolve to the live capture priority policy.");
+        Assert.Equal(
+            ProcessTuning.GetCaptureCpuPriority(
+                gdiNvencStrategy,
+                captureOutputRequiresScaling: true),
+            ProcessTuning.GetCaptureCpuPriority(
+                resolvedGdiProbeStrategy,
+                resolvedGdiScaling,
+                resolvedGdiProfile),
+            "The GDI fallback probe CPU priority differs from live capture.");
+        Assert.Equal(
+            ProcessTuning.GetCaptureGraphicsPriority(
+                gdiNvencStrategy,
+                captureOutputRequiresScaling: true),
+            ProcessTuning.GetCaptureGraphicsPriority(
+                resolvedGdiProbeStrategy,
+                resolvedGdiScaling,
+                resolvedGdiProfile),
+            "The GDI fallback probe GPU priority differs from live capture.");
+
+        var customSourceConfiguration = configuration with
+        {
+            Display = configuration.Display with
+            {
+                Left = -1290,
+                Top = 100,
+                Width = 1290,
+                Height = 980
+            },
+            Resolution = ResolutionOption.All.Single(option =>
+                option.Id == "source")
+        };
+        var customSourceGdiProbe =
+            FfmpegArgumentBuilder.BuildGdiCaptureProbeArguments(
+                customSourceConfiguration,
+                VideoEncodingStrategy.SoftwareGdi);
+        Assert.ContainsSequence(
+            customSourceGdiProbe,
+            "-offset_x", "-1290",
+            "-offset_y", "100",
+            "-video_size", "1290x980");
+        Assert.True(
+            customSourceGdiProbe.Any(argument => argument.Equals(
+                "null,format=yuv420p,setpts=PTS-STARTPTS",
+                StringComparison.Ordinal)),
+            "A custom Source GDI probe introduced scaling that live capture would not use.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.CapturePriority,
             "Capture processes should yield CPU time to the foreground game.");
         Assert.Equal(ProcessPriorityClass.BelowNormal, ProcessTuning.HardwareCapturePriority,
@@ -3764,11 +4871,25 @@ internal static class Program
                 captureOutputRequiresScaling: false),
             "Native Source WGC should retain the low-impact CPU policy.");
         Assert.Equal(
-            ProcessPriorityClass.BelowNormal,
+            ProcessPriorityClass.Normal,
             ProcessTuning.GetCaptureCpuPriority(
                 VideoEncodingStrategy.SoftwareGdi,
                 captureOutputRequiresScaling: true),
-            "GDI capture must not opt into the scaled WGC CPU policy.");
+            "Scaled GDI capture must keep enough CPU scheduling priority to sustain real-time cadence.");
+        Assert.Equal(
+            ProcessPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureCpuPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact),
+            "Native LowImpact GDI capture should continue yielding CPU time to the foreground game.");
+        Assert.Equal(
+            ProcessPriorityClass.Normal,
+            ProcessTuning.GetCaptureCpuPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient),
+            "A native GDI session promoted after measured pressure must use resilient CPU scheduling.");
         Assert.Equal(
             GraphicsSchedulingPriorityClass.Normal,
             ProcessTuning.GetCaptureGraphicsPriority(
@@ -3782,11 +4903,25 @@ internal static class Program
                 captureOutputRequiresScaling: false),
             "Native Source WGC should retain the low-impact GPU policy.");
         Assert.Equal(
-            GraphicsSchedulingPriorityClass.BelowNormal,
+            GraphicsSchedulingPriorityClass.Normal,
             ProcessTuning.GetCaptureGraphicsPriority(
                 VideoEncodingStrategy.SoftwareGdi,
                 captureOutputRequiresScaling: true),
-            "GDI capture must not opt into the scaled WGC GPU policy.");
+            "Scaled GDI capture must keep enough GPU scheduling priority to sustain real-time cadence.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.BelowNormal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.LowImpact),
+            "Native LowImpact GDI capture should continue yielding GPU time to the foreground game.");
+        Assert.Equal(
+            GraphicsSchedulingPriorityClass.Normal,
+            ProcessTuning.GetCaptureGraphicsPriority(
+                VideoEncodingStrategy.SoftwareGdi,
+                captureOutputRequiresScaling: false,
+                CapturePerformanceProfile.Resilient),
+            "A native GDI session promoted after measured pressure must use resilient GPU scheduling.");
 
         return Task.CompletedTask;
     }
@@ -3811,6 +4946,75 @@ internal static class Program
             "Software H.264 must remain the universal fallback.");
 
         var configuration = CreateCaptureConfiguration(monitorIndex: 1);
+        var resilientSourceQueueObserved = false;
+        var resilientSourceRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            if (encoderName != "h264_nvenc")
+            {
+                return false;
+            }
+
+            if (!isGraphicsCapture)
+            {
+                return true;
+            }
+
+            resilientSourceQueueObserved =
+                GetArgumentAfter(arguments, "-thread_queue_size") == "4";
+            return resilientSourceQueueObserved;
+        });
+        var resilientSourceSelection = await new FfmpegCapabilityProbe(
+                resilientSourceRunner)
+            .SelectAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration with
+                {
+                    Resolution = ResolutionOption.All.Single(option =>
+                        option.Id == "source")
+                },
+                CancellationToken.None,
+                CapturePerformanceProfile.Resilient);
+        Assert.True(
+            resilientSourceQueueObserved &&
+            resilientSourceSelection.Strategy.CaptureBackend ==
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+            "Source safety probing did not exercise the production Resilient queue.");
+
+        var resilientGdiRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isGdiCapture = arguments.Any(argument =>
+                argument.Equals("gdigrab", StringComparison.Ordinal));
+            return encoderName == "h264_nvenc" &&
+                   (!isGraphicsCapture || isGdiCapture);
+        });
+        var resilientGdiSelection = await new FfmpegCapabilityProbe(
+                resilientGdiRunner)
+            .SelectAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration with
+                {
+                    Resolution = ResolutionOption.All.Single(option =>
+                        option.Id == "source")
+                },
+                CancellationToken.None,
+                CapturePerformanceProfile.Resilient);
+        var resilientGdiInvocation =
+            resilientGdiRunner.Invocations.Single(invocation =>
+                invocation.Arguments.Any(argument =>
+                    argument.Equals("gdigrab", StringComparison.Ordinal)));
+        Assert.True(
+            resilientGdiSelection.Strategy.CaptureBackend ==
+                DesktopCaptureBackend.Gdi &&
+            resilientGdiInvocation.CapturePerformanceProfile ==
+                CapturePerformanceProfile.Resilient,
+            "The real GDI fallback probe did not inherit the live Resilient priority policy.");
+
         await AssertProbeSelectionAsync(
             configuration,
             VideoEncoderKind.NvidiaNvenc,
@@ -3851,6 +5055,74 @@ internal static class Program
             expectedEncoder: VideoEncoderKind.SoftwareX264,
             expectedBackend: DesktopCaptureBackend.Gdi,
             expectedTransfer: false);
+
+        var probedGdiEncoders = new List<string>();
+        var validatedGdiRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v") ?? string.Empty;
+            var isGraphicsCapture = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isGdiCapture = arguments.Any(argument =>
+                argument.Equals("gdigrab", StringComparison.Ordinal));
+            if (isGdiCapture)
+            {
+                probedGdiEncoders.Add(encoderName);
+                return encoderName == "h264_qsv";
+            }
+
+            if (isGraphicsCapture)
+            {
+                return false;
+            }
+
+            return encoderName is "h264_nvenc" or "h264_qsv";
+        });
+        var validatedGdiSelection = await new FfmpegCapabilityProbe(
+                validatedGdiRunner)
+            .SelectAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                CancellationToken.None);
+        Assert.SequenceEqual(
+            new[] { "h264_nvenc", "h264_qsv" },
+            probedGdiEncoders,
+            "GDI fallback candidates were not production-probed in hardware preference order.");
+        Assert.Equal(
+            VideoEncoderKind.IntelQuickSync,
+            validatedGdiSelection.Strategy.Encoder,
+            "A hardware encoder whose real GDI graph failed was still selected.");
+        Assert.Equal(
+            DesktopCaptureBackend.Gdi,
+            validatedGdiSelection.Strategy.CaptureBackend,
+            "The first production-verified GDI fallback was not selected.");
+
+        var noRealTimeCaptureRunner = new ScriptedProbeRunner(arguments =>
+        {
+            var encoderName = GetArgumentAfter(arguments, "-c:v");
+            var isCaptureProbe = arguments.Any(argument =>
+                argument.Contains("gfxcapture=", StringComparison.Ordinal) ||
+                argument.Equals("gdigrab", StringComparison.Ordinal));
+            return encoderName == "h264_nvenc" && !isCaptureProbe;
+        });
+        var noRealTimeCaptureRejected = false;
+        try
+        {
+            _ = await new FfmpegCapabilityProbe(noRealTimeCaptureRunner)
+                .SelectAsync(
+                    @"C:\Test\ffmpeg.exe",
+                    configuration,
+                    CancellationToken.None);
+        }
+        catch (InvalidOperationException exception)
+        {
+            noRealTimeCaptureRejected = exception.Message.Contains(
+                "real-time capture path",
+                StringComparison.Ordinal);
+        }
+
+        Assert.True(
+            noRealTimeCaptureRejected,
+            "Capability selection accepted an unverified software GDI fallback after every real capture graph failed.");
 
         var hybridRunner = new ScriptedProbeRunner(arguments =>
         {
@@ -4062,6 +5334,150 @@ internal static class Program
             runner.CallCount,
             "A rapid replay restart repeated the full permanent-fallback probe latency.");
 
+        var beforeCursorKeyProbe = runner.CallCount;
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration with
+            {
+                CaptureCursor = !configuration.CaptureCursor
+            },
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > beforeCursorKeyProbe,
+            "A capture-cursor graph change reused a capability result for different WGC arguments.");
+
+        var beforeDisplayCoordinateKeyProbe = runner.CallCount;
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration with
+            {
+                Display = configuration.Display with
+                {
+                    Left = -2560,
+                    Top = 120
+                }
+            },
+            CancellationToken.None);
+        Assert.True(
+            runner.CallCount > beforeDisplayCoordinateKeyProbe,
+            "A GDI desktop-coordinate change reused a capability result for different gdigrab arguments.");
+
+        var beforeProfileKeyProbe = runner.CallCount;
+        _ = await probe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None,
+            CapturePerformanceProfile.Resilient);
+        Assert.True(
+            runner.CallCount > beforeProfileKeyProbe,
+            "A Resilient Source probe reused the cached LowImpact queue/priority graph.");
+
+        var profileInvalidationRunner =
+            new ScriptedProbeRunner(arguments =>
+            {
+                var encoderName = GetArgumentAfter(arguments, "-c:v");
+                var isGraphicsCapture = arguments.Any(argument =>
+                    argument.Contains(
+                        "gfxcapture=",
+                        StringComparison.Ordinal));
+                return encoderName == "h264_nvenc" &&
+                       !isGraphicsCapture;
+            });
+        var profileInvalidationProbe = new FfmpegCapabilityProbe(
+            profileInvalidationRunner,
+            degradedCacheInitialDuration: TimeSpan.FromSeconds(10),
+            degradedCacheMaximumDuration: TimeSpan.FromSeconds(20),
+            positiveCacheDuration: TimeSpan.FromSeconds(30),
+            getUtcNow: () => utcNow);
+        var lowImpactProfileSelection =
+            await profileInvalidationProbe.SelectAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                CancellationToken.None,
+                CapturePerformanceProfile.LowImpact);
+        var resilientProfileSelection =
+            await profileInvalidationProbe.SelectAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                CancellationToken.None,
+                CapturePerformanceProfile.Resilient);
+        var afterResilientProfileProbe =
+            profileInvalidationRunner.CallCount;
+        Assert.True(
+            profileInvalidationProbe.Invalidate(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                lowImpactProfileSelection.Strategy,
+                CapturePerformanceProfile.LowImpact),
+            "The exact LowImpact capability entry was not invalidated.");
+        _ = await profileInvalidationProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None,
+            CapturePerformanceProfile.Resilient);
+        Assert.Equal(
+            afterResilientProfileProbe,
+            profileInvalidationRunner.CallCount,
+            "LowImpact launch-failure invalidation removed the independent Resilient capability entry.");
+        Assert.True(
+            profileInvalidationProbe.Invalidate(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                resilientProfileSelection.Strategy,
+                CapturePerformanceProfile.Resilient),
+            "The exact Resilient capability entry was not invalidated.");
+        _ = await profileInvalidationProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None,
+            CapturePerformanceProfile.Resilient);
+        Assert.True(
+            profileInvalidationRunner.CallCount >
+                afterResilientProfileProbe,
+            "Resilient launch-failure invalidation did not force a fresh Resilient capability probe.");
+
+        var staleFlightRunner =
+            new BlockingProbeRunner(arguments =>
+            {
+                var encoderName = GetArgumentAfter(arguments, "-c:v");
+                var isGraphicsCapture = arguments.Any(argument =>
+                    argument.Contains(
+                        "gfxcapture=",
+                        StringComparison.Ordinal));
+                return encoderName == "h264_nvenc" &&
+                       !isGraphicsCapture;
+            });
+        var staleFlightProbe = new FfmpegCapabilityProbe(
+            staleFlightRunner,
+            degradedCacheInitialDuration:
+                TimeSpan.FromSeconds(10),
+            degradedCacheMaximumDuration:
+                TimeSpan.FromSeconds(20),
+            getUtcNow: () => utcNow);
+        var staleFlight = staleFlightProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None,
+            CapturePerformanceProfile.LowImpact);
+        await staleFlightRunner.FirstInvocationStarted.Task
+            .WaitAsync(TimeSpan.FromSeconds(2))
+            .ConfigureAwait(false);
+        staleFlightProbe.InvalidateConfiguration(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CapturePerformanceProfile.LowImpact);
+        staleFlightRunner.Release();
+        _ = await staleFlight.ConfigureAwait(false);
+        var staleFlightCalls = staleFlightRunner.CallCount;
+        _ = await staleFlightProbe.SelectAsync(
+            @"C:\Test\ffmpeg.exe",
+            configuration,
+            CancellationToken.None,
+            CapturePerformanceProfile.LowImpact);
+        Assert.True(
+            staleFlightRunner.CallCount > staleFlightCalls,
+            "A capability flight invalidated by session teardown repopulated the cache after the new session began.");
+
         var differentConfiguration = CreateCaptureConfiguration(monitorIndex: 2);
         _ = await probe.SelectAsync(
             @"C:\Test\ffmpeg.exe",
@@ -4244,7 +5660,7 @@ internal static class Program
                 result.Strategy.CaptureBackend == DesktopCaptureBackend.Gdi),
             "Concurrent capability callers observed different degraded strategies.");
         Assert.Equal(
-            5,
+            6,
             blockingRunner.CallCount,
             "Concurrent callers launched more than one permanent-fallback probe flight.");
     }
@@ -4273,6 +5689,7 @@ internal static class Program
         DesktopCaptureBackend expectedBackend,
         bool expectedTransfer)
     {
+        var productionGdiProbeObserved = false;
         var runner = new ScriptedProbeRunner((arguments) =>
         {
             var encoderName = GetArgumentAfter(arguments, "-c:v");
@@ -4285,8 +5702,11 @@ internal static class Program
             };
             var isGraphicsCapture = arguments.Any(argument =>
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            var isGdiCapture = arguments.Any(argument =>
+                argument.Equals("gdigrab", StringComparison.Ordinal));
             var isTransfer = arguments.Any(argument =>
                 argument.Contains("hwdownload", StringComparison.Ordinal));
+            productionGdiProbeObserved |= isGdiCapture;
             return requestedEncoder == availableEncoder &&
                    (!isGraphicsCapture ||
                     (isTransfer
@@ -4302,7 +5722,11 @@ internal static class Program
         Assert.Equal(expectedBackend, result.Strategy.CaptureBackend, "Runtime probe chose the wrong backend.");
         Assert.Equal(expectedTransfer, result.Strategy.RequiresSystemMemoryTransfer,
             "Runtime probe chose the wrong graphics transfer mode.");
-        Assert.True(runner.CallCount is >= 1 and <= 5, "Runtime probing performed an unexpected number of checks.");
+        Assert.True(runner.CallCount is >= 1 and <= 6, "Runtime probing performed an unexpected number of checks.");
+        Assert.Equal(
+            expectedBackend == DesktopCaptureBackend.Gdi,
+            productionGdiProbeObserved,
+            "Capability selection did not limit the production GDI probe to an actual fallback decision.");
 
         var completedProbeCalls = runner.CallCount;
         var cachedResult = await probe.SelectAsync(
@@ -4529,6 +5953,17 @@ internal static class Program
                 preserveCompletedSegments: false,
                 reachedSegmentBoundary: true),
             "Unaligned and health-triggered renewals must invalidate the old generation.");
+        Assert.True(
+            ReplayBufferService.ShouldDeferNonDestructiveCaptureRefresh(
+                requireCompletedSegmentBoundary: true,
+                reachedSegmentBoundary: false) &&
+            !ReplayBufferService.ShouldDeferNonDestructiveCaptureRefresh(
+                requireCompletedSegmentBoundary: true,
+                reachedSegmentBoundary: true) &&
+            !ReplayBufferService.ShouldDeferNonDestructiveCaptureRefresh(
+                requireCompletedSegmentBoundary: false,
+                reachedSegmentBoundary: false),
+            "A non-destructive profile promotion can still stop capture without a completed segment boundary.");
         Assert.True(
             !ReplayBufferService.IsCaptureSegmentTrusted(42, 42) &&
             ReplayBufferService.IsCaptureSegmentTrusted(43, 42),
@@ -7822,14 +9257,22 @@ internal static class Program
         Func<IReadOnlyList<string>, bool> succeeds) : IFfmpegProbeRunner
     {
         public int CallCount { get; private set; }
+        public List<(
+            IReadOnlyList<string> Arguments,
+            CapturePerformanceProfile? CapturePerformanceProfile)> Invocations
+        { get; } = [];
 
         public Task<FfmpegProbeExecution> RunAsync(
             string executable,
             IReadOnlyList<string> arguments,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            CapturePerformanceProfile? capturePerformanceProfile = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
+            Invocations.Add((
+                arguments.ToArray(),
+                capturePerformanceProfile));
             return Task.FromResult(succeeds(arguments)
                 ? new FfmpegProbeExecution(true)
                 : new FfmpegProbeExecution(false, "scripted unavailable capability"));
@@ -7853,7 +9296,8 @@ internal static class Program
         public async Task<FfmpegProbeExecution> RunAsync(
             string executable,
             IReadOnlyList<string> arguments,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            CapturePerformanceProfile? capturePerformanceProfile = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             _ = Interlocked.Increment(ref _callCount);

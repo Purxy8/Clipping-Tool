@@ -17,7 +17,8 @@ internal interface IFfmpegProbeRunner
     Task<FfmpegProbeExecution> RunAsync(
         string executable,
         IReadOnlyList<string> arguments,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        CapturePerformanceProfile? capturePerformanceProfile = null);
 }
 
 internal sealed record FfmpegCapabilitySelection(
@@ -55,6 +56,8 @@ internal sealed class FfmpegCapabilityProbe
     private readonly SemaphoreSlim _probeGate = new(1, 1);
     private readonly object _cacheGate = new();
     private readonly Dictionary<string, CachedCapabilitySelection> _cache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> _cacheRevisions =
         new(StringComparer.OrdinalIgnoreCase);
 
     public FfmpegCapabilityProbe(
@@ -98,19 +101,28 @@ internal sealed class FfmpegCapabilityProbe
     public async Task<FfmpegCapabilitySelection> SelectAsync(
         string ffmpegPath,
         CaptureConfiguration configuration,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CapturePerformanceProfile performanceProfile =
+            CapturePerformanceProfile.LowImpact)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var cacheKey = BuildCacheKey(ffmpegPath, configuration);
+        var cacheKey = BuildCacheKey(
+            ffmpegPath,
+            configuration,
+            performanceProfile);
         await _probeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             CachedCapabilitySelection? previous;
+            long cacheRevision;
             lock (_cacheGate)
             {
                 _cache.TryGetValue(cacheKey, out previous);
+                _cacheRevisions.TryGetValue(
+                    cacheKey,
+                    out cacheRevision);
             }
 
             if (previous is not null &&
@@ -120,7 +132,11 @@ internal sealed class FfmpegCapabilityProbe
                 return previous.Selection;
             }
 
-            var selection = await ProbeCoreAsync(ffmpegPath, configuration, cancellationToken)
+            var selection = await ProbeCoreAsync(
+                    ffmpegPath,
+                    configuration,
+                    performanceProfile,
+                    cancellationToken)
                 .ConfigureAwait(false);
             // A GDI result can be caused by a transient cadence miss while a
             // fullscreen game, DWM, or another capture probe is briefly busy.
@@ -134,10 +150,16 @@ internal sealed class FfmpegCapabilityProbe
                 selection = selection with { CacheExpiresAtUtc = expiresAtUtc };
                 lock (_cacheGate)
                 {
-                    _cache[cacheKey] = new CachedCapabilitySelection(
-                        selection,
-                        expiresAtUtc,
-                        ConsecutiveDegradedSelections: 0);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (GetCacheRevisionLocked(cacheKey) ==
+                        cacheRevision)
+                    {
+                        _cache[cacheKey] =
+                            new CachedCapabilitySelection(
+                                selection,
+                                expiresAtUtc,
+                                ConsecutiveDegradedSelections: 0);
+                    }
                 }
             }
             else
@@ -153,10 +175,16 @@ internal sealed class FfmpegCapabilityProbe
                 selection = selection with { CacheExpiresAtUtc = expiresAtUtc };
                 lock (_cacheGate)
                 {
-                    _cache[cacheKey] = new CachedCapabilitySelection(
-                        selection,
-                        expiresAtUtc,
-                        consecutiveDegradedSelections);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (GetCacheRevisionLocked(cacheKey) ==
+                        cacheRevision)
+                    {
+                        _cache[cacheKey] =
+                            new CachedCapabilitySelection(
+                                selection,
+                                expiresAtUtc,
+                                consecutiveDegradedSelections);
+                    }
                 }
             }
 
@@ -171,13 +199,18 @@ internal sealed class FfmpegCapabilityProbe
     internal bool Invalidate(
         string ffmpegPath,
         CaptureConfiguration configuration,
-        VideoEncodingStrategy expectedStrategy)
+        VideoEncodingStrategy expectedStrategy,
+        CapturePerformanceProfile performanceProfile =
+            CapturePerformanceProfile.LowImpact)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(expectedStrategy);
 
-        var cacheKey = BuildCacheKey(ffmpegPath, configuration);
+        var cacheKey = BuildCacheKey(
+            ffmpegPath,
+            configuration,
+            performanceProfile);
         lock (_cacheGate)
         {
             if (!_cache.TryGetValue(cacheKey, out var cached) ||
@@ -186,8 +219,44 @@ internal sealed class FfmpegCapabilityProbe
                 return false;
             }
 
-            return _cache.Remove(cacheKey);
+            var removed = _cache.Remove(cacheKey);
+            AdvanceCacheRevisionLocked(cacheKey);
+            return removed;
         }
+    }
+
+    internal void InvalidateConfiguration(
+        string ffmpegPath,
+        CaptureConfiguration configuration,
+        CapturePerformanceProfile performanceProfile)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var cacheKey = BuildCacheKey(
+            ffmpegPath,
+            configuration,
+            performanceProfile);
+        lock (_cacheGate)
+        {
+            _cache.Remove(cacheKey);
+            AdvanceCacheRevisionLocked(cacheKey);
+        }
+    }
+
+    private long GetCacheRevisionLocked(string cacheKey) =>
+        _cacheRevisions.TryGetValue(
+            cacheKey,
+            out var revision)
+            ? revision
+            : 0;
+
+    private void AdvanceCacheRevisionLocked(string cacheKey)
+    {
+        var revision = GetCacheRevisionLocked(cacheKey);
+        _cacheRevisions[cacheKey] = revision == long.MaxValue
+            ? 1
+            : revision + 1;
     }
 
     internal static VideoEncoderKind SelectBestEncoder(
@@ -235,10 +304,11 @@ internal sealed class FfmpegCapabilityProbe
     private async Task<FfmpegCapabilitySelection> ProbeCoreAsync(
         string ffmpegPath,
         CaptureConfiguration configuration,
+        CapturePerformanceProfile performanceProfile,
         CancellationToken cancellationToken)
     {
         var diagnostics = new List<string>();
-        VideoEncodingStrategy? firstHardwareGdiFallback = null;
+        var hardwareGdiCandidates = new List<VideoEncodingStrategy>();
         var outputSize = CaptureGeometry.ResolveOutputSize(
             configuration.Display,
             configuration.Resolution);
@@ -256,6 +326,7 @@ internal sealed class FfmpegCapabilityProbe
                         targetWidth,
                         targetHeight,
                         configuration.FramesPerSecond),
+                    performanceProfile,
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -266,10 +337,10 @@ internal sealed class FfmpegCapabilityProbe
             }
 
             // A working encoder does not imply that its preferred graphics
-            // device can consume frames from the selected monitor. Retain the
-            // first verified GDI fallback, but try every available hardware
-            // encoder's WGC paths before accepting the CPU capture path.
-            firstHardwareGdiFallback ??= gdiStrategy;
+            // device can consume frames from the selected monitor. Retain every
+            // encoder candidate, but try all hardware WGC paths before paying
+            // for a production-shaped three-second GDI capture probe.
+            hardwareGdiCandidates.Add(gdiStrategy);
 
             var graphicsStrategy = gdiStrategy with
             {
@@ -279,7 +350,9 @@ internal sealed class FfmpegCapabilityProbe
                     ffmpegPath,
                     FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
                         configuration,
-                        graphicsStrategy),
+                        graphicsStrategy,
+                        performanceProfile),
+                    performanceProfile,
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -304,7 +377,9 @@ internal sealed class FfmpegCapabilityProbe
                     ffmpegPath,
                     FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
                         configuration,
-                        transferStrategy),
+                        transferStrategy,
+                        performanceProfile),
+                    performanceProfile,
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -322,12 +397,28 @@ internal sealed class FfmpegCapabilityProbe
                 Summarize(transferProbe.Diagnostic));
         }
 
-        if (firstHardwareGdiFallback is not null)
+        foreach (var hardwareGdiCandidate in hardwareGdiCandidates)
         {
+            var gdiProbe = await RunSafelyAsync(
+                    ffmpegPath,
+                    FfmpegArgumentBuilder.BuildGdiCaptureProbeArguments(
+                        configuration,
+                        hardwareGdiCandidate),
+                    performanceProfile,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!gdiProbe.Succeeded)
+            {
+                diagnostics.Add(
+                    $"{hardwareGdiCandidate.Description} could not sustain the production capture graph: " +
+                    Summarize(gdiProbe.Diagnostic));
+                continue;
+            }
+
             diagnostics.Add(
-                $"Selected {firstHardwareGdiFallback.Description} after testing all hardware graphics-capture paths.");
+                $"Selected {hardwareGdiCandidate.Description} after a three-second production capture verification.");
             return new FfmpegCapabilitySelection(
-                firstHardwareGdiFallback,
+                hardwareGdiCandidate,
                 string.Join(' ', diagnostics));
         }
 
@@ -339,7 +430,9 @@ internal sealed class FfmpegCapabilityProbe
                 ffmpegPath,
                 FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
                     configuration,
-                    softwareGraphics),
+                    softwareGraphics,
+                    performanceProfile),
+                performanceProfile,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -354,20 +447,44 @@ internal sealed class FfmpegCapabilityProbe
         diagnostics.Add(
             $"Windows Graphics Capture with {graphicsPath} unavailable: " +
             Summarize(softwareGraphicsProbe.Diagnostic));
-        diagnostics.Add($"Selected {VideoEncodingStrategy.SoftwareGdi.Description} as the safe fallback.");
-        return new FfmpegCapabilitySelection(
-            VideoEncodingStrategy.SoftwareGdi,
+        var softwareGdiProbe = await RunSafelyAsync(
+                ffmpegPath,
+                FfmpegArgumentBuilder.BuildGdiCaptureProbeArguments(
+                    configuration,
+                    VideoEncodingStrategy.SoftwareGdi),
+                performanceProfile,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (softwareGdiProbe.Succeeded)
+        {
+            diagnostics.Add(
+                $"Selected {VideoEncodingStrategy.SoftwareGdi.Description} after a three-second production capture verification.");
+            return new FfmpegCapabilitySelection(
+                VideoEncodingStrategy.SoftwareGdi,
+                string.Join(' ', diagnostics));
+        }
+
+        diagnostics.Add(
+            $"{VideoEncodingStrategy.SoftwareGdi.Description} could not sustain the production capture graph: " +
+            Summarize(softwareGdiProbe.Diagnostic));
+        throw new InvalidOperationException(
+            "ClipForge could not verify a real-time capture path for the selected display. " +
             string.Join(' ', diagnostics));
     }
 
     private async Task<FfmpegProbeExecution> RunSafelyAsync(
         string ffmpegPath,
         IReadOnlyList<string> arguments,
+        CapturePerformanceProfile performanceProfile,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await _runner.RunAsync(ffmpegPath, arguments, cancellationToken)
+            return await _runner.RunAsync(
+                    ffmpegPath,
+                    arguments,
+                    cancellationToken,
+                    performanceProfile)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -383,7 +500,8 @@ internal sealed class FfmpegCapabilityProbe
 
     private static string BuildCacheKey(
         string ffmpegPath,
-        CaptureConfiguration configuration)
+        CaptureConfiguration configuration,
+        CapturePerformanceProfile performanceProfile)
     {
         long writeTicks;
         try
@@ -399,12 +517,17 @@ internal sealed class FfmpegCapabilityProbe
         return string.Join("|",
             Path.GetFullPath(ffmpegPath),
             writeTicks,
+            configuration.Display.DeviceName,
             configuration.Display.MonitorIndex,
+            configuration.Display.Left,
+            configuration.Display.Top,
             configuration.Display.Width,
             configuration.Display.Height,
             configuration.Resolution.Width,
             configuration.Resolution.Height,
-            configuration.FramesPerSecond);
+            configuration.FramesPerSecond,
+            configuration.CaptureCursor,
+            performanceProfile);
     }
 
     private static string Summarize(string? diagnostic)
@@ -447,7 +570,8 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
     public async Task<FfmpegProbeExecution> RunAsync(
         string executable,
         IReadOnlyList<string> arguments,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CapturePerformanceProfile? capturePerformanceProfile = null)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -471,13 +595,41 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
 
         using var processJob = AttachProcessLifetime(process);
         _processOwnershipEstablished?.Invoke(process.Id);
-        _ = FindScaledGraphicsCaptureFilter(arguments) is not null
-            ? ProcessTuning.TryApplyScaledGraphicsProbePriority(process)
-            : ProcessTuning.TryApplyLowImpactPriority(process);
+        VideoEncodingStrategy? captureProbeStrategy = null;
+        var captureProbeRequiresScaling = false;
+        var captureProbePerformanceProfile =
+            CapturePerformanceProfile.LowImpact;
+        if (TryResolveCaptureProbePolicy(
+                arguments,
+                out var probeStrategy,
+                out var outputRequiresScaling,
+                out var inferredPerformanceProfile))
+        {
+            captureProbeStrategy = probeStrategy;
+            captureProbeRequiresScaling = outputRequiresScaling;
+            captureProbePerformanceProfile =
+                capturePerformanceProfile ?? inferredPerformanceProfile;
+            _ = ProcessTuning.TryApplyCapturePriority(
+                process,
+                probeStrategy,
+                outputRequiresScaling,
+                captureProbePerformanceProfile);
+        }
+        else
+        {
+            _ = ProcessTuning.TryApplyLowImpactPriority(process);
+        }
         var diagnosticsTask = ReadDiagnosticTailAsync(process.StandardError);
         var progressTask = ReadProgressObservationAsync(
             process.StandardOutput,
-            startedAt);
+            startedAt,
+            captureProbeStrategy is null
+                ? null
+                : () => ProcessTuning.TryApplyCapturePriority(
+                    process,
+                    captureProbeStrategy,
+                    captureProbeRequiresScaling,
+                    captureProbePerformanceProfile));
         using var timeout = new CancellationTokenSource(ProbeTimeout);
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
@@ -594,18 +746,29 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
     {
         ArgumentNullException.ThrowIfNull(arguments);
         diagnostic = string.Empty;
-        var graphicsFilter = FindScaledGraphicsCaptureFilter(arguments);
-        if (graphicsFilter is null)
+        var graphicsFilter = FindGraphicsCaptureFilter(arguments);
+        var isGdiCapture = IsGdiCaptureProbe(arguments);
+        if (graphicsFilter is null && !isGdiCapture)
         {
             return true;
         }
 
+        var requestedFramesPerSecond = 0;
+        var hasRequestedFramesPerSecond = graphicsFilter is not null
+            ? TryReadFilterInteger(
+                graphicsFilter,
+                "max_framerate=",
+                out requestedFramesPerSecond)
+            : TryReadOptionInteger(
+                arguments,
+                "-framerate",
+                out requestedFramesPerSecond);
         if (!TryReadOptionInteger(arguments, "-frames:v", out var requestedFrames) ||
-            !TryReadFilterInteger(graphicsFilter, "max_framerate=", out var requestedFramesPerSecond) ||
+            !hasRequestedFramesPerSecond ||
             requestedFrames <= 0 ||
             requestedFramesPerSecond <= 0)
         {
-            diagnostic = "scaled graphics probe omitted its frame-count or frame-rate contract";
+            diagnostic = "capture probe omitted its frame-count or frame-rate contract";
             return false;
         }
 
@@ -616,7 +779,7 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             sample.LastFrameElapsed <= sample.FirstFrameElapsed)
         {
             diagnostic =
-                "scaled graphics probe did not report enough frame-progress samples to verify sustained cadence";
+                "capture probe did not report enough frame-progress samples to verify sustained cadence";
             return false;
         }
 
@@ -627,7 +790,7 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         if (observedFrameDelta < minimumFrameDelta)
         {
             diagnostic =
-                "scaled graphics probe reported too short a frame-progress interval to verify sustained cadence";
+                "capture probe reported too short a frame-progress interval to verify sustained cadence";
             return false;
         }
 
@@ -642,20 +805,114 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
 
         diagnostic = string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"scaled graphics probe sustained {observedFramesPerSecond:0.##} FPS; " +
+            $"capture probe sustained {observedFramesPerSecond:0.##} FPS; " +
             $"the required minimum is {minimumFramesPerSecond:0.##} FPS");
         return false;
     }
 
-    private static string? FindScaledGraphicsCaptureFilter(
+    private static string? FindGraphicsCaptureFilter(
         IReadOnlyList<string> arguments) =>
         arguments.FirstOrDefault(argument =>
-            argument.Contains("gfxcapture=", StringComparison.Ordinal) &&
-            argument.Contains(":resize_mode=scale", StringComparison.Ordinal));
+            argument.Contains("gfxcapture=", StringComparison.Ordinal));
+
+    internal static bool TryResolveCaptureProbePolicy(
+        IReadOnlyList<string> arguments,
+        out VideoEncodingStrategy strategy,
+        out bool outputRequiresScaling,
+        out CapturePerformanceProfile performanceProfile)
+    {
+        strategy = VideoEncodingStrategy.SoftwareGdi;
+        outputRequiresScaling = false;
+        performanceProfile = CapturePerformanceProfile.LowImpact;
+        var graphicsFilter = FindGraphicsCaptureFilter(arguments);
+        var isGdiCapture = IsGdiCaptureProbe(arguments);
+        if (graphicsFilter is null && !isGdiCapture)
+        {
+            return false;
+        }
+
+        if (graphicsFilter is not null)
+        {
+            outputRequiresScaling =
+                graphicsFilter.Contains(
+                    ":resize_mode=scale",
+                    StringComparison.Ordinal);
+        }
+        else
+        {
+            var videoFilter = ReadOptionValue(arguments, "-vf");
+            outputRequiresScaling =
+                videoFilter is { } filter &&
+                filter.StartsWith("scale=", StringComparison.Ordinal) &&
+                !filter.StartsWith(
+                    "scale=trunc(",
+                    StringComparison.Ordinal);
+        }
+
+        if (graphicsFilter is not null &&
+            !outputRequiresScaling &&
+            TryReadOptionInteger(
+                arguments,
+                "-thread_queue_size",
+                out var inputQueuePackets) &&
+            inputQueuePackets >= FfmpegArgumentBuilder.ScaledVideoInputQueuePackets)
+        {
+            performanceProfile = CapturePerformanceProfile.Resilient;
+        }
+        var encoder = ReadOptionValue(arguments, "-c:v") switch
+        {
+            "h264_nvenc" => VideoEncoderKind.NvidiaNvenc,
+            "h264_qsv" => VideoEncoderKind.IntelQuickSync,
+            "h264_amf" => VideoEncoderKind.AmdAmf,
+            _ => VideoEncoderKind.SoftwareX264
+        };
+        strategy = new VideoEncodingStrategy(
+            encoder,
+            isGdiCapture
+                ? DesktopCaptureBackend.Gdi
+                : DesktopCaptureBackend.WindowsGraphicsCapture,
+            RequiresSystemMemoryTransfer: !isGdiCapture &&
+                arguments.Any(argument =>
+                argument.Contains("hwdownload", StringComparison.Ordinal)));
+        return true;
+    }
+
+    private static bool IsGdiCaptureProbe(
+        IReadOnlyList<string> arguments)
+    {
+        for (var index = 0; index < arguments.Count - 1; index++)
+        {
+            if (arguments[index].Equals("-f", StringComparison.Ordinal) &&
+                arguments[index + 1].Equals(
+                    "gdigrab",
+                    StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string? ReadOptionValue(
+        IReadOnlyList<string> arguments,
+        string option)
+    {
+        for (var index = 0; index < arguments.Count - 1; index++)
+        {
+            if (arguments[index].Equals(option, StringComparison.Ordinal))
+            {
+                return arguments[index + 1];
+            }
+        }
+
+        return null;
+    }
 
     private static async Task<FfmpegProbeCadenceObservation?> ReadProgressObservationAsync(
         StreamReader reader,
-        long processStartedAt)
+        long processStartedAt,
+        Action? firstFrameObserved = null)
     {
         int? firstFrame = null;
         var firstFrameElapsed = TimeSpan.Zero;
@@ -682,6 +939,15 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             {
                 firstFrame = frame;
                 firstFrameElapsed = elapsed;
+                try
+                {
+                    firstFrameObserved?.Invoke();
+                }
+                catch
+                {
+                    // The initial best-effort priority application remains in
+                    // force when Windows rejects a post-initialization repair.
+                }
             }
 
             lastFrame = frame;

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Security;
@@ -37,6 +38,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private static readonly TimeSpan CaptureRefreshGracefulStopTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan CaptureCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan CaptureRecoveryRetryDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CaptureRecoveryRetryExhaustedCooldown =
+        TimeSpan.FromMinutes(5);
+    private const int MaximumCaptureRecoveryRetryAttempts = 2;
     private static readonly TimeSpan ExportProcessMaximumRuntime = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LegacyBufferMinimumInactivity = TimeSpan.FromHours(24);
     internal static readonly TimeSpan CurrentSessionCleanupTimeBudget =
@@ -62,15 +66,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly object _stateGate = new();
     private readonly object _statePublicationGate = new();
     private readonly object _diagnosticGate = new();
+    private readonly object _discontinuousRefreshGate = new();
+    private readonly object _captureRecoveryRetryGate = new();
     private readonly HashSet<string> _protectedSegments = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _diagnosticLines = new();
+    private readonly ConcurrentQueue<CaptureProgressEnvelope> _captureProgressSamples = new();
     private readonly List<WasapiAudioPipe> _audioPipes = [];
     private readonly List<BufferedSegment> _segments = [];
     private readonly CaptureRecoveryRequestGate _captureRecoveryRequestGate = new();
     private readonly CaptureRuntimeJournal _runtimeJournal = new();
     private readonly ScheduledCaptureRefreshCoordinator _scheduledCaptureRefreshCoordinator;
+    private readonly ScheduledCaptureRefreshCoordinator
+        _discontinuousCaptureRefreshCoordinator;
     private readonly ScheduledCaptureRefreshCoordinator _degradedCaptureReprobeCoordinator;
     private readonly CancellationTokenSource _initialBufferMaintenanceCancellation = new();
+    private readonly CancellationTokenSource _captureRecoveryRetryCancellation = new();
     private readonly TaskCompletionSource _disposeCompletion = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Task _initialBufferMaintenanceTask;
@@ -93,6 +103,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private string? _activeEncoderDescription;
     private CaptureConfiguration? _activeConfiguration;
     private VideoEncodingStrategy? _activeCaptureStrategy;
+    private CapturePerformanceProfile _activeCapturePerformanceProfile =
+        CapturePerformanceProfile.LowImpact;
     private string? _activeFfmpegPath;
     private CaptureSessionPlan? _lastCapturePlan;
     private CaptureProgressSample? _latestCaptureProgress;
@@ -102,14 +114,22 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _nextSegmentNumber;
     private int _activeCaptureGeneration;
     private int _quarantinedGenerationHeadSegmentNumber = -1;
+    private int _exportBlockedCaptureGeneration = -1;
+    private CancellationTokenSource? _activeSaveInvalidation;
+    private int _activeSaveCaptureGeneration = -1;
     private int _untrustedDeleteCursorSegmentNumber = -1;
     private int _trustedDeleteCursorSegmentNumber = -1;
     private int _isRunning;
     private int _isSaving;
     private int _saveOperationPending;
     private int _isStopping;
-    private long _recoveryRetryNotBefore;
-    private int _recoveryRetryGeneration;
+    private int _captureRecoveryRetrySequence;
+    private CaptureRecoveryRetryState _captureRecoveryRetryState =
+        new(
+            CurrentGeneration: 0,
+            TaskGeneration: 0,
+            NotBeforeTimestamp: 0,
+            Task.CompletedTask);
     private int _capturePriorityRefreshWarningReported;
     private int _activeStrategyUsesCapabilityProbe;
     private int _degradedCaptureReprobeAttempt;
@@ -117,6 +137,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private long _statePublicationVersion;
     private int _disposeStarted;
     private int _disposed;
+    private int _captureSessionIdentity;
+    private long _discontinuousRefreshRequestedEpoch;
+    private long _discontinuousRefreshCompletedEpoch;
+    private int _discontinuousRefreshSessionIdentity;
+    private string _discontinuousRefreshDiagnostic = string.Empty;
+    private int _discontinuousRefreshContinuationScheduled;
+    private Task _discontinuousRefreshContinuationTask = Task.CompletedTask;
 
     public ReplayBufferService(
         FfmpegSetupService? ffmpegSetupService = null,
@@ -144,6 +171,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 EnqueueDiagnostic(
                     $"Background WGC renewal for process {processId} failed: " +
                     $"{diagnostic} {exception.GetBaseException().Message}"));
+        _discontinuousCaptureRefreshCoordinator =
+            new ScheduledCaptureRefreshCoordinator(
+                RunDiscontinuousCaptureRefreshAsync,
+                (processId, diagnostic, exception) =>
+                    EnqueueDiagnostic(
+                        $"Background display-transition capture renewal for process {processId} failed: " +
+                        $"{diagnostic} {exception.GetBaseException().Message}"));
         _degradedCaptureReprobeCoordinator = new ScheduledCaptureRefreshCoordinator(
             RunDegradedCaptureReprobeAsync,
             (processId, diagnostic, exception) =>
@@ -211,6 +245,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     internal CaptureSessionPlan? LastCapturePlan => Volatile.Read(ref _lastCapturePlan);
 
+    internal CapturePerformanceProfile ActiveCapturePerformanceProfile =>
+        _activeCapturePerformanceProfile;
+
     // Capture smoke tests must distinguish a real numbering hole from a
     // generation head that the engine deliberately quarantined and deleted.
     // Return only provenance; the mutable segment index remains encapsulated.
@@ -258,13 +295,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
             configuration,
             cancellationToken,
             sessionStrategyOverride: null,
-            sourceSafetyMode: false);
+            sourceSafetyMode: false,
+            performanceProfileOverride: null);
 
     internal async Task StartAsync(
         CaptureConfiguration configuration,
         CancellationToken cancellationToken,
         VideoEncodingStrategy? sessionStrategyOverride,
-        bool sourceSafetyMode)
+        bool sourceSafetyMode,
+        CapturePerformanceProfile? performanceProfileOverride = null)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -275,6 +314,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         cancellationToken,
                         sessionStrategyOverride,
                         sourceSafetyMode,
+                        performanceProfileOverride,
                         allowFreshCapabilityRetry: attempt == 0)
                     .ConfigureAwait(false);
                 return;
@@ -294,14 +334,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
         CancellationToken cancellationToken,
         VideoEncodingStrategy? sessionStrategyOverride,
         bool sourceSafetyMode,
+        CapturePerformanceProfile? performanceProfileOverride,
         bool allowFreshCapabilityRetry)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ThrowIfDisposed();
+
         FfmpegCapabilitySelection? selectedCapability = null;
         string? selectedFfmpegPath = null;
         var capabilityWasProbed = false;
         var realCaptureLaunchFailed = false;
+        var selectedPerformanceProfile =
+            performanceProfileOverride ??
+            (sourceSafetyMode
+                ? CapturePerformanceProfile.Resilient
+                : CapturePerformanceProfile.LowImpact);
         try
         {
             await _initialBufferMaintenanceTask
@@ -349,6 +396,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 ValidateConfiguration(configuration);
+                var captureSessionIdentity =
+                    Interlocked.Increment(
+                        ref _captureSessionIdentity);
+                lock (_discontinuousRefreshGate)
+                {
+                    // Only a start that owns the lifecycle gate and passed the
+                    // already-running check establishes a new frame-pool
+                    // identity. A duplicate/cancelled StartAsync must not make
+                    // transition work for the live session stale.
+                    _discontinuousRefreshCompletedEpoch =
+                        _discontinuousRefreshRequestedEpoch;
+                    _discontinuousRefreshSessionIdentity =
+                        captureSessionIdentity;
+                }
+
                 _retention = configuration.Retention;
                 Publish(new ReplayStateSnapshot(
                     ReplayState.Starting,
@@ -389,12 +451,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 _sessionCancellation = new CancellationTokenSource();
                 _reportedDroppedAudioBlocks = 0;
-                Volatile.Write(ref _latestCaptureProgress, null);
+                ResetCaptureProgress();
                 _captureStarvationWatchdog = new CaptureStarvationWatchdog(
                     configuration.FramesPerSecond);
                 _captureRecoveryRequestGate.ResetForSession();
-                Volatile.Write(ref _recoveryRetryNotBefore, 0);
-                _ = Interlocked.Increment(ref _recoveryRetryGeneration);
+                InvalidateCaptureRecoveryRetry();
                 lock (_diagnosticGate)
                 {
                     _diagnosticLines.Clear();
@@ -420,7 +481,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     ? await (sourceSafetyMode
                             ? new FfmpegCapabilityProbe()
                             : _capabilityProbe)
-                        .SelectAsync(ffmpegPath, configuration, cancellationToken)
+                        .SelectAsync(
+                            ffmpegPath,
+                            configuration,
+                            cancellationToken,
+                            selectedPerformanceProfile)
                         .ConfigureAwait(false)
                     : new FfmpegCapabilitySelection(
                         effectiveStrategyOverride,
@@ -446,6 +511,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     (sourceSafetyMode ? " (Source safety mode)" : string.Empty);
                 _activeConfiguration = configuration;
                 _activeCaptureStrategy = capabilitySelection.Strategy;
+                _activeCapturePerformanceProfile =
+                    selectedPerformanceProfile;
                 _activeFfmpegPath = ffmpegPath;
                 Volatile.Write(
                     ref _activeStrategyUsesCapabilityProbe,
@@ -471,7 +538,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     configuration,
                     _audioPipes.Select(pipe => pipe.Specification).ToArray(),
                     capabilitySelection.Strategy,
-                    _segmentDirectory);
+                    _segmentDirectory,
+                    performanceProfile: selectedPerformanceProfile);
 
                 var captureProcess = CreateProcess(
                     ffmpegPath,
@@ -510,7 +578,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         capabilitySelection.Strategy,
                         CaptureGeometry.ResolveOutputSize(
                             configuration.Display,
-                            configuration.Resolution).RequiresScaling))
+                            configuration.Resolution).RequiresScaling,
+                        selectedPerformanceProfile))
                 {
                     EnqueueDiagnostic(
                         "Windows did not allow ClipForge to apply the capture process priority policy.");
@@ -518,7 +587,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 captureProcess.StandardInput.AutoFlush = true;
                 _diagnosticTask = PumpDiagnosticsAsync(captureProcess);
-                _captureProgressTask = PumpCaptureProgressAsync(captureProcess);
+                _captureProgressTask = PumpCaptureProgressAsync(
+                    captureProcess,
+                    configuration.Display);
                 Volatile.Write(ref _isRunning, 1);
 
                 if (_audioPipes.Count > 0)
@@ -558,7 +629,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         capabilitySelection.Strategy,
                         CaptureGeometry.ResolveOutputSize(
                             configuration.Display,
-                            configuration.Resolution).RequiresScaling))
+                            configuration.Resolution).RequiresScaling,
+                        selectedPerformanceProfile))
                 {
                     EnqueueDiagnostic(
                         "Windows did not allow ClipForge to finalize the live capture priority policy.");
@@ -575,7 +647,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     captureProcess,
                     configuration,
                     capabilitySelection.Strategy,
-                    "Initial capture generation is active.");
+                    $"Initial capture generation is active; profile={selectedPerformanceProfile}.");
                 Publish(new ReplayStateSnapshot(
                     ReplayState.Buffering,
                     TimeSpan.Zero,
@@ -620,7 +692,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     _ = _capabilityProbe.Invalidate(
                         failedFfmpegPath,
                         configuration,
-                        failedCapability.Strategy);
+                        failedCapability.Strategy,
+                        selectedPerformanceProfile);
                 }
 
                 var retryWithFreshCapability =
@@ -700,7 +773,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
         int? expectedProcessId,
         CancellationToken cancellationToken,
         bool preserveCompletedSegments = true,
-        FfmpegCapabilitySelection? verifiedReplacement = null)
+        FfmpegCapabilitySelection? verifiedReplacement = null,
+        CapturePerformanceProfile? performanceProfileOverride = null,
+        bool requireCompletedSegmentBoundary = false,
+        int? expectedSessionIdentity = null,
+        bool invalidateCapabilitySelectionBeforeRefresh = false,
+        int recoveryRetryAttempt = 0,
+        int boundaryRetryAttempt = 0)
     {
         ThrowIfDisposed();
         await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -714,6 +793,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 var configuration = _activeConfiguration;
                 var strategy = _activeCaptureStrategy;
                 var replacementStrategy = verifiedReplacement?.Strategy ?? strategy;
+                var replacementPerformanceProfile =
+                    performanceProfileOverride ?? _activeCapturePerformanceProfile;
                 var ffmpegPath = _activeFfmpegPath;
                 var segmentDirectory = _segmentDirectory;
                 if (!IsRunning ||
@@ -724,9 +805,22 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     string.IsNullOrWhiteSpace(ffmpegPath) ||
                     string.IsNullOrWhiteSpace(segmentDirectory) ||
                     expectedProcessId is null ||
-                    CaptureProcessId != expectedProcessId)
+                    CaptureProcessId != expectedProcessId ||
+                    expectedSessionIdentity is { } sessionIdentity &&
+                    Volatile.Read(ref _captureSessionIdentity) !=
+                        sessionIdentity)
                 {
                     return false;
+                }
+
+                if (invalidateCapabilitySelectionBeforeRefresh &&
+                    Volatile.Read(
+                        ref _activeStrategyUsesCapabilityProbe) != 0)
+                {
+                    _capabilityProbe.InvalidateConfiguration(
+                        ffmpegPath,
+                        configuration,
+                        _activeCapturePerformanceProfile);
                 }
 
                 var promotesDegradedCapture = verifiedReplacement is not null;
@@ -735,8 +829,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             strategy,
                             replacementStrategy,
                             Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0)
-                        : strategy.CaptureBackend !=
-                          DesktopCaptureBackend.WindowsGraphicsCapture)
+                        : !CanRefreshCaptureBackend(
+                            strategy.CaptureBackend))
                 {
                     return false;
                 }
@@ -790,7 +884,33 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     // release the one-shot latch, and throttle the next attempt so
                     // a transient AV/file-system error cannot disable recovery or
                     // create a half-second error/hash loop forever.
-                    DeferCaptureRecoveryRetry(process.Id);
+                    var recoveryRetryScheduled =
+                        DeferCaptureRecoveryRetry(
+                        process.Id,
+                        preserveCompletedSegments,
+                        replacementPerformanceProfile,
+                        verifiedReplacement,
+                        requireCompletedSegmentBoundary,
+                        expectedSessionIdentity,
+                        invalidateCapabilitySelectionBeforeRefresh,
+                        checked(recoveryRetryAttempt + 1),
+                        boundaryRetryAttempt);
+                    if (!recoveryRetryScheduled &&
+                        IsActiveCaptureGenerationExportBlocked())
+                    {
+                        await StopCoreAsync(
+                                deleteBuffer: true,
+                                publishStopped: false)
+                            .ConfigureAwait(false);
+                        Publish(new ReplayStateSnapshot(
+                            ReplayState.Faulted,
+                            TimeSpan.Zero,
+                            _retention,
+                            0,
+                            "ClipForge stopped Instant Replay because the verified capture engine remained unavailable during bounded recovery.",
+                            _lastSavedPath));
+                    }
+
                     throw;
                 }
 
@@ -821,6 +941,35 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     {
                         EnqueueDiagnostic(
                             "Deferred optional WGC promotion because the healthy GDI recorder did not reach a completed segment boundary.");
+                        RefreshBufferState();
+                        return false;
+                    }
+
+                    if (ShouldDeferNonDestructiveCaptureRefresh(
+                            requireCompletedSegmentBoundary,
+                            reachedSegmentBoundary))
+                    {
+                        // Ambiguous content cadence can justify promoting the
+                        // capture process, but it does not prove the existing
+                        // replay generation is damaged. Do not turn that
+                        // one-way tuning change into a destructive restart
+                        // when the current writer misses the short boundary
+                        // window. Keep recording and retry later.
+                        DeferCaptureRecoveryRetry(
+                            process.Id,
+                            preserveCompletedSegments,
+                            replacementPerformanceProfile,
+                            verifiedReplacement,
+                            requireCompletedSegmentBoundary,
+                            expectedSessionIdentity,
+                            invalidateCapabilitySelectionBeforeRefresh,
+                            recoveryRetryAttempt,
+                            checked(boundaryRetryAttempt + 1));
+                        EnqueueDiagnostic(
+                            "Deferred the non-destructive capture-profile promotion because no completed segment boundary was observed.");
+                        _captureStarvationWatchdog =
+                            new CaptureStarvationWatchdog(
+                                configuration.FramesPerSecond);
                         RefreshBufferState();
                         return false;
                     }
@@ -869,7 +1018,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     cancellationToken.ThrowIfCancellationRequested();
                     _sessionCancellation = new CancellationTokenSource();
                     _reportedDroppedAudioBlocks = 0;
-                    Volatile.Write(ref _latestCaptureProgress, null);
+                    ResetCaptureProgress();
                     _captureStarvationWatchdog = new CaptureStarvationWatchdog(
                         configuration.FramesPerSecond);
 
@@ -884,7 +1033,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         _audioPipes.Select(pipe => pipe.Specification).ToArray(),
                         replacementStrategy,
                         segmentDirectory,
-                        segmentStartNumber);
+                        segmentStartNumber,
+                        replacementPerformanceProfile);
                     var replacement = CreateProcess(
                         verifiedFfmpegPath,
                         arguments,
@@ -920,7 +1070,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             replacementStrategy,
                             CaptureGeometry.ResolveOutputSize(
                                 configuration.Display,
-                                configuration.Resolution).RequiresScaling))
+                                configuration.Resolution).RequiresScaling,
+                            replacementPerformanceProfile))
                     {
                         EnqueueDiagnostic(
                             "Windows did not allow ClipForge to reapply the capture process priority policy.");
@@ -928,7 +1079,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                     replacement.StandardInput.AutoFlush = true;
                     _diagnosticTask = PumpDiagnosticsAsync(replacement);
-                    _captureProgressTask = PumpCaptureProgressAsync(replacement);
+                    _captureProgressTask = PumpCaptureProgressAsync(
+                        replacement,
+                        configuration.Display);
                     if (_audioPipes.Count > 0)
                     {
                         var connectionTasks = _audioPipes
@@ -961,17 +1114,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             replacementStrategy,
                             CaptureGeometry.ResolveOutputSize(
                                 configuration.Display,
-                                configuration.Resolution).RequiresScaling))
+                                configuration.Resolution).RequiresScaling,
+                            replacementPerformanceProfile))
                     {
                         EnqueueDiagnostic(
                             "Windows did not allow ClipForge to finalize the renewed capture priority policy.");
                     }
 
-                    Volatile.Write(ref _recoveryRetryNotBefore, 0);
-                    _ = Interlocked.Increment(ref _recoveryRetryGeneration);
+                    InvalidateCaptureRecoveryRetry();
                     Volatile.Write(ref _isStopping, 0);
                     Volatile.Write(ref _isRunning, 1);
                     _activeCaptureStrategy = replacementStrategy;
+                    _activeCapturePerformanceProfile = replacementPerformanceProfile;
                     _activeEncoderDescription = replacementStrategy.Description;
                     Volatile.Write(
                         ref _lastCapturePlan,
@@ -980,6 +1134,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             configuration.Resolution,
                             replacementStrategy));
                     ResetDegradedCaptureReprobe();
+                    if (ShouldMaintainDegradedCaptureReprobe(
+                            replacementStrategy.CaptureBackend,
+                            Volatile.Read(
+                                ref _activeStrategyUsesCapabilityProbe) != 0))
+                    {
+                        // A health/profile refresh must not silently disable the
+                        // background opportunity to return from compatibility
+                        // GDI to WGC.
+                        ScheduleNextDegradedCaptureReprobe();
+                    }
+
                     _monitorTask = MonitorCaptureAsync(
                         replacement,
                         configuration,
@@ -994,13 +1159,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         replacementStrategy,
                         string.Create(
                             CultureInfo.InvariantCulture,
-                            $"BoundaryAligned={reachedSegmentBoundary}; boundaryWaitMs={boundaryWait.TotalMilliseconds:0}; replacementMs={Stopwatch.GetElapsedTime(replacementStarted).TotalMilliseconds:0}."));
+                            $"BoundaryAligned={reachedSegmentBoundary}; boundaryWaitMs={boundaryWait.TotalMilliseconds:0}; replacementMs={Stopwatch.GetElapsedTime(replacementStarted).TotalMilliseconds:0}; profile={replacementPerformanceProfile}."));
                     EnqueueDiagnostic(
                         string.Create(
                             CultureInfo.InvariantCulture,
                             $"{(promotesDegradedCapture
                                 ? "Promoted capture from GDI to verified WGC"
-                                : "Renewed the WGC capture process")} at segment {segmentStartNumber}; " +
+                                : $"Renewed the {replacementStrategy.CaptureBackend} capture process")} at segment {segmentStartNumber}; " +
                             $"{(retainedCompletedSegments
                                 ? "completed replay segments were retained. "
                                 : "the previous capture generation was invalidated and is rebuffering. ")}" +
@@ -1020,13 +1185,20 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
                 catch (Exception exception)
                 {
-                    if (promotesDegradedCapture &&
-                        replacementCaptureLaunchFailed)
+                    if (replacementCaptureLaunchFailed &&
+                        Volatile.Read(
+                            ref _activeStrategyUsesCapabilityProbe) != 0)
                     {
                         _capabilityProbe.Invalidate(
                             ffmpegPath,
                             configuration,
-                            replacementStrategy);
+                            strategy,
+                            _activeCapturePerformanceProfile);
+                        _capabilityProbe.Invalidate(
+                            ffmpegPath,
+                            configuration,
+                            replacementStrategy,
+                            replacementPerformanceProfile);
                     }
 
                     Volatile.Write(ref _isStopping, 1);
@@ -1039,6 +1211,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                                 configuration,
                                 strategy,
                                 segmentDirectory,
+                                replacementPerformanceProfile,
                                 cancellationToken,
                                 exception)
                             .ConfigureAwait(false))
@@ -1147,10 +1320,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Acknowledges that MainWindow deliberately rejected a bounded health
-    /// recovery for the current process. Further fault notifications remain
-    /// suppressed for this manual replay session, but routine WGC rotation must
-    /// stay eligible so an old frame pool cannot run indefinitely.
+    /// Acknowledges that MainWindow reached the bounded health-recovery limit.
+    /// The UI immediately follows this acknowledgement with an orderly stop so
+    /// a blocked generation can never remain presented as a usable replay.
     /// </summary>
     internal bool SuppressCaptureFaultRecovery(CaptureRecoveryRequestedEventArgs request)
     {
@@ -1168,7 +1340,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         EnqueueDiagnostic(
-            "Automatic fault recovery reached its per-session limit; fault notifications are suppressed while scheduled WGC renewal remains enabled.");
+            "Automatic fault recovery reached its per-session limit; the current request was suppressed pending an orderly replay stop.");
         return true;
     }
 
@@ -1189,10 +1361,138 @@ public sealed class ReplayBufferService : IAsyncDisposable
         return QueueScheduledCaptureRefresh(CaptureProcessId, diagnostic);
     }
 
-    internal Task WaitForScheduledCaptureRefreshIdleAsync() =>
-        Task.WhenAll(
-            _scheduledCaptureRefreshCoordinator.WaitForIdleAsync(),
-            _degradedCaptureReprobeCoordinator.WaitForIdleAsync());
+    internal bool RequestDiscontinuousCaptureRefresh(string diagnostic)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(diagnostic);
+        if (!TryInvalidateCaptureGenerationForDisplayTransition(
+                diagnostic,
+                out var processId,
+                out var sessionIdentity))
+        {
+            return false;
+        }
+
+        long requestedEpoch;
+        lock (_discontinuousRefreshGate)
+        {
+            requestedEpoch = ++_discontinuousRefreshRequestedEpoch;
+            _discontinuousRefreshSessionIdentity = sessionIdentity;
+            _discontinuousRefreshDiagnostic = diagnostic;
+        }
+
+        var queued = _discontinuousCaptureRefreshCoordinator.TrySchedule(
+            processId,
+            diagnostic);
+        if (ShouldScheduleDiscontinuousRefreshContinuation(queued))
+        {
+            SchedulePendingDiscontinuousRefresh();
+            return true;
+        }
+
+        if (queued)
+        {
+            EnqueueDiagnostic(
+                $"Queued a discontinuous capture renewal for process {processId}: {diagnostic}");
+            RecordCaptureRuntimeEvent(
+                "capture_display_transition_queued",
+                _captureProcess,
+                detail:
+                    $"epoch={requestedEpoch}; session={sessionIdentity}; {diagnostic}");
+        }
+
+        return queued;
+    }
+
+    /// <summary>
+    /// Immediately makes media from the pre-transition capture generation
+    /// unexportable. Windows display/resume notifications arrive before display
+    /// enumeration stabilizes, so this safety action must not wait for the UI's
+    /// debounce or for a save that already owns <see cref="_saveGate"/>.
+    /// </summary>
+    internal bool InvalidateCaptureGenerationForDisplayTransition(
+        string diagnostic)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(diagnostic);
+        return TryInvalidateCaptureGenerationForDisplayTransition(
+            diagnostic,
+            out _,
+            out _);
+    }
+
+    private bool TryInvalidateCaptureGenerationForDisplayTransition(
+        string diagnostic,
+        out int processId,
+        out int sessionIdentity)
+    {
+        processId = 0;
+        sessionIdentity = 0;
+        CancellationTokenSource? invalidatedSave = null;
+        var newlyBlocked = false;
+        var blockedGeneration = -1;
+
+        lock (_fileGate)
+        {
+            var currentProcessId = CaptureProcessId;
+            var captureBackend = _activeCaptureStrategy?.CaptureBackend;
+            if (currentProcessId is not { } currentPid ||
+                currentPid <= 0 ||
+                Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _isStopping) != 0 ||
+                !IsRunning ||
+                captureBackend is not { } backend ||
+                !CanRefreshCaptureBackend(backend))
+            {
+                return false;
+            }
+
+            processId = currentPid;
+            sessionIdentity =
+                Volatile.Read(ref _captureSessionIdentity);
+            blockedGeneration = _activeCaptureGeneration;
+            newlyBlocked =
+                _exportBlockedCaptureGeneration != blockedGeneration;
+            _exportBlockedCaptureGeneration = blockedGeneration;
+            if (_activeSaveCaptureGeneration == blockedGeneration)
+            {
+                invalidatedSave = _activeSaveInvalidation;
+            }
+        }
+
+        try
+        {
+            // A save can otherwise keep _saveGate through the display debounce
+            // and publish held-frame/audio media after the transition was known.
+            invalidatedSave?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Commit revalidates under _fileGate, so a save that completed
+            // between the snapshot and cancellation still cannot publish.
+        }
+
+        RefreshBufferState();
+        if (newlyBlocked)
+        {
+            EnqueueDiagnostic(
+                $"Blocked capture generation {blockedGeneration} immediately after a display/graphics transition: {diagnostic}");
+            RecordCaptureRuntimeEvent(
+                "capture_display_transition_invalidated",
+                _captureProcess,
+                detail:
+                    $"generation={blockedGeneration}; session={sessionIdentity}; {diagnostic}");
+        }
+
+        return true;
+    }
+
+    internal async Task WaitForScheduledCaptureRefreshIdleAsync()
+    {
+        await Task.WhenAll(
+                _scheduledCaptureRefreshCoordinator.WaitForIdleAsync(),
+                WaitForDiscontinuousCaptureRefreshIdleAsync(),
+                _degradedCaptureReprobeCoordinator.WaitForIdleAsync())
+            .ConfigureAwait(false);
+    }
 
     public async Task<string> SaveClipAsync(
         TimeSpan requestedDuration,
@@ -1218,6 +1518,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         IReadOnlyList<string> selectedSegments = [];
         string? manifestPath = null;
         string? partialPath = null;
+        var saveStartedAt = Stopwatch.GetTimestamp();
+        var saveJournalStarted = false;
+        var selectedFirstSegmentNumber = -1;
+        var selectedLastSegmentNumber = -1;
+        var selectedGeneration = -1;
+        CancellationTokenSource? saveCancellation = null;
 
         try
         {
@@ -1227,6 +1533,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
             await SwitchToThreadPool();
             await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             enteredSaveGate = true;
+            saveCancellation =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var saveToken = saveCancellation.Token;
             if (!IsRunning)
             {
                 throw new InvalidOperationException("Instant Replay is not running.");
@@ -1246,16 +1555,46 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 selectedSegments = completed;
+                var selectedSegmentSet = selectedSegments.ToHashSet(
+                    StringComparer.OrdinalIgnoreCase);
+                var selectedEntries = _segments
+                    .Where(segment => selectedSegmentSet.Contains(
+                        segment.Path))
+                    .ToArray();
+                if (selectedEntries.Length > 0)
+                {
+                    selectedFirstSegmentNumber =
+                        selectedEntries[0].SegmentNumber;
+                    selectedLastSegmentNumber =
+                        selectedEntries[^1].SegmentNumber;
+                    selectedGeneration =
+                        selectedEntries[^1].GenerationId;
+                }
+
                 foreach (var path in selectedSegments)
                 {
                     _protectedSegments.Add(path);
                 }
 
+                _activeSaveCaptureGeneration = selectedGeneration;
+                _activeSaveInvalidation = saveCancellation;
                 actualDuration = TimeSpan.FromSeconds(Math.Min(
                     requestedDuration.TotalSeconds,
                     selectedCount * FfmpegArgumentBuilder.SegmentSeconds));
             }
 
+            saveJournalStarted = true;
+            RecordCaptureRuntimeEvent(
+                "clip_save_started",
+                detail: string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"requestedSeconds={requestedDuration.TotalSeconds:0.###}; " +
+                    $"actualSeconds={actualDuration.TotalSeconds:0.###}; " +
+                    $"segments={selectedSegments.Count}; " +
+                    $"firstSegment={selectedFirstSegmentNumber}; " +
+                    $"lastSegment={selectedLastSegmentNumber}; " +
+                    $"generation={selectedGeneration}."),
+                includeResourceSnapshots: false);
             Volatile.Write(ref _isSaving, 1);
             Publish(_state with
             {
@@ -1281,7 +1620,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     manifestPath,
                     manifestLines,
                     new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-                    cancellationToken)
+                    saveToken)
                 .ConfigureAwait(false);
 
             var selectedDuration = TimeSpan.FromSeconds(
@@ -1292,7 +1631,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 partialPath,
                 trimFromStart,
                 actualDuration);
-            await RunExportProcessAsync(ffmpegPath, arguments, cancellationToken)
+            await RunExportProcessAsync(ffmpegPath, arguments, saveToken)
                 .ConfigureAwait(false);
 
             if (!File.Exists(partialPath) || new FileInfo(partialPath).Length == 0)
@@ -1314,19 +1653,78 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     actualDuration,
                     expectedFramesPerSecond,
                     expectedAudio,
-                    cancellationToken)
+                    saveToken)
                 .ConfigureAwait(false);
 
-            File.Move(partialPath, finalPath);
+            lock (_fileGate)
+            {
+                if (!IsCaptureGenerationExportable(
+                        selectedGeneration,
+                        _exportBlockedCaptureGeneration))
+                {
+                    throw new InvalidDataException(
+                        "ClipForge stopped this save because capture pacing became unstable. " +
+                        "Wait for the replay buffer to refill, then clip again.");
+                }
+
+                // Commit while holding the same gate used to invalidate a
+                // generation. A fault observed before this point therefore
+                // wins the race and can never publish a known-bad clip.
+                File.Move(partialPath, finalPath);
+            }
+
             partialPath = null;
             _lastSavedPath = finalPath;
+            RecordCaptureRuntimeEvent(
+                "clip_save_completed",
+                detail: string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"elapsedMs={Stopwatch.GetElapsedTime(saveStartedAt).TotalMilliseconds:0}; " +
+                    $"segments={selectedSegments.Count}; generation={selectedGeneration}."),
+                includeResourceSnapshots: false);
             return finalPath;
+        }
+        catch (Exception exception)
+        {
+            var reportedException =
+                exception is OperationCanceledException &&
+                !cancellationToken.IsCancellationRequested &&
+                IsExportGenerationBlocked(selectedGeneration)
+                    ? new InvalidDataException(
+                        "ClipForge stopped this save because capture pacing became unstable. " +
+                        "Wait for the replay buffer to refill, then clip again.",
+                        exception)
+                    : exception;
+            if (saveJournalStarted)
+            {
+                RecordCaptureRuntimeEvent(
+                    "clip_save_failed",
+                    detail: string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"elapsedMs={Stopwatch.GetElapsedTime(saveStartedAt).TotalMilliseconds:0}; " +
+                        $"segments={selectedSegments.Count}; generation={selectedGeneration}; " +
+                        $"error={reportedException.GetType().Name}."),
+                    includeResourceSnapshots: false);
+            }
+
+            if (!ReferenceEquals(reportedException, exception))
+            {
+                throw reportedException;
+            }
+
+            throw;
         }
         finally
         {
             Volatile.Write(ref _isSaving, 0);
             lock (_fileGate)
             {
+                if (ReferenceEquals(_activeSaveInvalidation, saveCancellation))
+                {
+                    _activeSaveInvalidation = null;
+                    _activeSaveCaptureGeneration = -1;
+                }
+
                 foreach (var path in selectedSegments)
                 {
                     _protectedSegments.Remove(path);
@@ -1335,6 +1733,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             TryDeleteFile(manifestPath);
             TryDeleteFile(partialPath);
+            saveCancellation?.Dispose();
             if (enteredSaveGate)
             {
                 _saveGate.Release();
@@ -1358,6 +1757,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // completion instead of racing semaphore disposal.
         Volatile.Write(ref _disposed, 1);
         _initialBufferMaintenanceCancellation.Cancel();
+        _captureRecoveryRetryCancellation.Cancel();
         try
         {
             // Stop accepting maintenance before waiting for the lifecycle gates.
@@ -1365,6 +1765,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             // an in-flight refresh perform its normal bounded capture cleanup.
             await Task.WhenAll(
                     _scheduledCaptureRefreshCoordinator.DisposeAsync().AsTask(),
+                    _discontinuousCaptureRefreshCoordinator.DisposeAsync().AsTask(),
                     _degradedCaptureReprobeCoordinator.DisposeAsync().AsTask())
                 .ConfigureAwait(false);
 
@@ -1386,6 +1787,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _saveGate.Release();
             }
 
+            while (true)
+            {
+                var recoveryRetry =
+                    Volatile.Read(ref _captureRecoveryRetryState);
+                await recoveryRetry.Task.ConfigureAwait(false);
+                if (ReferenceEquals(
+                        recoveryRetry,
+                        Volatile.Read(ref _captureRecoveryRetryState)))
+                {
+                    break;
+                }
+            }
+
             _lifecycleGate.Dispose();
             _saveGate.Dispose();
             await _runtimeJournal.DisposeAsync().ConfigureAwait(false);
@@ -1398,6 +1812,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
         finally
         {
+            _captureRecoveryRetryCancellation.Dispose();
             DisposeInitialBufferMaintenanceCancellationWhenSafe();
         }
     }
@@ -1614,7 +2029,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _monitorTask = null;
         _diagnosticTask = null;
         _captureProgressTask = null;
-        Volatile.Write(ref _latestCaptureProgress, null);
+        ResetCaptureProgress();
         _captureStarvationWatchdog = null;
         return true;
     }
@@ -1624,6 +2039,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         CaptureConfiguration configuration,
         VideoEncodingStrategy degradedStrategy,
         string segmentDirectory,
+        CapturePerformanceProfile performanceProfile,
         CancellationToken cancellationToken,
         Exception promotionFailure)
     {
@@ -1672,7 +2088,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
             _sessionCancellation = new CancellationTokenSource();
             _reportedDroppedAudioBlocks = 0;
-            Volatile.Write(ref _latestCaptureProgress, null);
+            ResetCaptureProgress();
             _captureStarvationWatchdog = new CaptureStarvationWatchdog(
                 configuration.FramesPerSecond);
             lock (_diagnosticGate)
@@ -1686,7 +2102,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _audioPipes.Select(pipe => pipe.Specification).ToArray(),
                 degradedStrategy,
                 segmentDirectory,
-                segmentStartNumber);
+                segmentStartNumber,
+                performanceProfile);
             restoredProcess = CreateProcess(
                 ffmpegPath,
                 arguments,
@@ -1705,10 +2122,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 degradedStrategy,
                 CaptureGeometry.ResolveOutputSize(
                     configuration.Display,
-                    configuration.Resolution).RequiresScaling);
+                    configuration.Resolution).RequiresScaling,
+                performanceProfile);
             restoredProcess.StandardInput.AutoFlush = true;
             _diagnosticTask = PumpDiagnosticsAsync(restoredProcess);
-            _captureProgressTask = PumpCaptureProgressAsync(restoredProcess);
+            _captureProgressTask = PumpCaptureProgressAsync(
+                restoredProcess,
+                configuration.Display);
             if (_audioPipes.Count > 0)
             {
                 var connectionTasks = _audioPipes
@@ -1730,8 +2150,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 degradedStrategy,
                 CaptureGeometry.ResolveOutputSize(
                     configuration.Display,
-                    configuration.Resolution).RequiresScaling);
+                    configuration.Resolution).RequiresScaling,
+                performanceProfile);
             _activeCaptureStrategy = degradedStrategy;
+            _activeCapturePerformanceProfile = performanceProfile;
             _activeEncoderDescription = degradedStrategy.Description;
             Volatile.Write(ref _isStopping, 0);
             Volatile.Write(ref _isRunning, 1);
@@ -1902,6 +2324,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private async Task StopCoreAsync(bool deleteBuffer, bool publishStopped)
     {
         Volatile.Write(ref _isStopping, 1);
+        InvalidateCaptureRecoveryRetry();
+        if (_degradedCaptureReprobeCoordinator.IsActive &&
+            _activeConfiguration is { } reprobeConfiguration &&
+            _activeFfmpegPath is { Length: > 0 } reprobeFfmpegPath)
+        {
+            // A session stop can race a long real GDI-to-WGC probe. Remove any
+            // result already committed for that exact graph and advance its
+            // cache revision so a cancellation-ignoring stale flight cannot
+            // repopulate it after the next session begins.
+            _capabilityProbe.InvalidateConfiguration(
+                reprobeFfmpegPath,
+                reprobeConfiguration,
+                _activeCapturePerformanceProfile);
+        }
+
         var hadSession = _captureProcess is not null ||
                          _segmentDirectory is not null ||
                          _audioPipes.Count > 0;
@@ -1941,6 +2378,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         _activeConfiguration = null;
         _activeCaptureStrategy = null;
+        _activeCapturePerformanceProfile = CapturePerformanceProfile.LowImpact;
         _activeFfmpegPath = null;
         Volatile.Write(ref _activeStrategyUsesCapabilityProbe, 0);
         ResetDegradedCaptureReprobe();
@@ -1986,13 +2424,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var captureStarted = Stopwatch.GetTimestamp();
         var lastBufferRefresh = Stopwatch.GetTimestamp();
         var lastRuntimeSample = captureStarted;
+        var lastCadenceJournalSample = captureStarted;
         var lastPriorityRefresh = captureStarted;
         var lastCaptureActivity = captureStarted;
         long lastProgressFrame = -1;
         long lastProgressOutputTime = -1;
         long lastEvaluatedProgressTimestamp = -1;
+        CaptureProgressSample? previousCadenceIntervalProgress = null;
+        CaptureProgressSample? previousCadenceJournalProgress = null;
+        var worstCadenceIntervalDuplicateRatio = 0d;
+        var slowestCadenceIntervalOutputSpeed = double.PositiveInfinity;
+        var latestForegroundContext =
+            new CaptureForegroundContext(false, false);
         var lastSegmentNumber = -1;
         long lastBufferBytes = -1;
+        var outputRequiresScaling = CaptureGeometry.ResolveOutputSize(
+            configuration.Display,
+            configuration.Resolution).RequiresScaling;
 
         try
         {
@@ -2103,11 +2551,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 RefreshBufferState();
                 var degradedReprobeDeadline = Volatile.Read(
                     ref _degradedCaptureReprobeNotBeforeUtcTicks);
-                if (ShouldScheduleDegradedCaptureReprobe(
+                if (ShouldRunDegradedCaptureReprobe(
                         strategy.CaptureBackend,
                         Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
                         degradedReprobeDeadline,
-                        DateTimeOffset.UtcNow.UtcDateTime.Ticks))
+                        DateTimeOffset.UtcNow.UtcDateTime.Ticks,
+                        latestForegroundContext))
                 {
                     _ = QueueDegradedCaptureReprobe(
                         process.Id,
@@ -2123,7 +2572,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             strategy,
                             CaptureGeometry.ResolveOutputSize(
                                 configuration.Display,
-                                configuration.Resolution).RequiresScaling))
+                                configuration.Resolution).RequiresScaling,
+                            _activeCapturePerformanceProfile))
                     {
                         if (Interlocked.Exchange(
                                 ref _capturePriorityRefreshWarningReported,
@@ -2192,26 +2642,208 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             $"The WGC capture process reached its bounded {CaptureProcessMaximumAge.TotalMinutes:0}-minute lifetime; renewing it prevents long-session frame-pool degradation."));
                 }
 
-                if (strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
-                    progress is not null &&
-                    progress.Timestamp != lastEvaluatedProgressTimestamp)
+                if (strategy.CaptureBackend is
+                        DesktopCaptureBackend.WindowsGraphicsCapture or
+                        DesktopCaptureBackend.Gdi &&
+                    progress is not null)
                 {
-                    lastEvaluatedProgressTimestamp = progress.Timestamp;
-                    var context = CaptureForegroundContextProbe.Read(configuration.Display);
-                    var assessment = _captureStarvationWatchdog?.Observe(
-                        progress,
-                        context,
-                        captureProcessUptime);
+                    CaptureStarvationAssessment? assessment = null;
+                    CaptureForegroundContext? assessmentForegroundContext = null;
+                    while (_captureProgressSamples.TryDequeue(out var envelope))
+                    {
+                        if (envelope.ProcessId != process.Id ||
+                            envelope.Sample.Timestamp <= lastEvaluatedProgressTimestamp)
+                        {
+                            continue;
+                        }
+
+                        lastEvaluatedProgressTimestamp = envelope.Sample.Timestamp;
+                        latestForegroundContext = envelope.ForegroundContext;
+                        if (previousCadenceIntervalProgress is { } intervalPrevious)
+                        {
+                            var interval = Stopwatch.GetElapsedTime(
+                                intervalPrevious.Timestamp,
+                                envelope.Sample.Timestamp);
+                            var intervalFrames =
+                                envelope.Sample.Frame - intervalPrevious.Frame;
+                            var intervalDuplicates =
+                                envelope.Sample.DuplicatedFrames -
+                                intervalPrevious.DuplicatedFrames;
+                            var intervalOutputTime =
+                                envelope.Sample.OutputTimeMicroseconds -
+                                intervalPrevious.OutputTimeMicroseconds;
+                            if (interval > TimeSpan.Zero &&
+                                intervalFrames > 0 &&
+                                intervalDuplicates >= 0 &&
+                                intervalOutputTime >= 0)
+                            {
+                                worstCadenceIntervalDuplicateRatio = Math.Max(
+                                    worstCadenceIntervalDuplicateRatio,
+                                    intervalDuplicates /
+                                    (double)intervalFrames);
+                                slowestCadenceIntervalOutputSpeed = Math.Min(
+                                    slowestCadenceIntervalOutputSpeed,
+                                    intervalOutputTime /
+                                    1_000_000d /
+                                    interval.TotalSeconds);
+                            }
+                        }
+
+                        previousCadenceIntervalProgress = envelope.Sample;
+                        var isWindowsGraphicsCapture =
+                            strategy.CaptureBackend ==
+                            DesktopCaptureBackend.WindowsGraphicsCapture;
+                        var isInitialNativeLowImpactProfile =
+                            isWindowsGraphicsCapture &&
+                            !outputRequiresScaling &&
+                            _activeCapturePerformanceProfile ==
+                                CapturePerformanceProfile.LowImpact;
+                        var deferredRecoveryIsPending =
+                            ReadCurrentCaptureRecoveryRetryNotBefore() >
+                            Stopwatch.GetTimestamp();
+                        var suppressNonObjectiveSourceCadence =
+                            ShouldSuppressNonObjectiveCaptureCadence(
+                                envelope.ForegroundContext
+                                    .UsedCustomFullscreenFallback,
+                                outputRequiresScaling,
+                                _activeCapturePerformanceProfile,
+                                deferredRecoveryIsPending);
+                        var allowInitialProfileCadence =
+                            isInitialNativeLowImpactProfile &&
+                            !suppressNonObjectiveSourceCadence;
+                        var observedAssessment =
+                            _captureStarvationWatchdog?.Observe(
+                                envelope.Sample,
+                                envelope.ForegroundContext,
+                                captureProcessUptime,
+                                allowSchedulingPressure:
+                                    allowInitialProfileCadence,
+                                allowOutputThroughput: true,
+                                allowChronicLowCadence:
+                                    allowInitialProfileCadence,
+                                allowSourceCadence:
+                                    isWindowsGraphicsCapture &&
+                                    !suppressNonObjectiveSourceCadence);
+                        if (assessment is null &&
+                            observedAssessment is not null)
+                        {
+                            assessmentForegroundContext =
+                                envelope.ForegroundContext;
+                        }
+
+                        assessment = RetainFirstCaptureAssessment(
+                            assessment,
+                            observedAssessment);
+                    }
+
+                    previousCadenceJournalProgress ??= progress;
+                    if (Stopwatch.GetElapsedTime(lastCadenceJournalSample) >=
+                        TimeSpan.FromMinutes(1))
+                    {
+                        lastCadenceJournalSample = Stopwatch.GetTimestamp();
+                        var previous = previousCadenceJournalProgress;
+                        previousCadenceJournalProgress = progress;
+                        if (previous is not null &&
+                            progress.Frame >= previous.Frame &&
+                            progress.DuplicatedFrames >= previous.DuplicatedFrames &&
+                            progress.OutputTimeMicroseconds >=
+                                previous.OutputTimeMicroseconds)
+                        {
+                            var sampleWindow = Stopwatch.GetElapsedTime(
+                                previous.Timestamp,
+                                progress.Timestamp);
+                            var frameDelta = progress.Frame - previous.Frame;
+                            var duplicateDelta =
+                                progress.DuplicatedFrames - previous.DuplicatedFrames;
+                            var uniqueFps = sampleWindow > TimeSpan.Zero
+                                ? Math.Max(0, frameDelta - duplicateDelta) /
+                                  sampleWindow.TotalSeconds
+                                : 0;
+                            var duplicateRatio = frameDelta > 0
+                                ? duplicateDelta / (double)frameDelta
+                                : 0;
+                            var outputSpeed = sampleWindow > TimeSpan.Zero
+                                ? (progress.OutputTimeMicroseconds -
+                                   previous.OutputTimeMicroseconds) /
+                                  1_000_000d / sampleWindow.TotalSeconds
+                                : 0;
+                            RecordCaptureRuntimeEvent(
+                                "capture_cadence_sample",
+                                process,
+                                configuration,
+                                strategy,
+                                string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"windowSeconds={sampleWindow.TotalSeconds:0.0}; " +
+                                    $"uniqueFps={uniqueFps:0.0}; duplicateRatio={duplicateRatio:0.000}; " +
+                                    $"outputSpeed={outputSpeed:0.000}; dropped={progress.DroppedFrames - previous.DroppedFrames}; " +
+                                    $"worstIntervalDuplicateRatio={worstCadenceIntervalDuplicateRatio:0.000}; " +
+                                    $"slowestIntervalOutputSpeed={(double.IsPositiveInfinity(slowestCadenceIntervalOutputSpeed) ? 0 : slowestCadenceIntervalOutputSpeed):0.000}; " +
+                                    $"fullscreen={latestForegroundContext.IsFullscreenOnCapturedDisplay}; " +
+                                    $"coverage={latestForegroundContext.CapturedDisplayCoverage:0.000}; " +
+                                    $"customFullscreen={latestForegroundContext.UsedCustomFullscreenFallback}; " +
+                                    $"profile={_activeCapturePerformanceProfile}."));
+                            worstCadenceIntervalDuplicateRatio = 0;
+                            slowestCadenceIntervalOutputSpeed =
+                                double.PositiveInfinity;
+                        }
+                    }
+
                     if (assessment is not null &&
                         Stopwatch.GetElapsedTime(captureStarted) >= TimeSpan.FromSeconds(8))
                     {
+                        var faultContext =
+                            assessmentForegroundContext ??
+                            latestForegroundContext;
+                        var usedCustomFullscreenFallback =
+                            assessment.UsedCustomFullscreenFallback ||
+                            faultContext.UsedCustomFullscreenFallback;
+                        var recoveryReason = SelectSafeCadenceRecoveryReason(
+                            outputRequiresScaling,
+                            _activeCapturePerformanceProfile,
+                            assessment.Kind,
+                            usedCustomFullscreenFallback);
+                        var diagnostic = string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Desktop capture cadence fault backend={strategy.CaptureBackend}; kind={assessment.Kind}; " +
+                            $"uniqueFps={assessment.UniqueFramesPerSecond:0.0}; " +
+                            $"windowSeconds={assessment.Window.TotalSeconds:0.0}; " +
+                            $"duplicateRatio={assessment.DuplicateRatio:0.000}; " +
+                            $"outputSpeed={assessment.OutputSpeedRatio:0.000}; " +
+                            $"coverage={faultContext.CapturedDisplayCoverage:0.000}; " +
+                            $"customFullscreen={usedCustomFullscreenFallback}; " +
+                            $"profile={_activeCapturePerformanceProfile}.");
+                        if (recoveryReason is null)
+                        {
+                            // Win32 cannot reliably distinguish a stretched
+                            // exclusive game from every borderless top-left
+                            // custom-sized application. Once the safe profile
+                            // is already active, content-duplicate evidence
+                            // alone must not destroy the replay generation.
+                            // Continue watching objective output/gap counters.
+                            _captureStarvationWatchdog =
+                                new CaptureStarvationWatchdog(
+                                    configuration.FramesPerSecond);
+                            RecordCaptureRuntimeEvent(
+                                "capture_cadence_fault_suppressed",
+                                process,
+                                configuration,
+                                strategy,
+                                diagnostic);
+                            EnqueueDiagnostic(
+                                $"Suppressed ambiguous custom-fullscreen source cadence; objective capture throughput monitoring remains active. {diagnostic}");
+                            continue;
+                        }
+
+                        RecordCaptureRuntimeEvent(
+                            "capture_cadence_fault",
+                            process,
+                            configuration,
+                            strategy,
+                            diagnostic);
                         RequestCaptureRecovery(
-                            CaptureRecoveryReason.SourceStarvation,
-                            string.Create(
-                                CultureInfo.InvariantCulture,
-                                $"WGC supplied only {assessment.UniqueFramesPerSecond:0.0} unique FPS " +
-                                $"over {assessment.Window.TotalSeconds:0.0}s " +
-                                $"({assessment.DuplicateRatio:P0} CFR duplicates)."));
+                            recoveryReason.Value,
+                            diagnostic);
                     }
                 }
 
@@ -2424,9 +3056,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 trustedCompletedCount--;
             }
 
-            var completedCount = _segments
-                .Take(Math.Max(0, _segments.Count - 1))
-                .Count(segment => segment.Length > 0 && segment.IsTrusted);
+            var completedRangeCount = Math.Max(0, _segments.Count - 1);
+            var completedCount = SelectNewestContiguousTrustedSuffix(
+                    _segments,
+                    completedRangeCount,
+                    maximumCompletedSegments,
+                    static segment => segment.SegmentNumber,
+                    segment =>
+                        segment.Length > 0 &&
+                        segment.IsTrusted &&
+                        segment.GenerationId != _exportBlockedCaptureGeneration)
+                .Count;
             available = TimeSpan.FromSeconds(Math.Min(
                 retention.TotalSeconds,
                 completedCount * FfmpegArgumentBuilder.SegmentSeconds));
@@ -2630,6 +3270,159 @@ public sealed class ReplayBufferService : IAsyncDisposable
             .ToArray();
     }
 
+    internal static IReadOnlyList<T> SelectNewestContiguousTrustedSuffix<T>(
+        IReadOnlyList<T> orderedSegments,
+        int completedCount,
+        int maximumCount,
+        Func<T, int> getSegmentNumber,
+        Func<T, bool> isTrusted)
+    {
+        ArgumentNullException.ThrowIfNull(orderedSegments);
+        ArgumentNullException.ThrowIfNull(getSegmentNumber);
+        ArgumentNullException.ThrowIfNull(isTrusted);
+        if (completedCount < 0 || completedCount > orderedSegments.Count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(completedCount));
+        }
+
+        if (maximumCount <= 0)
+        {
+            return [];
+        }
+
+        var result = new List<T>(Math.Min(maximumCount, completedCount));
+        int? expectedSegmentNumber = null;
+        for (var index = completedCount - 1;
+             index >= 0 && result.Count < maximumCount;
+             index--)
+        {
+            var segment = orderedSegments[index];
+            var segmentNumber = getSegmentNumber(segment);
+            if (!isTrusted(segment) ||
+                expectedSegmentNumber is { } expected &&
+                segmentNumber != expected)
+            {
+                break;
+            }
+
+            result.Add(segment);
+            expectedSegmentNumber = segmentNumber - 1;
+        }
+
+        result.Reverse();
+        return result;
+    }
+
+    private bool IsExportGenerationBlocked(int generation)
+    {
+        lock (_fileGate)
+        {
+            return generation >= 0 &&
+                   generation == _exportBlockedCaptureGeneration;
+        }
+    }
+
+    private bool IsActiveCaptureGenerationExportBlocked()
+    {
+        lock (_fileGate)
+        {
+            return _activeCaptureGeneration >= 0 &&
+                   _activeCaptureGeneration ==
+                       _exportBlockedCaptureGeneration;
+        }
+    }
+
+    internal static bool IsCaptureGenerationExportable(
+        int selectedGeneration,
+        int blockedGeneration) =>
+        selectedGeneration >= 0 &&
+        selectedGeneration != blockedGeneration;
+
+    internal static CaptureRecoveryReason SelectCadenceRecoveryReason(
+        bool outputRequiresScaling,
+        CapturePerformanceProfile performanceProfile,
+        CaptureStarvationKind starvationKind =
+            CaptureStarvationKind.Severe) =>
+        !outputRequiresScaling &&
+        performanceProfile == CapturePerformanceProfile.LowImpact
+            ? starvationKind == CaptureStarvationKind.ChronicLowCadence
+                ? CaptureRecoveryReason.SourceProfilePromotion
+                : CaptureRecoveryReason.SourcePressure
+            : CaptureRecoveryReason.SourceStarvation;
+
+    internal static CaptureRecoveryReason? SelectSafeCadenceRecoveryReason(
+        bool outputRequiresScaling,
+        CapturePerformanceProfile performanceProfile,
+        CaptureStarvationKind starvationKind,
+        bool usedCustomFullscreenFallback)
+    {
+        if (!usedCustomFullscreenFallback ||
+            !IsContentCadenceAssessment(starvationKind))
+        {
+            return SelectCadenceRecoveryReason(
+                outputRequiresScaling,
+                performanceProfile,
+                starvationKind);
+        }
+
+        // A custom/stretched fullscreen candidate is necessarily heuristic:
+        // Win32 can expose the game's pre-stretch client rectangle. In the
+        // initial native low-impact profile, content cadence may safely request
+        // one boundary-aligned priority/queue promotion. Once scaling or the
+        // resilient profile is active, only objective graph throughput/gap
+        // evidence may invalidate and restart capture.
+        return !outputRequiresScaling &&
+               performanceProfile == CapturePerformanceProfile.LowImpact
+            ? CaptureRecoveryReason.SourceProfilePromotion
+            : null;
+    }
+
+    internal static bool IsContentCadenceAssessment(
+        CaptureStarvationKind starvationKind) =>
+        starvationKind is
+            CaptureStarvationKind.Severe or
+            CaptureStarvationKind.ModerateDegradation or
+            CaptureStarvationKind.SchedulingPressure or
+            CaptureStarvationKind.ChronicLowCadence;
+
+    internal static bool ShouldSuppressNonObjectiveCaptureCadence(
+        bool usedCustomFullscreenFallback,
+        bool outputRequiresScaling,
+        CapturePerformanceProfile performanceProfile,
+        bool deferredRecoveryIsPending) =>
+        deferredRecoveryIsPending ||
+        usedCustomFullscreenFallback &&
+        (outputRequiresScaling ||
+         performanceProfile == CapturePerformanceProfile.Resilient);
+
+    internal static bool CanRefreshCaptureBackend(
+        DesktopCaptureBackend captureBackend) =>
+        captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.Gdi;
+
+    internal static bool ShouldInvalidateCaptureGeneration(
+        CaptureRecoveryReason reason) =>
+        reason is not (
+            CaptureRecoveryReason.ScheduledRefresh or
+            CaptureRecoveryReason.SourceProfilePromotion);
+
+    internal static CaptureStarvationAssessment? RetainFirstCaptureAssessment(
+        CaptureStarvationAssessment? retained,
+        CaptureStarvationAssessment? observed) =>
+        retained ?? observed;
+
+    internal static bool ShouldScheduleDiscontinuousRefreshContinuation(
+        bool refreshWasQueued) =>
+        !refreshWasQueued;
+
+    internal static bool IsDiscontinuousRefreshQuiescent(
+        bool hasActionablePendingRequest,
+        bool coordinatorIsActive,
+        bool continuationIsScheduled) =>
+        !hasActionablePendingRequest &&
+        !coordinatorIsActive &&
+        !continuationIsScheduled;
+
     private List<string> GetCompletedSegmentsLocked(int maximumCount)
     {
         if (maximumCount <= 0)
@@ -2644,23 +3437,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
             completedCount--;
         }
 
-        // Revalidate only the tail needed by this export. A 30-second hotkey
-        // save therefore checks about 15 files, not all ~1,800 entries in a
-        // one-hour ring. Walk farther back only when a file disappeared.
-        var result = new List<string>(Math.Min(maximumCount, completedCount));
-        for (var index = completedCount - 1;
-             index >= 0 && result.Count < maximumCount;
-             index--)
-        {
-            var segment = _segments[index];
-            if (segment.IsTrusted && GetFileLengthSafely(segment.Path) > 0)
-            {
-                result.Add(segment.Path);
-            }
-        }
-
-        result.Reverse();
-        return result;
+        // Export only the newest contiguous trusted suffix. Crossing an
+        // untrusted generation head, a deleted file, or a numbering gap could
+        // otherwise splice pre-recovery audio/video onto a healthy new
+        // generation and make the final MP4 appear to freeze at the join.
+        return SelectNewestContiguousTrustedSuffix(
+                _segments,
+                completedCount,
+                maximumCount,
+                static segment => segment.SegmentNumber,
+                segment =>
+                    segment.IsTrusted &&
+                    segment.GenerationId != _exportBlockedCaptureGeneration &&
+                    GetFileLengthSafely(segment.Path) > 0)
+            .Select(segment => segment.Path)
+            .ToList();
     }
 
     private void RefreshSegmentIndexLocked()
@@ -2723,6 +3514,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _nextSegmentNumber = 0;
         _activeCaptureGeneration = 0;
         _quarantinedGenerationHeadSegmentNumber = -1;
+        _exportBlockedCaptureGeneration = -1;
         _untrustedDeleteCursorSegmentNumber = -1;
         _trustedDeleteCursorSegmentNumber = -1;
     }
@@ -2746,6 +3538,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
         bool preserveCompletedSegments,
         bool reachedSegmentBoundary) =>
         preserveCompletedSegments && reachedSegmentBoundary;
+
+    internal static bool ShouldDeferNonDestructiveCaptureRefresh(
+        bool requireCompletedSegmentBoundary,
+        bool reachedSegmentBoundary) =>
+        requireCompletedSegmentBoundary && !reachedSegmentBoundary;
 
     internal static bool IsCaptureSegmentTrusted(
         int segmentNumber,
@@ -2822,9 +3619,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
-    private async Task PumpCaptureProgressAsync(Process process)
+    private async Task PumpCaptureProgressAsync(
+        Process process,
+        DisplayOption? capturedDisplay)
     {
         var parser = new CaptureProgressParser();
+        var processId = process.Id;
         while (await process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
         {
             if (parser.TryParse(
@@ -2834,7 +3634,31 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 sample is not null)
             {
                 Volatile.Write(ref _latestCaptureProgress, sample);
+                if (ReferenceEquals(_captureProcess, process))
+                {
+                    while (_captureProgressSamples.Count >= 256 &&
+                           _captureProgressSamples.TryDequeue(out _))
+                    {
+                    }
+
+                    var foregroundContext = capturedDisplay is null
+                        ? new CaptureForegroundContext(false, false)
+                        : CaptureForegroundContextProbe.Read(capturedDisplay);
+                    _captureProgressSamples.Enqueue(
+                        new CaptureProgressEnvelope(
+                            processId,
+                            sample,
+                            foregroundContext));
+                }
             }
+        }
+    }
+
+    private void ResetCaptureProgress()
+    {
+        Volatile.Write(ref _latestCaptureProgress, null);
+        while (_captureProgressSamples.TryDequeue(out _))
+        {
         }
     }
 
@@ -2850,9 +3674,43 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return;
         }
 
-        var retryNotBefore = Volatile.Read(ref _recoveryRetryNotBefore);
+        CancellationTokenSource? invalidatedSave = null;
+        if (ShouldInvalidateCaptureGeneration(reason))
+        {
+            lock (_fileGate)
+            {
+                // Safety is independent from the bounded notification/restart
+                // budget. If later recovery requests are suppressed, a newly
+                // degraded generation must still become immediately unexportable.
+                _exportBlockedCaptureGeneration = _activeCaptureGeneration;
+                if (_activeSaveCaptureGeneration == _activeCaptureGeneration)
+                {
+                    invalidatedSave = _activeSaveInvalidation;
+                }
+            }
+        }
+
+        try
+        {
+            // Release _saveGate promptly so recovery is not held behind a long
+            // export/validation operation from the now-untrusted generation.
+            invalidatedSave?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The save completed its bounded cleanup between the snapshot and
+            // cancellation. The generation check at commit remains authoritative.
+        }
+
+        RefreshBufferState();
+        var retryNotBefore =
+            ReadCurrentCaptureRecoveryRetryNotBefore();
+        var objectiveFaultMaySupersedeDeferredMaintenance =
+            CanRecoverySupersedeDeferredMaintenance(reason);
         if (Volatile.Read(ref _isStopping) != 0 ||
-            retryNotBefore > 0 && Stopwatch.GetTimestamp() < retryNotBefore)
+            !objectiveFaultMaySupersedeDeferredMaintenance &&
+            retryNotBefore > 0 &&
+            Stopwatch.GetTimestamp() < retryNotBefore)
         {
             return;
         }
@@ -2926,6 +3784,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             Volatile.Read(ref _disposed) != 0 ||
             Volatile.Read(ref _isStopping) != 0 ||
             !IsRunning ||
+            IsActiveCaptureGenerationExportBlocked() ||
             !ShouldScheduleDegradedCaptureReprobe(
                 _activeCaptureStrategy?.CaptureBackend,
                 Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
@@ -2960,12 +3819,35 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var configuration = _activeConfiguration;
         var ffmpegPath = _activeFfmpegPath;
         var currentStrategy = _activeCaptureStrategy;
+        var performanceProfile = _activeCapturePerformanceProfile;
+        var sessionIdentity =
+            Volatile.Read(ref _captureSessionIdentity);
+        if (!TryReadCancellationToken(
+                _sessionCancellation,
+                out var sessionCancellation))
+        {
+            return;
+        }
+
         if (!IsCurrentDegradedCapture(
                 expectedProcessId,
+                sessionIdentity,
                 configuration,
                 ffmpegPath,
                 currentStrategy))
         {
+            return;
+        }
+
+        var foregroundContext =
+            CaptureForegroundContextProbe.Read(configuration!.Display);
+        if (ShouldDeferDegradedCaptureReprobeForGameplay(
+                foregroundContext))
+        {
+            // The capability probe is a real three-second capture/encode graph.
+            // Never launch that competing workload while the user is actively
+            // playing; the monitor will retry the already-due check after an
+            // alt-tab or idle period.
             return;
         }
 
@@ -2990,15 +3872,66 @@ public sealed class ReplayBufferService : IAsyncDisposable
             _ffmpegSetupService.OpenVerifiedExecutableLease(verifiedFfmpegPath)
             ?? throw new SecurityException(
                 "The capture engine failed its final pinned-file verification before the background WGC recheck.");
-        var selection = await _capabilityProbe.SelectAsync(
-                verifiedFfmpegPath,
-                configuration!,
-                cancellationToken)
-            .ConfigureAwait(false);
+        using var probeCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                sessionCancellation);
+        using var inputMonitorCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                sessionCancellation);
+        var inputMonitorTask = CancelDegradedCaptureReprobeOnInputAsync(
+            configuration.Display,
+            probeCancellation,
+            inputMonitorCancellation.Token);
+        FfmpegCapabilitySelection selection;
+        try
+        {
+            selection = await _capabilityProbe.SelectAsync(
+                    verifiedFfmpegPath,
+                    configuration,
+                    probeCancellation.Token,
+                    performanceProfile)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            sessionCancellation.IsCancellationRequested)
+        {
+            // A manual stop, display restart, or another capture replacement
+            // superseded this old session's capability flight.
+            return;
+        }
+        catch (OperationCanceledException) when (
+            !cancellationToken.IsCancellationRequested &&
+            probeCancellation.IsCancellationRequested)
+        {
+            RecordCaptureRuntimeEvent(
+                "capture_degraded_reprobe_deferred",
+                _captureProcess,
+                configuration,
+                currentStrategy,
+                "Foreground input resumed while the compatibility re-probe was running; the competing probe was stopped.");
+            return;
+        }
+        finally
+        {
+            inputMonitorCancellation.Cancel();
+            try
+            {
+                await inputMonitorTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (
+                inputMonitorCancellation.IsCancellationRequested)
+            {
+                // Probe completion or replay shutdown stops the input watcher.
+            }
+        }
+
         EnqueueDiagnostic(selection.Diagnostics);
 
         if (!IsCurrentDegradedCapture(
                 expectedProcessId,
+                sessionIdentity,
                 configuration,
                 ffmpegPath,
                 currentStrategy))
@@ -3023,12 +3956,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 expectedProcessId,
                 cancellationToken,
                 preserveCompletedSegments: true,
-                verifiedReplacement: selection)
+                verifiedReplacement: selection,
+                performanceProfileOverride: performanceProfile)
             .ConfigureAwait(false);
         if (!refreshed)
         {
             if (IsCurrentDegradedCapture(
                     expectedProcessId,
+                    sessionIdentity,
                     configuration,
                     ffmpegPath,
                     currentStrategy))
@@ -3041,8 +3976,38 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
+    private static async Task CancelDegradedCaptureReprobeOnInputAsync(
+        DisplayOption display,
+        CancellationTokenSource probeCancellation,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await Task.Delay(
+                    TimeSpan.FromMilliseconds(250),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!CaptureForegroundContextProbe.Read(display).HasRecentInput)
+            {
+                continue;
+            }
+
+            try
+            {
+                probeCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The probe completed between the observation and cancellation.
+            }
+
+            return;
+        }
+    }
+
     private bool IsCurrentDegradedCapture(
         int expectedProcessId,
+        int expectedSessionIdentity,
         CaptureConfiguration? expectedConfiguration,
         string? expectedFfmpegPath,
         VideoEncodingStrategy? expectedStrategy) =>
@@ -3050,6 +4015,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         Volatile.Read(ref _disposed) == 0 &&
         Volatile.Read(ref _isStopping) == 0 &&
         Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0 &&
+        Volatile.Read(ref _captureSessionIdentity) ==
+            expectedSessionIdentity &&
         CaptureProcessId == expectedProcessId &&
         ReferenceEquals(_activeConfiguration, expectedConfiguration) &&
         string.Equals(
@@ -3111,6 +4078,47 @@ public sealed class ReplayBufferService : IAsyncDisposable
         deadlineUtcTicks > 0 &&
         nowUtcTicks >= deadlineUtcTicks;
 
+    internal static bool ShouldRunDegradedCaptureReprobe(
+        DesktopCaptureBackend? captureBackend,
+        bool strategyUsesCapabilityProbe,
+        long deadlineUtcTicks,
+        long nowUtcTicks,
+        CaptureForegroundContext foregroundContext) =>
+        ShouldScheduleDegradedCaptureReprobe(
+            captureBackend,
+            strategyUsesCapabilityProbe,
+            deadlineUtcTicks,
+            nowUtcTicks) &&
+        !ShouldDeferDegradedCaptureReprobeForGameplay(
+            foregroundContext);
+
+    internal static bool ShouldDeferDegradedCaptureReprobeForGameplay(
+        CaptureForegroundContext foregroundContext) =>
+        foregroundContext.HasRecentInput;
+
+    internal static bool ShouldMaintainDegradedCaptureReprobe(
+        DesktopCaptureBackend? captureBackend,
+        bool strategyUsesCapabilityProbe) =>
+        captureBackend == DesktopCaptureBackend.Gdi &&
+        strategyUsesCapabilityProbe;
+
+    internal static bool CanRecoverySupersedeDeferredMaintenance(
+        CaptureRecoveryReason reason) =>
+        reason is
+            CaptureRecoveryReason.SourcePressure or
+            CaptureRecoveryReason.SourceStarvation or
+            CaptureRecoveryReason.CaptureHang;
+
+    internal static bool HasCaptureRecoveryRetryCapacity(int attempt)
+    {
+        if (attempt < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+
+        return attempt <= MaximumCaptureRecoveryRetryAttempts;
+    }
+
     internal static bool CanPromoteDegradedCapture(
         VideoEncodingStrategy currentStrategy,
         VideoEncodingStrategy replacementStrategy,
@@ -3141,7 +4149,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         int? expectedProcessId,
         string diagnostic)
     {
-        var retryNotBefore = Volatile.Read(ref _recoveryRetryNotBefore);
+        var retryNotBefore =
+            ReadCurrentCaptureRecoveryRetryNotBefore();
         if (expectedProcessId is not { } processId ||
             processId <= 0 ||
             Volatile.Read(ref _disposed) != 0 ||
@@ -3195,44 +4204,694 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
-    private void DeferCaptureRecoveryRetry(int expectedProcessId)
+    private async Task RunDiscontinuousCaptureRefreshAsync(
+        int expectedProcessId,
+        string diagnostic,
+        CancellationToken cancellationToken)
     {
+        var refreshCompleted = false;
+        long requestedEpoch;
+        long completedEpoch;
+        int requestedSessionIdentity;
+        lock (_discontinuousRefreshGate)
+        {
+            requestedEpoch = _discontinuousRefreshRequestedEpoch;
+            completedEpoch = _discontinuousRefreshCompletedEpoch;
+            requestedSessionIdentity = _discontinuousRefreshSessionIdentity;
+            diagnostic = _discontinuousRefreshDiagnostic;
+        }
+
+        if (requestedSessionIdentity !=
+                Volatile.Read(ref _captureSessionIdentity) ||
+            requestedEpoch <= completedEpoch)
+        {
+            return;
+        }
+
+        try
+        {
+            RecordCaptureRuntimeEvent(
+                "capture_display_transition_started",
+                _captureProcess,
+                detail:
+                    $"epoch={requestedEpoch}; session={requestedSessionIdentity}; {diagnostic}");
+
+            // A graphics-device/display-mode transition is not a clean segment
+            // boundary. Audio can continue while an old capture source supplies a
+            // held frame, so never concatenate the previous generation onto clips
+            // produced after the transition.
+            var currentProcessId = CaptureProcessId;
+            var targetProcessId = currentProcessId == expectedProcessId
+                ? expectedProcessId
+                : currentProcessId;
+            var refreshed = targetProcessId is { } processId &&
+                await RefreshCaptureAsync(
+                    processId,
+                    cancellationToken,
+                    preserveCompletedSegments: false,
+                    expectedSessionIdentity: requestedSessionIdentity,
+                    invalidateCapabilitySelectionBeforeRefresh: true)
+                .ConfigureAwait(false);
+            if (refreshed)
+            {
+                RecordCaptureRuntimeEvent(
+                    "capture_display_transition_completed",
+                    _captureProcess,
+                    detail:
+                        $"epoch={requestedEpoch}; session={requestedSessionIdentity}.");
+                CompleteDiscontinuousRefresh(
+                    requestedEpoch,
+                    requestedSessionIdentity);
+                refreshCompleted = true;
+                return;
+            }
+
+            RecordCaptureRuntimeEvent(
+                "capture_display_transition_skipped",
+                _captureProcess,
+                detail:
+                    $"epoch={requestedEpoch}; session={requestedSessionIdentity}; {diagnostic}");
+        }
+        finally
+        {
+            // RefreshCaptureAsync can throw after scheduling its bounded
+            // verification retry. Keep ownership of the epoch in that path too;
+            // the continuation waits for the retry window instead of spinning.
+            if (!refreshCompleted &&
+                HasActionablePendingDiscontinuousRefresh())
+            {
+                SchedulePendingDiscontinuousRefresh();
+            }
+        }
+    }
+
+    private void CompleteDiscontinuousRefresh(
+        long completedEpoch,
+        int sessionIdentity)
+    {
+        var hasNewerRequest = false;
+        lock (_discontinuousRefreshGate)
+        {
+            if (sessionIdentity != _discontinuousRefreshSessionIdentity)
+            {
+                return;
+            }
+
+            _discontinuousRefreshCompletedEpoch = Math.Max(
+                _discontinuousRefreshCompletedEpoch,
+                completedEpoch);
+            hasNewerRequest =
+                _discontinuousRefreshRequestedEpoch >
+                _discontinuousRefreshCompletedEpoch;
+        }
+
+        if (hasNewerRequest)
+        {
+            SchedulePendingDiscontinuousRefresh();
+        }
+    }
+
+    private void SchedulePendingDiscontinuousRefresh()
+    {
+        lock (_discontinuousRefreshGate)
+        {
+            if (_discontinuousRefreshContinuationScheduled != 0)
+            {
+                return;
+            }
+
+            _discontinuousRefreshContinuationScheduled = 1;
+            _discontinuousRefreshContinuationTask = Task.Run(
+                ResumePendingDiscontinuousRefreshAsync);
+        }
+    }
+
+    private async Task ResumePendingDiscontinuousRefreshAsync()
+    {
+        try
+        {
+            if (!TryReadCancellationToken(
+                    _captureRecoveryRetryCancellation,
+                    out var serviceCancellation))
+            {
+                return;
+            }
+
+            while (true)
+            {
+                try
+                {
+                    await _discontinuousCaptureRefreshCoordinator
+                        .WaitForIdleAsync()
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The coordinator reports its own bounded failure diagnostic.
+                }
+
+                await WaitForCaptureRecoveryRetryWindowAsync(
+                        serviceCancellation)
+                    .ConfigureAwait(false);
+
+                var readiness =
+                    ReadPendingDiscontinuousRefreshReadiness(
+                        out _,
+                        out var diagnostic);
+                if (readiness ==
+                    DiscontinuousRefreshReadiness.Terminal)
+                {
+                    return;
+                }
+
+                if (readiness ==
+                    DiscontinuousRefreshReadiness.Wait)
+                {
+                    // Another same-session refresh temporarily owns the process
+                    // and can leave it null while _isStopping is set. Retain the
+                    // sole continuation through that replacement instead of
+                    // dropping a coalesced display epoch.
+                    await Task.Delay(
+                            TimeSpan.FromMilliseconds(250),
+                            serviceCancellation)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+
+                if (CaptureProcessId is not { } processId)
+                {
+                    // The readiness snapshot raced a process replacement.
+                    // Re-read the pending epoch instead of releasing ownership.
+                    await Task.Delay(
+                            TimeSpan.FromMilliseconds(250),
+                            serviceCancellation)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+
+                if (_discontinuousCaptureRefreshCoordinator.TrySchedule(
+                        processId,
+                        diagnostic))
+                {
+                    return;
+                }
+
+                // A worker won the coordinator between WaitForIdleAsync and
+                // TrySchedule. Follow it and retry the still-owned epoch.
+                await Task.Yield();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The replay session stopped before its retry window opened.
+        }
+        finally
+        {
+            lock (_discontinuousRefreshGate)
+            {
+                _discontinuousRefreshContinuationScheduled = 0;
+            }
+        }
+
+        // Re-check after releasing the continuation flag even when TrySchedule
+        // accepted a worker. That worker can skip/fail before this continuation
+        // clears its flag; its own reschedule attempt would otherwise be lost.
+        // The next continuation safely waits for an accepted active worker.
+        if (HasActionablePendingDiscontinuousRefresh())
+        {
+            SchedulePendingDiscontinuousRefresh();
+        }
+    }
+
+    private async Task WaitForDiscontinuousCaptureRefreshIdleAsync()
+    {
+        while (true)
+        {
+            Task continuationTask;
+            lock (_discontinuousRefreshGate)
+            {
+                continuationTask =
+                    _discontinuousRefreshContinuationTask;
+            }
+
+            await Task.WhenAll(
+                    _discontinuousCaptureRefreshCoordinator.WaitForIdleAsync(),
+                    continuationTask)
+                .ConfigureAwait(false);
+
+            bool continuationScheduled;
+            lock (_discontinuousRefreshGate)
+            {
+                continuationScheduled =
+                    _discontinuousRefreshContinuationScheduled != 0;
+            }
+
+            if (IsDiscontinuousRefreshQuiescent(
+                    HasActionablePendingDiscontinuousRefresh(),
+                    _discontinuousCaptureRefreshCoordinator.IsActive,
+                    continuationScheduled))
+            {
+                return;
+            }
+
+            if (HasActionablePendingDiscontinuousRefresh())
+            {
+                SchedulePendingDiscontinuousRefresh();
+            }
+
+            await Task.Yield();
+        }
+    }
+
+    private bool HasActionablePendingDiscontinuousRefresh()
+    {
+        return ReadPendingDiscontinuousRefreshReadiness(
+                out _,
+                out _) ==
+            DiscontinuousRefreshReadiness.Actionable;
+    }
+
+    private async Task WaitForCaptureRecoveryRetryWindowAsync(
+        CancellationToken serviceCancellation)
+    {
+        while (true)
+        {
+            if (ReadPendingDiscontinuousRefreshReadiness(
+                    out _,
+                    out _) ==
+                DiscontinuousRefreshReadiness.Terminal)
+            {
+                return;
+            }
+
+            var recoveryRetry =
+                Volatile.Read(ref _captureRecoveryRetryState);
+            if (!IsCurrentCaptureRecoveryRetry(
+                    recoveryRetry.CurrentGeneration,
+                    recoveryRetry.TaskGeneration))
+            {
+                // A successful start/refresh/stop superseded the registered
+                // delay. Never hold a newer display epoch behind that stale
+                // task even if its cancellation continuation has not run yet.
+                return;
+            }
+
+            var retryNotBefore =
+                recoveryRetry.NotBeforeTimestamp;
+            var now = Stopwatch.GetTimestamp();
+            if (recoveryRetry.Task.IsCompleted &&
+                ReferenceEquals(
+                    recoveryRetry,
+                    Volatile.Read(ref _captureRecoveryRetryState)) &&
+                retryNotBefore <= now)
+            {
+                return;
+            }
+
+            var pollDelay = TimeSpan.FromMilliseconds(250);
+            if (retryNotBefore > now)
+            {
+                var retryDelay = TimeSpan.FromSeconds(
+                    (retryNotBefore - now) /
+                    (double)Stopwatch.Frequency);
+                if (retryDelay < pollDelay)
+                {
+                    pollDelay = retryDelay;
+                }
+            }
+
+            await Task.Delay(
+                    pollDelay,
+                    serviceCancellation)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private DiscontinuousRefreshReadiness
+        ReadPendingDiscontinuousRefreshReadiness(
+            out DiscontinuousRefreshTicket ticket,
+            out string diagnostic)
+    {
+        var hasCurrentPendingRequest =
+            TryReadCurrentPendingDiscontinuousRefresh(
+                out ticket,
+                out diagnostic);
+        var captureBackend =
+            _activeCaptureStrategy?.CaptureBackend;
+        return GetDiscontinuousRefreshReadiness(
+            hasCurrentPendingRequest,
+            Volatile.Read(ref _disposed) != 0,
+            IsRunning,
+            Volatile.Read(ref _isStopping) != 0,
+            CaptureProcessId is not null,
+            captureBackend is { } backend &&
+            CanRefreshCaptureBackend(backend));
+    }
+
+    internal static DiscontinuousRefreshReadiness
+        GetDiscontinuousRefreshReadiness(
+            bool hasCurrentPendingRequest,
+            bool isDisposed,
+            bool isRunning,
+            bool isStopping,
+            bool hasCaptureProcess,
+            bool canRefreshCaptureBackend)
+    {
+        if (!hasCurrentPendingRequest || isDisposed)
+        {
+            return DiscontinuousRefreshReadiness.Terminal;
+        }
+
+        if (isStopping)
+        {
+            return DiscontinuousRefreshReadiness.Wait;
+        }
+
+        if (!isRunning || !canRefreshCaptureBackend)
+        {
+            return DiscontinuousRefreshReadiness.Terminal;
+        }
+
+        return hasCaptureProcess
+            ? DiscontinuousRefreshReadiness.Actionable
+            : DiscontinuousRefreshReadiness.Wait;
+    }
+
+    private void InvalidateCaptureRecoveryRetry()
+    {
+        lock (_captureRecoveryRetryGate)
+        {
+            var current =
+                Volatile.Read(ref _captureRecoveryRetryState);
+            var generation = unchecked(
+                ++_captureRecoveryRetrySequence);
+            Volatile.Write(
+                ref _captureRecoveryRetryState,
+                new CaptureRecoveryRetryState(
+                    generation,
+                    current.TaskGeneration,
+                    NotBeforeTimestamp: 0,
+                    current.Task));
+        }
+    }
+
+    private long ReadCurrentCaptureRecoveryRetryNotBefore()
+    {
+        var retry =
+            Volatile.Read(ref _captureRecoveryRetryState);
+        return IsCurrentCaptureRecoveryRetry(
+                retry.CurrentGeneration,
+                retry.TaskGeneration)
+            ? retry.NotBeforeTimestamp
+            : 0;
+    }
+
+    internal static bool IsCurrentCaptureRecoveryRetry(
+        int currentGeneration,
+        int taskGeneration) =>
+        currentGeneration == taskGeneration;
+
+    private static bool TryReadCancellationToken(
+        CancellationTokenSource? source,
+        out CancellationToken cancellationToken)
+    {
+        if (source is null)
+        {
+            cancellationToken = default;
+            return false;
+        }
+
+        try
+        {
+            cancellationToken = source.Token;
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            cancellationToken = default;
+            return false;
+        }
+    }
+
+    private DiscontinuousRefreshTicket? ReadPendingDiscontinuousRefreshTicket()
+    {
+        return TryReadCurrentPendingDiscontinuousRefresh(
+                out var ticket,
+                out _)
+            ? ticket
+            : null;
+    }
+
+    private bool TryReadCurrentPendingDiscontinuousRefresh(
+        out DiscontinuousRefreshTicket ticket,
+        out string diagnostic)
+    {
+        lock (_discontinuousRefreshGate)
+        {
+            var sessionIdentity =
+                Volatile.Read(ref _captureSessionIdentity);
+            if (_discontinuousRefreshSessionIdentity !=
+                    sessionIdentity ||
+                _discontinuousRefreshRequestedEpoch <=
+                    _discontinuousRefreshCompletedEpoch)
+            {
+                ticket = default;
+                diagnostic = string.Empty;
+                return false;
+            }
+
+            ticket = new DiscontinuousRefreshTicket(
+                _discontinuousRefreshRequestedEpoch,
+                sessionIdentity);
+            diagnostic = _discontinuousRefreshDiagnostic;
+            return true;
+        }
+    }
+
+    private bool DeferCaptureRecoveryRetry(
+        int expectedProcessId,
+        bool preserveCompletedSegments,
+        CapturePerformanceProfile performanceProfile,
+        FfmpegCapabilitySelection? verifiedReplacement,
+        bool requireCompletedSegmentBoundary,
+        int? expectedSessionIdentity,
+        bool invalidateCapabilitySelectionBeforeRefresh,
+        int recoveryRetryAttempt,
+        int boundaryRetryAttempt)
+    {
+        if (recoveryRetryAttempt < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(recoveryRetryAttempt));
+        }
+
+        if (boundaryRetryAttempt < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(boundaryRetryAttempt));
+        }
+
+        var retryDelay = CaptureRecoveryRetryDelay;
+        if (recoveryRetryAttempt > 0 &&
+            !HasCaptureRecoveryRetryCapacity(
+                recoveryRetryAttempt))
+        {
+            if (IsActiveCaptureGenerationExportBlocked())
+            {
+                EnqueueDiagnostic(
+                    $"Capture recovery exhausted {MaximumCaptureRecoveryRetryAttempts} delayed verification attempts while the active generation was blocked.");
+                return false;
+            }
+
+            // Routine renewal or a boundary-safe profile promotion still has
+            // a healthy old recorder. Keep it running and retry much later,
+            // with a fresh bounded verification chain.
+            recoveryRetryAttempt = 0;
+            retryDelay =
+                CaptureRecoveryRetryExhaustedCooldown;
+            EnqueueDiagnostic(
+                $"Capture maintenance exhausted {MaximumCaptureRecoveryRetryAttempts} delayed verification attempts; the healthy recorder remains active and verification will retry in {retryDelay.TotalMinutes:0} minutes.");
+        }
+
+        if (boundaryRetryAttempt > 0 &&
+            !HasCaptureRecoveryRetryCapacity(
+                boundaryRetryAttempt))
+        {
+            // A missing boundary is not a verification failure and must not
+            // consume a later objective/display recovery's retry budget. Back
+            // off the optional non-destructive promotion, then start its own
+            // fresh boundary chain.
+            boundaryRetryAttempt = 0;
+            retryDelay =
+                CaptureRecoveryRetryExhaustedCooldown;
+            EnqueueDiagnostic(
+                $"Capture profile promotion did not observe a completed boundary after {MaximumCaptureRecoveryRetryAttempts} delayed attempts; the healthy recorder remains active and promotion will retry in {retryDelay.TotalMinutes:0} minutes.");
+        }
+
         var delayTicks = checked((long)(
-            CaptureRecoveryRetryDelay.TotalSeconds * Stopwatch.Frequency));
-        Volatile.Write(
-            ref _recoveryRetryNotBefore,
-            checked(Stopwatch.GetTimestamp() + delayTicks));
-        var generation = Interlocked.Increment(ref _recoveryRetryGeneration);
-        var cancellationToken = _sessionCancellation?.Token ?? CancellationToken.None;
-        _ = RetryCaptureRecoveryAfterDelayAsync(
+            retryDelay.TotalSeconds * Stopwatch.Frequency));
+        var retryNotBefore =
+            checked(Stopwatch.GetTimestamp() + delayTicks);
+        expectedSessionIdentity ??=
+            Volatile.Read(ref _captureSessionIdentity);
+        var cancellationToken = _captureRecoveryRetryCancellation.Token;
+        int generation;
+        TaskCompletionSource retryCompletion;
+        lock (_captureRecoveryRetryGate)
+        {
+            generation = unchecked(
+                ++_captureRecoveryRetrySequence);
+            retryCompletion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(
+                ref _captureRecoveryRetryState,
+                new CaptureRecoveryRetryState(
+                    generation,
+                    generation,
+                    retryNotBefore,
+                    retryCompletion.Task));
+        }
+
+        _ = RunPublishedCaptureRecoveryRetryAsync(
+            retryCompletion,
             expectedProcessId,
             generation,
+            preserveCompletedSegments,
+            performanceProfile,
+            verifiedReplacement,
+            requireCompletedSegmentBoundary,
+            expectedSessionIdentity,
+            invalidateCapabilitySelectionBeforeRefresh,
+            recoveryRetryAttempt,
+            boundaryRetryAttempt,
+            retryDelay,
             cancellationToken);
+        return true;
+    }
+
+    private async Task RunPublishedCaptureRecoveryRetryAsync(
+        TaskCompletionSource retryCompletion,
+        int expectedProcessId,
+        int generation,
+        bool preserveCompletedSegments,
+        CapturePerformanceProfile performanceProfile,
+        FfmpegCapabilitySelection? verifiedReplacement,
+        bool requireCompletedSegmentBoundary,
+        int? expectedSessionIdentity,
+        bool invalidateCapabilitySelectionBeforeRefresh,
+        int recoveryRetryAttempt,
+        int boundaryRetryAttempt,
+        TimeSpan retryDelay,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RetryCaptureRecoveryAfterDelayAsync(
+                    expectedProcessId,
+                    generation,
+                    preserveCompletedSegments,
+                    performanceProfile,
+                    verifiedReplacement,
+                    requireCompletedSegmentBoundary,
+                    expectedSessionIdentity,
+                    invalidateCapabilitySelectionBeforeRefresh,
+                    recoveryRetryAttempt,
+                    boundaryRetryAttempt,
+                    retryDelay,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            retryCompletion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            retryCompletion.TrySetException(exception);
+        }
     }
 
     private async Task RetryCaptureRecoveryAfterDelayAsync(
         int expectedProcessId,
         int generation,
+        bool preserveCompletedSegments,
+        CapturePerformanceProfile performanceProfile,
+        FfmpegCapabilitySelection? verifiedReplacement,
+        bool requireCompletedSegmentBoundary,
+        int? expectedSessionIdentity,
+        bool invalidateCapabilitySelectionBeforeRefresh,
+        int recoveryRetryAttempt,
+        int boundaryRetryAttempt,
+        TimeSpan retryDelay,
         CancellationToken cancellationToken)
     {
         try
         {
-            await Task.Delay(CaptureRecoveryRetryDelay, cancellationToken).ConfigureAwait(false);
-            if (generation != Volatile.Read(ref _recoveryRetryGeneration) ||
+            await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
+            if (Volatile.Read(ref _disposed) != 0 ||
+                !IsCurrentCaptureRecoveryRetry(
+                    Volatile.Read(
+                        ref _captureRecoveryRetryState).CurrentGeneration,
+                    generation) ||
                 !IsRunning ||
-                CaptureProcessId != expectedProcessId)
+                CaptureProcessId != expectedProcessId ||
+                expectedSessionIdentity is { } sessionIdentity &&
+                Volatile.Read(ref _captureSessionIdentity) != sessionIdentity)
             {
                 return;
             }
 
-            Volatile.Write(ref _recoveryRetryNotBefore, 0);
-            _ = QueueScheduledCaptureRefresh(
-                expectedProcessId,
-                "Retrying a capture-process renewal after a transient executable or buffer preflight failure.");
+            var discontinuousRefreshTicket = preserveCompletedSegments
+                ? null
+                : ReadPendingDiscontinuousRefreshTicket();
+            var refreshed = await RefreshCaptureAsync(
+                    expectedProcessId,
+                    cancellationToken,
+                    preserveCompletedSegments,
+                    verifiedReplacement,
+                    performanceProfile,
+                    requireCompletedSegmentBoundary,
+                    expectedSessionIdentity,
+                    invalidateCapabilitySelectionBeforeRefresh ||
+                    discontinuousRefreshTicket is not null,
+                    recoveryRetryAttempt,
+                    boundaryRetryAttempt)
+                .ConfigureAwait(false);
+            if (refreshed &&
+                discontinuousRefreshTicket is { } completedTransition)
+            {
+                // The retry created a clean generation with the same invalidating
+                // semantics requested by the display-transition worker. Complete
+                // only the epoch observed before that replacement started; a
+                // transition arriving during it remains pending.
+                CompleteDiscontinuousRefresh(
+                    completedTransition.Epoch,
+                    completedTransition.SessionIdentity);
+            }
+
+            if (!refreshed)
+            {
+                EnqueueDiagnostic(
+                    $"Skipped stale capture-recovery retry for process {expectedProcessId}.");
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // The original capture process stopped or was replaced first.
+            // Service disposal superseded the delayed retry. Process-generation
+            // replacement intentionally does not cancel this token.
+        }
+        catch (Exception exception)
+        {
+            // RefreshCaptureAsync schedules another bounded retry when the same
+            // transient preflight fails again. Observe this task locally so a
+            // background retry can never become an unobserved exception.
+            EnqueueDiagnostic(
+                $"Capture-recovery retry for process {expectedProcessId} failed: " +
+                exception.GetBaseException().Message);
+        }
+        finally
+        {
+            if (HasActionablePendingDiscontinuousRefresh())
+            {
+                SchedulePendingDiscontinuousRefresh();
+            }
         }
     }
 
@@ -3264,7 +4923,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         Process? process = null,
         CaptureConfiguration? configuration = null,
         VideoEncodingStrategy? strategy = null,
-        string? detail = null)
+        string? detail = null,
+        bool includeResourceSnapshots = true)
     {
         try
         {
@@ -3275,6 +4935,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 : CaptureGeometry.ResolveOutputSize(
                     configuration.Display,
                     configuration.Resolution);
+            if (configuration is not null && outputSize is not null)
+            {
+                var captureContext = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"source={configuration.Display.Width}x{configuration.Display.Height}; " +
+                    $"output={outputSize.Value.Width}x{outputSize.Value.Height}; " +
+                    $"resolution={configuration.Resolution.Id}; " +
+                    $"requiresScaling={outputSize.Value.RequiresScaling}; " +
+                    $"monitorIndex={configuration.Display.MonitorIndex}; " +
+                    $"profile={_activeCapturePerformanceProfile}.");
+                detail = string.IsNullOrWhiteSpace(detail)
+                    ? captureContext
+                    : $"{captureContext} {detail}";
+            }
+
             _runtimeJournal.Record(
                 eventName,
                 process,
@@ -3283,7 +4958,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 outputSize?.Height,
                 configuration?.FramesPerSecond,
                 configuration?.CaptureCursor,
-                detail);
+                detail,
+                includeResourceSnapshots);
         }
         catch
         {
@@ -5521,6 +7197,28 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private void ThrowIfDisposed() =>
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+    private readonly record struct CaptureProgressEnvelope(
+        int ProcessId,
+        CaptureProgressSample Sample,
+        CaptureForegroundContext ForegroundContext);
+
+    private readonly record struct DiscontinuousRefreshTicket(
+        long Epoch,
+        int SessionIdentity);
+
+    private sealed record CaptureRecoveryRetryState(
+        int CurrentGeneration,
+        int TaskGeneration,
+        long NotBeforeTimestamp,
+        Task Task);
+
+    internal enum DiscontinuousRefreshReadiness
+    {
+        Terminal,
+        Wait,
+        Actionable
+    }
 
     private readonly record struct BufferedSegment(
         string Path,
