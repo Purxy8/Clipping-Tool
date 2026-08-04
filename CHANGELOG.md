@@ -23,6 +23,7 @@ All notable user-facing changes to ClipForge are recorded here.
 - Fixed-preset capture keeps one locked output geometry across stretched or custom-resolution transitions. WGC now scales only when live geometry truly differs from the selected output, while Source/native matching geometry stays on the low-overhead no-scale path.
 - High-refresh displays use a divisor-aware WGC input cap, including stable 165 Hz to 60 FPS sampling, to avoid uneven frame delivery without increasing encoder load.
 - Recorder stop and replay export use bounded progress-stall detection and single-pass stream copy. Trim and save operations no longer compete with capture-critical playback, update, thumbnail, or configuration work.
+- Recorder start no longer reads or requires the Instant Replay length. The UI now labels that duration as Instant Replay-only and states that Recorder runs continuously until Stop & save; twelve-hour storage figures are explicitly estimates rather than duration presets.
 - Recovery commit order now distinguishes a planned output from a durably committed file, verifies exact output length, preserves source data across partial moves, missing segments, stale or torn journals, offline drives, and failed locator migration, and only removes a recovery locator after an explicitly successful owned-directory deletion. An incomplete zero-safe-segment recovery has a separately labeled, confirmed discard action whose durable terminal state cannot return as a ghost session after a crash.
 
 ### Verification
