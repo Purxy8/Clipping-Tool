@@ -274,7 +274,7 @@
                             <!-- Video -->
                             <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
                                 <StackPanel>
-                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="REPLAY, RECORDER &amp; VIDEO" />
+                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="CAPTURE VIDEO" />
                                     <TextBlock Margin="0,10,0,6" Style="{StaticResource FieldLabelStyle}" Text="DISPLAY" />
                                     <ComboBox x:Name="DisplayComboBox" SelectionChanged="DisplayComboBox_SelectionChanged" />
 
@@ -285,8 +285,11 @@
                                             <ColumnDefinition Width="112" />
                                         </Grid.ColumnDefinitions>
                                         <StackPanel>
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="REPLAY LENGTH" />
+                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="INSTANT REPLAY LENGTH" />
                                             <ComboBox x:Name="ReplayLengthComboBox" SelectionChanged="ReplayLengthComboBox_SelectionChanged" />
+                                            <TextBlock Margin="0,5,0,0" Style="{StaticResource MutedTextStyle}"
+                                                       TextWrapping="Wrap"
+                                                       Text="Instant Replay only. Recorder runs until you choose Stop &amp; save." />
                                         </StackPanel>
                                         <StackPanel Grid.Column="2">
                                             <TextBlock Style="{StaticResource FieldLabelStyle}" Text="FPS" />
@@ -298,7 +301,7 @@
                                     <ComboBox x:Name="ResolutionComboBox" SelectionChanged="ResolutionComboBox_SelectionChanged" />
 
                                     <CheckBox x:Name="CaptureCursorCheckBox" Margin="0,12,0,0"
-                                              Content="Include mouse cursor in clips"
+                                              Content="Include mouse cursor in capture"
                                               Checked="CaptureCursorCheckBox_Changed"
                                               Unchecked="CaptureCursorCheckBox_Changed"
                                               Style="{StaticResource ToggleCheckBoxStyle}" />
@@ -454,7 +457,7 @@
                                 <StackPanel>
                                     <TextBlock Style="{StaticResource EyebrowStyle}" Text="FEEDBACK" />
                                     <CheckBox x:Name="ClipSavedSoundCheckBox" Margin="0,10,0,0"
-                                              Content="Play a sound when a clip is saved" IsChecked="True"
+                                              Content="Play a sound after saving" IsChecked="True"
                                               Click="ClipSavedSoundCheckBox_Click"
                                               Style="{StaticResource ToggleCheckBoxStyle}" />
                                     <TextBlock Margin="0,7,0,0" Style="{StaticResource MutedTextStyle}"
@@ -532,7 +535,8 @@
                             </Grid.ColumnDefinitions>
                             <StackPanel VerticalAlignment="Center">
                                 <TextBlock Style="{StaticResource EyebrowStyle}" Text="CAPTURE" />
-                                <TextBlock Margin="0,4,0,2" FontSize="20" FontWeight="SemiBold" Text="Replay or record the full session" />
+                                <TextBlock Margin="0,4,0,2" FontSize="20" FontWeight="SemiBold"
+                                           Text="Instant Replay saves the selected past. Recorder runs until Stop &amp; save." />
                                 <TextBlock x:Name="AvailableText" Style="{StaticResource MutedTextStyle}" Text="Capture is off" />
                             </StackPanel>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -540,7 +544,8 @@
                                         Click="BufferToggleButton_Click" Style="{StaticResource SecondaryButtonStyle}" />
                                 <Button x:Name="RecordToggleButton" MinWidth="132" Margin="0,0,8,0" Content="Start recording"
                                         Click="RecordToggleButton_Click" Style="{StaticResource SecondaryButtonStyle}"
-                                        AutomationProperties.Name="Start full-session recording" />
+                                        AutomationProperties.Name="Start full-session recording"
+                                        AutomationProperties.HelpText="Starts a continuous manual recording that runs until Stop and save." />
                                 <Button x:Name="SaveClipButton" MinWidth="172" Content="Save last clip" IsEnabled="False"
                                         Click="SaveClipButton_Click" Style="{StaticResource AnimatedPrimaryButtonStyle}" />
                             </StackPanel>

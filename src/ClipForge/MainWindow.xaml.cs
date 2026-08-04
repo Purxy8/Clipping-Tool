@@ -1275,7 +1275,7 @@ public partial class MainWindow : Window
 
         // Resolve the live display/audio selection while Replay is still intact.
         // StartCaptureCore repeats this after Replay stops to close a hot-plug race.
-        _ = BuildCaptureConfiguration();
+        _ = BuildCaptureConfiguration(CaptureSessionMode.Recording);
     }
 
     private async Task StartCaptureCoreAsync(
@@ -1342,7 +1342,7 @@ public partial class MainWindow : Window
             }
         }
 
-        var baseConfiguration = BuildCaptureConfiguration();
+        var baseConfiguration = BuildCaptureConfiguration(sessionMode);
         var initialOutputSize = CaptureGeometry.ResolveOutputSize(
             baseConfiguration.Display,
             baseConfiguration.Resolution);
@@ -1355,10 +1355,7 @@ public partial class MainWindow : Window
                 : null,
             LockedOutputHeight = sessionMode == CaptureSessionMode.Recording
                 ? initialOutputSize.Height
-                : null,
-            Retention = sessionMode == CaptureSessionMode.Recording
-                ? RecordingStoragePolicy.EngineRetention
-                : baseConfiguration.Retention
+                : null
         };
         if (sourceSafetyMode)
         {
@@ -1476,7 +1473,7 @@ public partial class MainWindow : Window
         (_replayBufferService.IsRunning || IsReplaySessionState(_latestState)) &&
         !IsRecorderSession;
 
-    private CaptureConfiguration BuildCaptureConfiguration()
+    private CaptureConfiguration BuildCaptureConfiguration(CaptureSessionMode sessionMode)
     {
         var selectedDisplay = DisplayComboBox.SelectedItem as DisplayOption
             ?? throw new InvalidOperationException("No display is available to capture.");
@@ -1487,8 +1484,11 @@ public partial class MainWindow : Window
                           "The selected display is no longer available. Choose another display and try again.");
         var resolution = ResolutionComboBox.SelectedItem as ResolutionOption
             ?? throw new InvalidOperationException("Choose a recording resolution.");
-        var replayLength = ReplayLengthComboBox.SelectedItem as ReplayLengthOption
-            ?? throw new InvalidOperationException("Choose a replay length.");
+        var retention = ResolveCaptureRetention(
+            sessionMode,
+            sessionMode == CaptureSessionMode.InstantReplay
+                ? (ReplayLengthComboBox.SelectedItem as ReplayLengthOption)?.Duration
+                : null);
         var framesPerSecond = FpsComboBox.SelectedItem is int fps
             ? fps
             : throw new InvalidOperationException("Choose a frame rate.");
@@ -1511,13 +1511,32 @@ public partial class MainWindow : Window
             display,
             resolution,
             framesPerSecond,
-            replayLength.Duration,
+            retention,
             CaptureCursorCheckBox.IsChecked == true,
             captureSystemAudio,
             outputDevice,
             captureMicrophone,
             microphone,
             _settings.SaveDirectory);
+    }
+
+    internal static TimeSpan ResolveCaptureRetention(
+        CaptureSessionMode sessionMode,
+        TimeSpan? replayRetention)
+    {
+        if (sessionMode == CaptureSessionMode.Recording)
+        {
+            return RecordingStoragePolicy.EngineRetention;
+        }
+
+        if (sessionMode != CaptureSessionMode.InstantReplay)
+        {
+            throw new ArgumentOutOfRangeException(nameof(sessionMode));
+        }
+
+        return replayRetention is { } retention && retention > TimeSpan.Zero
+            ? retention
+            : throw new InvalidOperationException("Choose a replay length.");
     }
 
     internal static DisplayOption? FindDisplayByDeviceName(
@@ -3168,8 +3187,8 @@ public partial class MainWindow : Window
             : SavePathTextBox.Text;
         var generation = Interlocked.Increment(ref _storageStatusGeneration);
         StorageText.Text =
-            $"~{StorageEstimator.FormatBytes(estimate)} replay · " +
-            $"~{StorageEstimator.FormatBytes(recordingEstimate)} per 12h recording";
+            $"Replay buffer: ~{StorageEstimator.FormatBytes(estimate)} · " +
+            $"Recorder estimate for 12 hours: ~{StorageEstimator.FormatBytes(recordingEstimate)}";
         StorageText.Foreground = Brush("TextMutedBrush");
         _ = UpdateStorageFreeSpaceAsync(
             generation,
@@ -3208,8 +3227,8 @@ public partial class MainWindow : Window
             }
 
             StorageText.Text =
-                $"~{StorageEstimator.FormatBytes(estimatedBufferBytes)} replay · " +
-                $"~{StorageEstimator.FormatBytes(estimatedTwelveHourRecordingBytes)} per 12h · " +
+                $"Replay buffer: ~{StorageEstimator.FormatBytes(estimatedBufferBytes)} · " +
+                $"Recorder 12h estimate: ~{StorageEstimator.FormatBytes(estimatedTwelveHourRecordingBytes)} · " +
                 $"{StorageEstimator.FormatBytes(freeSpace.Value)} free";
             var recommendedRecordingFreeBytes =
                 estimatedTwelveHourRecordingBytes >
@@ -3794,6 +3813,12 @@ public partial class MainWindow : Window
         if (_replayBufferService.IsRunning && !IsRecorderSession)
         {
             await SaveClipAsync();
+        }
+        else if (IsRecorderSession)
+        {
+            ShowError(
+                $"{_settings.SaveClipHotkey.DisplayText} saves Instant Replay clips only. " +
+                "Recorder keeps the full session until you choose Stop & save.");
         }
         else
         {

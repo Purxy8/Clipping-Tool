@@ -703,6 +703,31 @@ internal static class Program
             !malformed.StartRecordingWithWindows,
             "Startup preference normalization did not preserve the bounded fail-safe mode.");
 
+        var replayRetention = TimeSpan.FromMinutes(5);
+        Assert.Equal(
+            replayRetention,
+            MainWindow.ResolveCaptureRetention(
+                CaptureSessionMode.InstantReplay,
+                replayRetention),
+            "Instant Replay did not keep its selected replay length.");
+        Assert.Equal(
+            RecordingStoragePolicy.EngineRetention,
+            MainWindow.ResolveCaptureRetention(
+                CaptureSessionMode.Recording,
+                replayRetention: null),
+            "Recorder incorrectly required an Instant Replay length.");
+        Assert.Equal(
+            RecordingStoragePolicy.EngineRetention,
+            MainWindow.ResolveCaptureRetention(
+                CaptureSessionMode.Recording,
+                replayRetention),
+            "Recorder incorrectly inherited the selected Instant Replay length.");
+        Assert.Throws<InvalidOperationException>(
+            () => MainWindow.ResolveCaptureRetention(
+                CaptureSessionMode.InstantReplay,
+                replayRetention: null),
+            "Instant Replay accepted a missing replay length.");
+
         return Task.CompletedTask;
     }
 
