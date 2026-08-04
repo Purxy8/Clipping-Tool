@@ -711,13 +711,13 @@ internal static class Program
                 replayRetention),
             "Instant Replay did not keep its selected replay length.");
         Assert.Equal(
-            RecordingStoragePolicy.EngineRetention,
+            RecordingStoragePolicy.NoReplayRetention,
             MainWindow.ResolveCaptureRetention(
                 CaptureSessionMode.Recording,
                 replayRetention: null),
             "Recorder incorrectly required an Instant Replay length.");
         Assert.Equal(
-            RecordingStoragePolicy.EngineRetention,
+            RecordingStoragePolicy.NoReplayRetention,
             MainWindow.ResolveCaptureRetention(
                 CaptureSessionMode.Recording,
                 replayRetention),
@@ -6225,6 +6225,21 @@ internal static class Program
             !remuxArguments.Contains("+faststart", StringComparer.Ordinal),
             "A local replay remux must not rewrite the whole MP4 for faststart.");
 
+        var recordingArguments = FfmpegArgumentBuilder.BuildRecordingConcatArguments(
+            @"C:\Buffer\recording-manifest.txt",
+            @"C:\Clips\recording.mp4");
+        Assert.ContainsSequence(recordingArguments, "-f", "concat", "-safe", "0");
+        Assert.ContainsSequence(recordingArguments, "-map", "0:v:0", "-map", "0:a?");
+        Assert.ContainsSequence(recordingArguments, "-c", "copy", "-avoid_negative_ts", "make_zero");
+        Assert.True(
+            !recordingArguments.Contains("-ss", StringComparer.Ordinal) &&
+            !recordingArguments.Contains("-t", StringComparer.Ordinal),
+            "Recorder finalization must preserve the full Start-to-Stop session without replay trimming bounds.");
+        Assert.Equal(
+            @"C:\Clips\recording.mp4",
+            recordingArguments[^1],
+            "The Recorder output path must remain one argument.");
+
         return Task.CompletedTask;
     }
 
@@ -7169,22 +7184,38 @@ internal static class Program
             "Finalization reserve did not include one complete output copy.");
         Assert.True(
             !RecordingStoragePolicy.ShouldFinalize(
-                TimeSpan.FromHours(12),
                 sessionBytes,
                 sessionBytes + 5 * gibibyte),
             "Recorder stopped before reaching its projected-write headroom.");
         Assert.True(
             RecordingStoragePolicy.ShouldFinalize(
-                TimeSpan.FromHours(12),
                 sessionBytes,
                 sessionBytes + 4 * gibibyte),
             "Recorder did not stop with enough headroom left for finalization.");
         Assert.True(
-            RecordingStoragePolicy.ShouldFinalize(
-                RecordingStoragePolicy.MaximumDuration,
-                0,
+            !MainWindow.ShouldFinalizeRecordingForSafety(
+                TimeSpan.FromDays(30),
+                sessionBytes,
                 long.MaxValue),
-            "The 24-hour safety limit did not request finalization.");
+            "Elapsed recording time incorrectly requested automatic finalization.");
+        Assert.True(
+            MainWindow.ShouldFinalizeRecordingForSafety(
+                TimeSpan.Zero,
+                sessionBytes,
+                availableFreeBytes: null),
+            "Recorder did not stop after losing access to its selected drive.");
+        Assert.True(
+            MainWindow.ShouldFinalizeRecordingForSafety(
+                TimeSpan.Zero,
+                sessionBytes,
+                sessionBytes + 4 * gibibyte),
+            "Recorder did not preserve finalization headroom on a low-space drive.");
+        Assert.True(
+            !MainWindow.ShouldFinalizeRecordingForSafety(
+                TimeSpan.FromDays(30),
+                sessionBytes,
+                sessionBytes + 5 * gibibyte),
+            "A long Recorder session stopped despite having safe finalization headroom.");
         Assert.Equal(
             long.MaxValue,
             RecordingStoragePolicy.GetRequiredFinalizationFreeBytes(long.MaxValue),
@@ -7207,9 +7238,9 @@ internal static class Program
             manifest[^1],
             "The 12-hour manifest lost its fixed final segment cadence.");
         Assert.Equal(
-            RecordingStoragePolicy.EngineRetention,
-            RecordingStoragePolicy.MaximumDuration + TimeSpan.FromMinutes(5),
-            "Recorder engine retention no longer covers the complete safety window.");
+            TimeSpan.Zero,
+            RecordingStoragePolicy.NoReplayRetention,
+            "Recorder unexpectedly exposed an Instant Replay retention window.");
 
         return Task.CompletedTask;
     }

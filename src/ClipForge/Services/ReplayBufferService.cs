@@ -1079,11 +1079,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         Volatile.Write(ref _pendingDetachedRecordingBuffer, detached);
         _sessionMode = CaptureSessionMode.Recording;
-        _retention = RecordingStoragePolicy.MaximumDuration;
+        _retention = RecordingStoragePolicy.NoReplayRetention;
         Publish(new ReplayStateSnapshot(
             ReplayState.Faulted,
             TimeSpan.Zero,
-            RecordingStoragePolicy.MaximumDuration,
+            RecordingStoragePolicy.NoReplayRetention,
             detached.SegmentBytes,
             detached.SourceAvailable
                 ? detached.MissingSegmentCount > 0
@@ -1791,7 +1791,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         if (_sessionMode == CaptureSessionMode.Recording)
         {
             throw new InvalidOperationException(
-                "Recorder retention is fixed for the active long session.");
+                "Recorder does not use the Instant Replay length.");
         }
 
         ThrowIfDisposed();
@@ -2398,7 +2398,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     Publish(new ReplayStateSnapshot(
                         ReplayState.Faulted,
                         TimeSpan.Zero,
-                        RecordingStoragePolicy.MaximumDuration,
+                        RecordingStoragePolicy.NoReplayRetention,
                         detachedBuffer.SegmentBytes,
                         "Recorder stopped before a complete safe segment was available. " +
                         "The incomplete source was preserved; use Discard incomplete only if you no longer need it."));
@@ -2444,11 +2444,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var ffprobePath = _ffmpegSetupService.FindProbeExecutable()
                 ?? throw new InvalidOperationException(
                     "The clip validator is no longer available. The recording session was preserved.");
-            var arguments = FfmpegArgumentBuilder.BuildConcatArguments(
+            var arguments = FfmpegArgumentBuilder.BuildRecordingConcatArguments(
                 manifestPath,
-                partialPath,
-                TimeSpan.Zero,
-                duration);
+                partialPath);
             await RunRecordingExportProcessAsync(
                     ffmpegPath,
                     arguments,
@@ -2525,7 +2523,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             Publish(new ReplayStateSnapshot(
                 ReplayState.Stopped,
                 TimeSpan.Zero,
-                RecordingStoragePolicy.MaximumDuration,
+                RecordingStoragePolicy.NoReplayRetention,
                 0,
                 "Recording saved.",
                 finalPath));
@@ -2551,7 +2549,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             Publish(new ReplayStateSnapshot(
                 ReplayState.Faulted,
                 TimeSpan.Zero,
-                RecordingStoragePolicy.MaximumDuration,
+                RecordingStoragePolicy.NoReplayRetention,
                 detachedBuffer?.SegmentBytes ?? 0,
                 $"Recording finalization did not finish.{recoveryDetail}"));
             throw;
@@ -2646,7 +2644,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 Publish(new ReplayStateSnapshot(
                     ReplayState.Stopped,
                     TimeSpan.Zero,
-                    RecordingStoragePolicy.MaximumDuration,
+                    RecordingStoragePolicy.NoReplayRetention,
                     0,
                     "Incomplete recording discarded.",
                     _lastSavedPath));
@@ -4216,7 +4214,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         Publish(new ReplayStateSnapshot(
             state,
             available,
-            RecordingStoragePolicy.MaximumDuration,
+            RecordingStoragePolicy.NoReplayRetention,
             bytes,
             state == ReplayState.Saving
                 ? "Finalizing the recording…"
@@ -8526,18 +8524,27 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private static void ValidateConfiguration(CaptureConfiguration configuration)
     {
-        var maximumRetention = configuration.SessionMode ==
-            CaptureSessionMode.Recording
-            ? RecordingStoragePolicy.EngineRetention
-            : TimeSpan.FromHours(1);
-        if (configuration.Retention < TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds) ||
-            configuration.Retention > maximumRetention)
+        if (configuration.SessionMode == CaptureSessionMode.InstantReplay &&
+            (configuration.Retention < TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds) ||
+             configuration.Retention > TimeSpan.FromHours(1)))
         {
             throw new ArgumentOutOfRangeException(
                 nameof(configuration),
-                configuration.SessionMode == CaptureSessionMode.Recording
-                    ? "Recorder sessions cannot exceed the 24-hour safety limit."
-                    : "Replay length must be between two seconds and one hour.");
+                "Replay length must be between two seconds and one hour.");
+        }
+
+        if (configuration.SessionMode == CaptureSessionMode.Recording &&
+            configuration.Retention != RecordingStoragePolicy.NoReplayRetention)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(configuration),
+                "Recorder must not define an Instant Replay retention window.");
+        }
+
+        if (configuration.SessionMode is not (
+                CaptureSessionMode.InstantReplay or CaptureSessionMode.Recording))
+        {
+            throw new ArgumentOutOfRangeException(nameof(configuration));
         }
 
         if (configuration.CaptureSystemAudio && configuration.OutputAudioDevice is null)

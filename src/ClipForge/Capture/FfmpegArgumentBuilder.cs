@@ -374,6 +374,30 @@ internal static class FfmpegArgumentBuilder
         return arguments;
     }
 
+    public static IReadOnlyList<string> BuildRecordingConcatArguments(
+        string manifestPath,
+        string outputPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(manifestPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+
+        return
+        [
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", manifestPath,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-y",
+            outputPath
+        ];
+    }
+
     /// <summary>
     /// Builds a fast stream-copy trim when both normalized bounds match ClipForge's fixed GOP
     /// boundaries, or an exact-seek transcode for an arbitrary range. FFmpeg's accurate-seek path

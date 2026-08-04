@@ -1526,7 +1526,7 @@ public partial class MainWindow : Window
     {
         if (sessionMode == CaptureSessionMode.Recording)
         {
-            return RecordingStoragePolicy.EngineRetention;
+            return RecordingStoragePolicy.NoReplayRetention;
         }
 
         if (sessionMode != CaptureSessionMode.InstantReplay)
@@ -3098,11 +3098,10 @@ public partial class MainWindow : Window
                 () => ReplayBufferService.TryGetAvailableFreeSpace(saveDirectory),
                 _lifetimeCancellation.Token);
             var storageUnavailable = availableFreeBytes is null;
-            if (!storageUnavailable &&
-                !RecordingStoragePolicy.ShouldFinalize(
+            if (!ShouldFinalizeRecordingForSafety(
                     snapshot.AvailableDuration,
                     snapshot.BufferBytes,
-                    availableFreeBytes!.Value) ||
+                    availableFreeBytes) ||
                 !IsRecorderSession ||
                 !_replayBufferService.IsRunning ||
                 _isClosing)
@@ -3112,9 +3111,7 @@ public partial class MainWindow : Window
 
             var reason = storageUnavailable
                 ? "Recorder lost access to the selected drive and is stopping to preserve the session."
-                : snapshot.AvailableDuration >= RecordingStoragePolicy.MaximumDuration
-                    ? "Recorder reached its 24-hour safety limit and is finalizing the session."
-                    : "Recorder is finalizing before the drive runs out of safe working space.";
+                : "Recorder is finalizing before the drive runs out of safe working space.";
             ShowError(reason);
             var error = await RunCaptureCommandAsync(
                 StopRecordingAndSaveCoreAsync,
@@ -3132,6 +3129,21 @@ public partial class MainWindow : Window
         {
             _recordingSafetyCheckRunning = false;
         }
+    }
+
+    internal static bool ShouldFinalizeRecordingForSafety(
+        TimeSpan availableDuration,
+        long sessionBytes,
+        long? availableFreeBytes)
+    {
+        // Recorder duration is controlled only by Start / Stop & save. Keep the
+        // elapsed value in this explicit policy boundary so a future caller
+        // cannot accidentally reintroduce the old time-based auto-finalization.
+        _ = availableDuration;
+        return availableFreeBytes is null ||
+               RecordingStoragePolicy.ShouldFinalize(
+                   sessionBytes,
+                   availableFreeBytes.Value);
     }
 
     private Brush Brush(string resourceKey) => (Brush)FindResource(resourceKey);

@@ -1899,11 +1899,9 @@ static async Task RunLongRecordingSmokeAsync(
     var exportTimer = Stopwatch.StartNew();
     var export = await processRunner.RunAsync(
             ffmpeg,
-            FfmpegArgumentBuilder.BuildConcatArguments(
+            FfmpegArgumentBuilder.BuildRecordingConcatArguments(
                 manifestPath,
-                outputPath,
-                TimeSpan.Zero,
-                expectedDuration),
+                outputPath),
             TimeSpan.FromMinutes(8),
             cancellationToken)
         .ConfigureAwait(false);
