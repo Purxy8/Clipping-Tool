@@ -18,6 +18,7 @@ public sealed class AppSettings
     public bool CaptureMicrophone { get; set; }
     public string? MicrophoneDeviceId { get; set; }
     public bool StartReplayWithWindows { get; set; }
+    public bool StartRecordingWithWindows { get; set; }
     public bool CheckForUpdatesAutomatically { get; set; }
     public bool PlayClipSavedSound { get; set; } = true;
     public string BackgroundColor { get; set; } = DefaultBackgroundColor;

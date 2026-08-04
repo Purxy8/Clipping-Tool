@@ -72,6 +72,16 @@ try
         return 0;
     }
 
+    if (args.Contains("--long-recording-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await RunLongRecordingSmokeAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            timeout.Token);
+        return 0;
+    }
+
     if (args.Contains("--wgc-matrix", StringComparer.OrdinalIgnoreCase))
     {
         await RunInteractiveCaptureMatrixAsync(args, artifactRoot, timeout.Token);
@@ -1813,6 +1823,138 @@ static async Task RunConcatTimingSmokeAsync(
         $"Concat: 1920x1080 at {media.AverageFrameRate:0.###} FPS, {media.FrameCount} frames, " +
         $"maximum frame delta {maxVideoFrameDelta * 1000:0.###} ms, " +
         $"A/V delta {avDurationDelta * 1000:0.###} ms, monotonic audio DTS.");
+}
+
+static async Task RunLongRecordingSmokeAsync(
+    FfmpegSetupService setup,
+    string ffmpeg,
+    string artifactRoot,
+    CancellationToken cancellationToken)
+{
+    const int framesPerSecond = 2;
+    const int segmentCount = 21_600;
+    var expectedDuration = TimeSpan.FromHours(12);
+    var ffprobe = setup.FindProbeExecutable()
+        ?? throw new InvalidOperationException(
+            "The verified FFprobe tool is unavailable for the long-recording smoke test.");
+    var runDirectory = Path.Combine(
+        artifactRoot,
+        $"long-recording-smoke-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(runDirectory);
+    var processRunner = new ClipMediaProcessRunner();
+    var seedPath = Path.Combine(runDirectory, "segment-seed.mkv");
+    IReadOnlyList<string> seedArguments =
+    [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "lavfi",
+        "-i", $"color=c=black:s=160x90:r={framesPerSecond}:d=2",
+        "-f", "lavfi",
+        "-i", "anullsrc=r=8000:cl=mono:d=2",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "45",
+        "-pix_fmt", "yuv420p",
+        "-g", "4",
+        "-keyint_min", "4",
+        "-sc_threshold", "0",
+        "-bf", "0",
+        "-c:a", "aac",
+        "-b:a", "16k",
+        "-ar", "8000",
+        "-ac", "1",
+        "-shortest",
+        "-f", "matroska",
+        "-y",
+        seedPath
+    ];
+    var generated = await processRunner.RunAsync(
+            ffmpeg,
+            seedArguments,
+            TimeSpan.FromMinutes(2),
+            cancellationToken)
+        .ConfigureAwait(false);
+    if (!generated.Succeeded ||
+        !File.Exists(seedPath) ||
+        new FileInfo(seedPath).Length == 0)
+    {
+        throw new InvalidDataException(
+            $"Long-recording seed generation failed: {generated.StandardError.Trim()}");
+    }
+
+    var manifestPath = Path.Combine(runDirectory, "manifest.txt");
+    await File.WriteAllLinesAsync(
+            manifestPath,
+            ReplayBufferService.BuildConcatManifestLines(
+                Enumerable.Repeat(seedPath, segmentCount)),
+            cancellationToken)
+        .ConfigureAwait(false);
+    var outputPath = Path.Combine(
+        runDirectory,
+        "Clip_2026-07-13_12-hour-recorder-smoke.mp4");
+    var exportTimer = Stopwatch.StartNew();
+    var export = await processRunner.RunAsync(
+            ffmpeg,
+            FfmpegArgumentBuilder.BuildConcatArguments(
+                manifestPath,
+                outputPath,
+                TimeSpan.Zero,
+                expectedDuration),
+            TimeSpan.FromMinutes(8),
+            cancellationToken)
+        .ConfigureAwait(false);
+    exportTimer.Stop();
+    if (!export.Succeeded ||
+        !File.Exists(outputPath) ||
+        new FileInfo(outputPath).Length == 0)
+    {
+        throw new InvalidDataException(
+            $"Synthetic 12-hour recording finalization failed: {export.StandardError.Trim()}");
+    }
+
+    var duration = await ReadDurationAsync(ffprobe, outputPath, cancellationToken)
+        .ConfigureAwait(false);
+    var media = await ReadMediaInfoAsync(ffprobe, outputPath, cancellationToken)
+        .ConfigureAwait(false);
+    if (Math.Abs(duration - expectedDuration.TotalSeconds) > 1 ||
+        media.Width != 160 ||
+        media.Height != 90 ||
+        Math.Abs(media.AverageFrameRate - framesPerSecond) > 0.1 ||
+        media.AudioStreamCount != 1)
+    {
+        throw new InvalidDataException(
+            $"Synthetic 12-hour recording validation failed: {duration:0.###}s, " +
+            $"{media.Width}x{media.Height}, {media.AverageFrameRate:0.###} FPS, " +
+            $"{media.AudioStreamCount} audio stream(s).");
+    }
+
+    var outputBytes = new FileInfo(outputPath).Length;
+    var reportPath = Path.Combine(runDirectory, "long-recording-report.json");
+    await File.WriteAllTextAsync(
+            reportPath,
+            JsonSerializer.Serialize(
+                new
+                {
+                    SegmentCount = segmentCount,
+                    DurationSeconds = duration,
+                    media.Width,
+                    media.Height,
+                    media.AverageFrameRate,
+                    media.AudioStreamCount,
+                    FinalizationMilliseconds = exportTimer.Elapsed.TotalMilliseconds,
+                    OutputBytes = outputBytes
+                },
+                new JsonSerializerOptions { WriteIndented = true }),
+            cancellationToken)
+        .ConfigureAwait(false);
+    Console.WriteLine(
+        $"PASS long recording: {segmentCount:N0} segments / {duration / 3600:0.###}h, " +
+        $"finalized in {exportTimer.Elapsed.TotalSeconds:0.###}s, " +
+        $"{outputBytes:N0} bytes, report {reportPath}");
 }
 
 static async Task RunReplayLengthMatrixAsync(

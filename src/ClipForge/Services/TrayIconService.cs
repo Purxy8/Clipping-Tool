@@ -30,7 +30,7 @@ public sealed class TrayIconService : IDisposable
 
         _notifyIcon = new Forms.NotifyIcon
         {
-            Text = "ClipForge — Replay off",
+            Text = "ClipForge - Capture off",
             Icon = _icon ?? SystemIcons.Application,
             ContextMenuStrip = menu,
             Visible = true
@@ -47,7 +47,7 @@ public sealed class TrayIconService : IDisposable
     public void UpdateStatus(string status, bool canSave)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var text = $"ClipForge — {status}";
+        var text = $"ClipForge - {status}";
         _notifyIcon.Text = text.Length <= 63 ? text : text[..63];
         _saveItem.Enabled = canSave;
     }
@@ -56,12 +56,12 @@ public sealed class TrayIconService : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _notifyIcon.BalloonTipTitle = "ClipForge is still running";
-        _notifyIcon.BalloonTipText = "Replay and shortcuts continue in the background. Double-click the tray icon to reopen ClipForge.";
+        _notifyIcon.BalloonTipText = "Capture and shortcuts continue in the background. Double-click the tray icon to reopen ClipForge.";
         _notifyIcon.BalloonTipIcon = Forms.ToolTipIcon.Info;
         _notifyIcon.ShowBalloonTip(3500);
     }
 
-    public void ShowReplayStartupFailure(string detail)
+    public void ShowCaptureStartupFailure(string detail)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var safeDetail = string.IsNullOrWhiteSpace(detail)
@@ -72,7 +72,7 @@ public sealed class TrayIconService : IDisposable
             safeDetail = $"{safeDetail[..217]}...";
         }
 
-        _notifyIcon.BalloonTipTitle = "Automatic replay did not start";
+        _notifyIcon.BalloonTipTitle = "Automatic capture did not start";
         _notifyIcon.BalloonTipText = safeDetail;
         _notifyIcon.BalloonTipIcon = Forms.ToolTipIcon.Warning;
         _notifyIcon.ShowBalloonTip(5000);

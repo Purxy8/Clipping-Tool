@@ -10,6 +10,37 @@ namespace ClipForge.Capture;
 internal static class CaptureGeometry
 {
     public static CaptureOutputSize ResolveOutputSize(
+        CaptureConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (!configuration.LockOutputGeometry)
+        {
+            return ResolveOutputSize(
+                configuration.Display,
+                configuration.Resolution);
+        }
+
+        if (configuration.LockedOutputWidth is not { } lockedWidth ||
+            configuration.LockedOutputHeight is not { } lockedHeight ||
+            lockedWidth < 2 ||
+            lockedHeight < 2 ||
+            lockedWidth % 2 != 0 ||
+            lockedHeight % 2 != 0)
+        {
+            throw new ArgumentException(
+                "Locked Recorder output geometry must contain positive even dimensions.",
+                nameof(configuration));
+        }
+
+        var liveWidth = MakeEven(configuration.Display.Width);
+        var liveHeight = MakeEven(configuration.Display.Height);
+        return new CaptureOutputSize(
+            lockedWidth,
+            lockedHeight,
+            RequiresScaling: liveWidth != lockedWidth || liveHeight != lockedHeight);
+    }
+
+    public static CaptureOutputSize ResolveOutputSize(
         DisplayOption display,
         ResolutionOption resolution)
     {
@@ -75,6 +106,16 @@ internal static class CaptureGeometry
                 StringComparison.OrdinalIgnoreCase) ||
             previousDisplay.MonitorIndex != currentDisplay.MonitorIndex)
         {
+            return true;
+        }
+
+        if (previousDisplay.RefreshRateHz > 0 &&
+            currentDisplay.RefreshRateHz > 0 &&
+            previousDisplay.RefreshRateHz != currentDisplay.RefreshRateHz)
+        {
+            // gfxcapture's minimum update interval is derived from the live
+            // refresh rate. Rebuild it when a game changes the display cadence;
+            // an unknown transient reading is not enough to force a restart.
             return true;
         }
 

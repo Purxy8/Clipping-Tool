@@ -519,9 +519,7 @@ internal static class FfmpegArgumentBuilder
 
     private static string BuildVideoFilter(CaptureConfiguration configuration)
     {
-        var output = CaptureGeometry.ResolveOutputSize(
-            configuration.Display,
-            configuration.Resolution);
+        var output = CaptureGeometry.ResolveOutputSize(configuration);
         if (!output.RequiresScaling)
         {
             return configuration.Display.Width % 2 == 0 && configuration.Display.Height % 2 == 0
@@ -545,9 +543,7 @@ internal static class FfmpegArgumentBuilder
 
         if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
         {
-            var output = CaptureGeometry.ResolveOutputSize(
-                configuration.Display,
-                configuration.Resolution);
+            var output = CaptureGeometry.ResolveOutputSize(configuration);
             var queuePackets = output.RequiresScaling ||
                                performanceProfile == CapturePerformanceProfile.Resilient
                 ? ScaledVideoInputQueuePackets
@@ -580,12 +576,13 @@ internal static class FfmpegArgumentBuilder
         CaptureConfiguration configuration,
         VideoEncodingStrategy encodingStrategy)
     {
-        var output = CaptureGeometry.ResolveOutputSize(
-            configuration.Display,
-            configuration.Resolution);
+        var output = CaptureGeometry.ResolveOutputSize(configuration);
+        var inputFrameRate = ResolveGraphicsCaptureInputFrameRate(
+            configuration.FramesPerSecond,
+            configuration.Display.RefreshRateHz);
         var filter = $"gfxcapture=monitor_idx={configuration.Display.MonitorIndex}" +
                      $":capture_cursor={(configuration.CaptureCursor ? "1" : "0")}" +
-                     $":max_framerate={Invariant(configuration.FramesPerSecond)}" +
+                     $":max_framerate={Invariant(inputFrameRate)}" +
                      ":output_fmt=bgra";
 
         if (output.RequiresScaling)
@@ -596,6 +593,10 @@ internal static class FfmpegArgumentBuilder
             // while a fullscreen game owns most of the GPU. The exact output path
             // is exercised by the runtime graphics-capture probe, which falls back
             // to a transfer or GDI when the selected adapter cannot sustain it.
+            // Recorder locks the encoded geometry for the complete session.
+            // Exclusive-fullscreen custom resolutions are resampled by WGC to
+            // this original canvas, so every 30-minute generation remains
+            // stream-copy compatible at finalization.
             filter += $":width={output.Width}:height={output.Height}" +
                       ":resize_mode=scale:scale_mode=point";
         }
@@ -622,6 +623,44 @@ internal static class FfmpegArgumentBuilder
             VideoEncoderKind.SoftwareX264 => filter + ",hwdownload,format=bgra,format=yuv420p",
             _ => filter + ",hwdownload,format=bgra"
         };
+    }
+
+    /// <summary>
+    /// WGC implements max_framerate as a minimum update interval. Asking a
+    /// 165-Hz desktop for exactly 60 updates admits every third refresh (about
+    /// 55 unique frames), which CFR then has to duplicate. The smallest rate
+    /// just above an integral refresh divisor avoids that alias while keeping
+    /// capture work well below the full high-refresh presentation rate.
+    /// </summary>
+    internal static int ResolveGraphicsCaptureInputFrameRate(
+        int outputFramesPerSecond,
+        int displayRefreshRateHz)
+    {
+        if (outputFramesPerSecond is < 1 or > 240)
+        {
+            throw new ArgumentOutOfRangeException(nameof(outputFramesPerSecond));
+        }
+
+        var maximumInputRate = Math.Min(
+            1000,
+            checked(outputFramesPerSecond * 2));
+        if (displayRefreshRateHz is < 24 or > 1000)
+        {
+            // Keep the proven low-overhead path when a remote/virtual driver
+            // cannot report VREFRESH. Verified high-refresh displays use the
+            // divisor-aware adjustment below.
+            return outputFramesPerSecond;
+        }
+
+        var refreshesPerFrame = Math.Max(
+            1,
+            displayRefreshRateHz / outputFramesPerSecond);
+        var divisorBoundary =
+            (double)displayRefreshRateHz / refreshesPerFrame;
+        return Math.Clamp(
+            checked((int)Math.Ceiling(divisorBoundary) + 1),
+            outputFramesPerSecond,
+            maximumInputRate);
     }
 
     private static bool UsesDirectWindowsGraphicsHardwarePath(

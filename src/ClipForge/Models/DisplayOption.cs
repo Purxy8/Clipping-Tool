@@ -8,7 +8,10 @@ public sealed record DisplayOption(
     int Width,
     int Height,
     bool IsPrimary,
-    int MonitorIndex = 0)
+    int MonitorIndex = 0,
+    int RefreshRateHz = 0)
 {
-    public override string ToString() => $"{Label} · {Width}×{Height}";
+    public override string ToString() => RefreshRateHz > 0
+        ? $"{Label} · {Width}×{Height} @ {RefreshRateHz} Hz"
+        : $"{Label} · {Width}×{Height}";
 }

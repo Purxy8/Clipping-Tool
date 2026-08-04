@@ -73,6 +73,7 @@ public partial class MainWindow : Window
         0);
     private bool _isInitializing = true;
     private bool _isClosing;
+    private bool _sessionEnding;
     private bool _exitRequested;
     private bool _engineReady;
     private bool _backgroundHintShown;
@@ -82,10 +83,19 @@ public partial class MainWindow : Window
     private DateTimeOffset _captureSafeLibraryRecoveryRetryNotBeforeUtc;
     private bool _captureCriticalPresentationActive;
     private bool _captureRestartInProgress;
+    private bool _captureModeTransitionInProgress;
+    private bool _captureConfigurationApplyDeferred;
+    private bool _deferredCaptureConfigurationRestartRequired;
+    private bool _captureCommandInProgress;
     private bool _captureRecoveryQueued;
     private bool _automaticCaptureSourceFallback;
     private bool _preferResilientSourceCapture;
     private bool _replayStartRequested;
+    private CaptureSessionMode? _requestedCaptureMode;
+    private bool _recordingSafetyCheckRunning;
+    private DateTimeOffset _recordingSafetyRetryNotBeforeUtc;
+    private bool _startupPreferenceChangeInProgress;
+    private int _autoStartIntentGeneration;
     private bool _playerSourceReleasedForBackground;
     private int _clipPlayerHostIndex = 1;
     private bool _isPlayerPlaying;
@@ -192,11 +202,21 @@ public partial class MainWindow : Window
             _settingsLoadOutcome = settingsLoad.Outcome;
             _settings.SaveClipHotkey ??= HotkeyGesture.DefaultSaveClip;
             _settings.ToggleOverlayHotkey ??= HotkeyGesture.DefaultToggleOverlay;
+            NormalizeAutomaticCapturePreferences(_settings);
             _settings.RecentClipCount = AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount);
             PopulateControls();
             _settingsControlsPopulated = true;
             SyncSaveDirectoryFromControls();
             await RefreshEngineStateAsync(forceVerification: false);
+            if (await _replayBufferService.TryLoadPendingRecordingAsync(
+                    _settings.SaveDirectory,
+                    _lifetimeCancellation.Token))
+            {
+                _requestedCaptureMode = CaptureSessionMode.Recording;
+                ShowError(
+                    "ClipForge recovered a stopped Recorder session. Select Retry save before starting a new capture.");
+            }
+
             UpdateStorageText();
             InitializeUpdateControls();
 
@@ -234,7 +254,8 @@ public partial class MainWindow : Window
                 _launchOptions.IsAutoStart,
                 initializationCompleted,
                 _settingsLoadOutcome,
-                _settings.StartReplayWithWindows);
+                _settings.StartReplayWithWindows ||
+                _settings.StartRecordingWithWindows);
             if (staleAutoStartLaunch)
             {
                 try
@@ -256,25 +277,37 @@ public partial class MainWindow : Window
             {
                 if (_launchOptions.IsAutoStart && !initializationCompleted)
                 {
-                    _trayIconService.ShowReplayStartupFailure(
+                    _trayIconService.ShowCaptureStartupFailure(
                         "ClipForge could not finish initialization. Open it from the tray to review the error.");
                 }
-                else if (_launchOptions.IsAutoStart && _settings.StartReplayWithWindows && !_engineReady)
+                else if (_launchOptions.IsAutoStart &&
+                         (_settings.StartReplayWithWindows ||
+                          _settings.StartRecordingWithWindows) &&
+                         !_engineReady)
                 {
-                    _trayIconService.ShowReplayStartupFailure(
-                        "Install the ClipForge capture engine, then start replay once from the app.");
+                    _trayIconService.ShowCaptureStartupFailure(
+                        "Install the ClipForge capture engine, then start capture once from the app.");
                 }
-                var shouldAutoStartReplay = ShouldAutoStartReplay(
+                var automaticCaptureMode = ResolveAutomaticCaptureMode(
                     _launchOptions.IsAutoStart,
                     _settings.StartReplayWithWindows,
+                    _settings.StartRecordingWithWindows,
                     initializationCompleted,
                     _engineReady,
-                    _replayBufferService.IsRunning,
+                    _replayBufferService.IsRunning ||
+                    _replayBufferService.HasPendingRecording,
                     _isClosing);
-                await RunAutoStartReplaySequenceAsync(
-                    shouldAutoStartReplay,
-                    PreloadClipLibraryBeforeAutoStartAsync,
-                    StartReplayAfterWindowsLoginAsync);
+                if (automaticCaptureMode == CaptureSessionMode.InstantReplay)
+                {
+                    await RunAutoStartReplaySequenceAsync(
+                        shouldAutoStartReplay: true,
+                        PreloadClipLibraryBeforeAutoStartAsync,
+                        StartReplayAfterWindowsLoginAsync);
+                }
+                else if (automaticCaptureMode == CaptureSessionMode.Recording)
+                {
+                    await StartRecordingAfterWindowsLoginAsync();
+                }
 
                 _ = RunAutomaticUpdateCheckAsync();
                 _ = RefreshClipLibraryAsync();
@@ -327,12 +360,18 @@ public partial class MainWindow : Window
         AutoUpdateCheckBox.IsChecked = _settings.CheckForUpdatesAutomatically;
         ClipSavedSoundCheckBox.IsChecked = _settings.PlayClipSavedSound;
         StartReplayWithWindowsCheckBox.IsChecked = _settings.StartReplayWithWindows;
+        StartRecordingWithWindowsCheckBox.IsChecked =
+            _settings.StartRecordingWithWindows;
         StartReplayWithWindowsCheckBox.IsEnabled = _startupRegistrationService.IsSupported;
-        StartupHintText.Text = !StartReplayWithWindowsCheckBox.IsEnabled
+        StartRecordingWithWindowsCheckBox.IsEnabled =
+            _startupRegistrationService.IsSupported;
+        StartupHintText.Text = !_startupRegistrationService.IsSupported
             ? "Install ClipForge Setup to enable automatic Windows startup."
             : _settings.StartReplayWithWindows
                 ? "Enabled. ClipForge will start hidden and begin replay after you sign in."
-                : "ClipForge starts hidden in the tray and uses your saved capture settings.";
+                : _settings.StartRecordingWithWindows
+                    ? "Enabled. ClipForge will start hidden and begin Recorder after you sign in."
+                    : "ClipForge will not start automatically with Windows.";
         RecentClipCountComboBox.ItemsSource = RecentClipCountOptions;
         RecentClipCountComboBox.SelectedItem = _settings.RecentClipCount;
         AppearanceTargetComboBox.ItemsSource = AppearanceTargetOptions;
@@ -375,11 +414,19 @@ public partial class MainWindow : Window
             return;
         }
 
+        _ = Interlocked.Increment(ref _autoStartIntentGeneration);
+
         await RunCaptureCommandAsync(async () =>
         {
             if (_replayBufferService.IsRunning)
             {
+                if (IsRecorderSession)
+                {
+                    return;
+                }
+
                 _replayStartRequested = false;
+                _requestedCaptureMode = null;
                 ResetAutomaticCaptureRecovery();
                 await _replayBufferService.StopAsync();
             }
@@ -389,6 +436,142 @@ public partial class MainWindow : Window
                 await StartReplayCoreAsync();
             }
         });
+    }
+
+    private async void RecordToggleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isClosing)
+        {
+            return;
+        }
+
+        _ = Interlocked.Increment(ref _autoStartIntentGeneration);
+
+        await RunCaptureCommandAsync(async () =>
+        {
+            if (_replayBufferService.CanDiscardIncompleteRecording)
+            {
+                var confirmation = MessageBox.Show(
+                    this,
+                    "This stopped Recorder session has no complete safe video to save. " +
+                    "Discarding it permanently deletes its remaining incomplete source files.\n\n" +
+                    "Discard the incomplete recording?",
+                    "Discard incomplete recording",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning,
+                    MessageBoxResult.No);
+                if (confirmation != MessageBoxResult.Yes)
+                {
+                    return;
+                }
+
+                await _replayBufferService.DiscardIncompleteRecordingAsync(
+                    _lifetimeCancellation.Token);
+                _requestedCaptureMode = null;
+                SetCaptureCriticalPresentationState(isActive: false);
+                return;
+            }
+
+            if (IsRecorderSession)
+            {
+                await StopRecordingAndSaveCoreAsync();
+                return;
+            }
+
+            _captureModeTransitionInProgress = true;
+            SetCaptureCriticalPresentationState(isActive: true);
+            try
+            {
+                var restoreSourceSafetyMode = _automaticCaptureSourceFallback;
+                var restoreResilientProfile =
+                    _preferResilientSourceCapture ||
+                    _replayBufferService.ActiveCapturePerformanceProfile ==
+                        CapturePerformanceProfile.Resilient;
+                await PreflightRecorderStartAsync();
+                var restoreReplayOnFailure =
+                    _replayBufferService.IsRunning && !IsRecorderSession;
+                if (_replayBufferService.IsRunning)
+                {
+                    // A single service and a single command gate enforce the hard
+                    // no-overlap rule: Replay is fully stopped before Recorder can
+                    // create its capture process.
+                    _replayStartRequested = false;
+                    _requestedCaptureMode = null;
+                    ResetAutomaticCaptureRecovery();
+                    await _replayBufferService.StopAsync();
+                }
+
+                ResetAutomaticCaptureRecovery();
+                try
+                {
+                    await StartCaptureCoreAsync(CaptureSessionMode.Recording);
+                }
+                catch (Exception recorderException) when (
+                    restoreReplayOnFailure && !_isClosing)
+                {
+                    try
+                    {
+                        ResetAutomaticCaptureRecovery();
+                        await StartReplayCoreAsync(
+                            sourceSafetyMode: restoreSourceSafetyMode,
+                            retainResilientProfile:
+                                !restoreSourceSafetyMode && restoreResilientProfile);
+                        _automaticCaptureSourceFallback = restoreSourceSafetyMode;
+                    }
+                    catch (Exception replayException)
+                    {
+                        throw new InvalidOperationException(
+                            $"Recorder could not start, and Instant Replay could not be restored. Recorder: {recorderException.Message} Replay: {replayException.Message}",
+                            new AggregateException(recorderException, replayException));
+                    }
+
+                    throw new InvalidOperationException(
+                        $"Recorder could not start, so Instant Replay was restored. {recorderException.Message}",
+                        recorderException);
+                }
+            }
+            finally
+            {
+                _captureModeTransitionInProgress = false;
+                SetCaptureCriticalPresentationState(
+                    IsRecorderSession ||
+                    IsCapturePresentationSuspendedState(_latestState));
+            }
+        });
+    }
+
+    private async Task StopRecordingAndSaveCoreAsync()
+    {
+        if (!IsRecorderSession)
+        {
+            return;
+        }
+
+        _replayStartRequested = false;
+        ResetAutomaticCaptureRecovery();
+        var committed = false;
+        try
+        {
+            var path = await _replayBufferService.StopAndSaveRecordingAsync(
+                _settings.SaveDirectory,
+                CancellationToken.None);
+            committed = true;
+            _requestedCaptureMode = null;
+            ShowLastSaved(path);
+            _clipSavedSoundService.TryPlay(_settings.PlayClipSavedSound);
+        }
+        finally
+        {
+            if (!_replayBufferService.IsRunning)
+            {
+                _requestedCaptureMode = committed
+                    ? null
+                    : _replayBufferService.HasUnfinishedRecording
+                        ? CaptureSessionMode.Recording
+                        : null;
+                SetCaptureCriticalPresentationState(IsRecorderSession);
+            }
+        }
     }
 
     private async void SaveClipButton_Click(object sender, RoutedEventArgs e) =>
@@ -401,7 +584,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!_replayBufferService.IsRunning)
+        if (!_replayBufferService.IsRunning || IsRecorderSession)
         {
             ShowError("Start Instant Replay before saving a clip.");
             return;
@@ -506,7 +689,8 @@ public partial class MainWindow : Window
         UpdatePrimaryActionText();
         UpdateStorageText();
         if (ReplayLengthComboBox.SelectedItem is ReplayLengthOption replayLength &&
-            _replayBufferService.IsRunning)
+            _replayBufferService.IsRunning &&
+            !IsRecorderSession)
         {
             _replayBufferService.UpdateRetention(replayLength.Duration);
         }
@@ -597,6 +781,22 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Recorder keeps one stable media format for the full session. Its
+        // capture controls are disabled in the UI, and a late queued change is
+        // ignored rather than deleting or corrupting the accumulated session.
+        if (_captureCommandInProgress || _captureModeTransitionInProgress)
+        {
+            _captureConfigurationApplyDeferred = true;
+            _deferredCaptureConfigurationRestartRequired |= restartRequired;
+            return;
+        }
+
+        if (IsRecorderSession)
+        {
+            UpdateControlsForState(_latestState);
+            return;
+        }
+
         // Read the controls only after the debounce. A rapid series of WPF
         // SelectionChanged/Checked events therefore persists and applies the
         // final UI state instead of restarting capture once per intermediate
@@ -614,7 +814,7 @@ public partial class MainWindow : Window
                 resetProfilePreference: false);
             await RunCaptureCommandAsync(async () =>
             {
-                if (_isClosing)
+                if (_isClosing || IsRecorderSession)
                 {
                     return;
                 }
@@ -645,7 +845,8 @@ public partial class MainWindow : Window
                     await _replayBufferService.StopAsync();
                     if (!_isClosing && _replayStartRequested)
                     {
-                        await StartReplayCoreAsync(
+                        await StartCaptureCoreAsync(
+                            _requestedCaptureMode ?? CaptureSessionMode.InstantReplay,
                             retainResilientProfile:
                                 retainResilientProfile);
                     }
@@ -659,6 +860,22 @@ public partial class MainWindow : Window
                 }
             });
         }
+    }
+
+    private void DispatchDeferredCaptureConfigurationChange()
+    {
+        if (!_captureConfigurationApplyDeferred ||
+            _captureCommandInProgress ||
+            _captureModeTransitionInProgress ||
+            _isClosing)
+        {
+            return;
+        }
+
+        var restartRequired = _deferredCaptureConfigurationRestartRequired;
+        _captureConfigurationApplyDeferred = false;
+        _deferredCaptureConfigurationRestartRequired = false;
+        _ = CaptureConfigurationChangedAsync(restartRequired);
     }
 
     private async Task<Exception?> RunCaptureCommandAsync(Func<Task> command, bool showError = true)
@@ -675,7 +892,12 @@ public partial class MainWindow : Window
                 return null;
             }
 
+            _captureCommandInProgress = true;
             BufferToggleButton.IsEnabled = false;
+            RecordToggleButton.IsEnabled = false;
+            SetCaptureSettingsEnabled(enabled: false);
+            BrowseButton.IsEnabled = false;
+            UpdateActionButton.IsEnabled = false;
             HideError();
             await command();
         }
@@ -686,6 +908,12 @@ public partial class MainWindow : Window
         catch (Exception exception)
         {
             commandError = exception;
+            if (!_replayBufferService.IsRunning)
+            {
+                SetCaptureCriticalPresentationState(
+                    IsRecorderSession || _captureRestartInProgress);
+            }
+
             if (showError)
             {
                 ShowError(exception.Message);
@@ -695,8 +923,11 @@ public partial class MainWindow : Window
         {
             if (gateEntered)
             {
+                _captureCommandInProgress = false;
                 _captureCommandGate.Release();
                 UpdateControlsForState(_latestState);
+                UpdateControlsForState(_appUpdateService.Snapshot);
+                DispatchDeferredCaptureConfigurationChange();
             }
         }
 
@@ -716,6 +947,45 @@ public partial class MainWindow : Window
         engineReady &&
         !replayRunning &&
         !isClosing;
+
+    internal static CaptureSessionMode? ResolveAutomaticCaptureMode(
+        bool isAutoStartLaunch,
+        bool replayPreferenceEnabled,
+        bool recordingPreferenceEnabled,
+        bool initializationCompleted,
+        bool engineReady,
+        bool captureRunning,
+        bool isClosing)
+    {
+        if (!isAutoStartLaunch ||
+            !initializationCompleted ||
+            !engineReady ||
+            captureRunning ||
+            isClosing)
+        {
+            return null;
+        }
+
+        // Fail safe if settings were hand-edited or came from a partial write:
+        // replay is bounded and must win over an unexpected all-day recording.
+        if (replayPreferenceEnabled)
+        {
+            return CaptureSessionMode.InstantReplay;
+        }
+
+        return recordingPreferenceEnabled
+            ? CaptureSessionMode.Recording
+            : null;
+    }
+
+    internal static void NormalizeAutomaticCapturePreferences(AppSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (settings.StartReplayWithWindows && settings.StartRecordingWithWindows)
+        {
+            settings.StartRecordingWithWindows = false;
+        }
+    }
 
     internal static bool ShouldRemoveStaleAutoStartRegistration(
         bool isAutoStartLaunch,
@@ -814,29 +1084,57 @@ public partial class MainWindow : Window
 
     private async Task StartReplayAfterWindowsLoginAsync()
     {
+        var intentGeneration = Volatile.Read(ref _autoStartIntentGeneration);
         try
         {
-            ResetAutomaticCaptureRecovery();
             // Windows can report the signed-in desktop before GPU and audio
             // endpoints are fully ready. Give them a short bounded window.
             await Task.Delay(TimeSpan.FromSeconds(3), _lifetimeCancellation.Token);
+            if (!IsAutomaticStartStillEligible(
+                    CaptureSessionMode.InstantReplay,
+                    intentGeneration))
+            {
+                return;
+            }
 
+            ResetAutomaticCaptureRecovery();
             var error = await RunCaptureCommandAsync(
-                () => StartReplayCoreAsync(),
+                () => IsAutomaticStartStillEligible(
+                        CaptureSessionMode.InstantReplay,
+                        intentGeneration)
+                    ? StartReplayCoreAsync()
+                    : Task.CompletedTask,
                 showError: false);
-            if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
+            if (error is not null &&
+                IsAutomaticStartStillEligible(
+                    CaptureSessionMode.InstantReplay,
+                    intentGeneration))
             {
                 await Task.Delay(TimeSpan.FromSeconds(4), _lifetimeCancellation.Token);
+                if (!IsAutomaticStartStillEligible(
+                        CaptureSessionMode.InstantReplay,
+                        intentGeneration))
+                {
+                    return;
+                }
+
                 error = await RunCaptureCommandAsync(
-                    () => StartReplayCoreAsync(),
+                    () => IsAutomaticStartStillEligible(
+                            CaptureSessionMode.InstantReplay,
+                            intentGeneration)
+                        ? StartReplayCoreAsync()
+                        : Task.CompletedTask,
                     showError: false);
             }
 
-            if (error is not null && !_lifetimeCancellation.IsCancellationRequested)
+            if (error is not null &&
+                IsAutomaticStartStillEligible(
+                    CaptureSessionMode.InstantReplay,
+                    intentGeneration))
             {
                 var message = $"Automatic replay could not start. {error.Message}";
                 ShowError(message);
-                _trayIconService.ShowReplayStartupFailure(error.Message);
+                _trayIconService.ShowCaptureStartupFailure(error.Message);
             }
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
@@ -845,35 +1143,231 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task StartRecordingAfterWindowsLoginAsync()
+    {
+        var intentGeneration = Volatile.Read(ref _autoStartIntentGeneration);
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), _lifetimeCancellation.Token);
+            if (!IsAutomaticStartStillEligible(
+                    CaptureSessionMode.Recording,
+                    intentGeneration))
+            {
+                return;
+            }
+
+            ResetAutomaticCaptureRecovery();
+            var error = await RunCaptureCommandAsync(
+                () => IsAutomaticStartStillEligible(
+                        CaptureSessionMode.Recording,
+                        intentGeneration)
+                    ? StartCaptureCoreAsync(CaptureSessionMode.Recording)
+                    : Task.CompletedTask,
+                showError: false);
+            if (error is not null &&
+                IsAutomaticStartStillEligible(
+                    CaptureSessionMode.Recording,
+                    intentGeneration))
+            {
+                await Task.Delay(TimeSpan.FromSeconds(4), _lifetimeCancellation.Token);
+                if (!IsAutomaticStartStillEligible(
+                        CaptureSessionMode.Recording,
+                        intentGeneration))
+                {
+                    return;
+                }
+
+                error = await RunCaptureCommandAsync(
+                    () => IsAutomaticStartStillEligible(
+                            CaptureSessionMode.Recording,
+                            intentGeneration)
+                        ? StartCaptureCoreAsync(CaptureSessionMode.Recording)
+                        : Task.CompletedTask,
+                    showError: false);
+            }
+
+            if (error is not null &&
+                IsAutomaticStartStillEligible(
+                    CaptureSessionMode.Recording,
+                    intentGeneration))
+            {
+                var message = $"Automatic Recorder could not start. {error.Message}";
+                ShowError(message);
+                _trayIconService.ShowCaptureStartupFailure(error.Message);
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Windows is signing out or ClipForge is exiting.
+        }
+    }
+
+    private bool IsAutomaticStartStillEligible(
+        CaptureSessionMode mode,
+        int intentGeneration) =>
+        !_isClosing &&
+        !_lifetimeCancellation.IsCancellationRequested &&
+        Volatile.Read(ref _autoStartIntentGeneration) == intentGeneration &&
+        !_replayBufferService.IsRunning &&
+        !_replayBufferService.HasUnfinishedRecording &&
+        (mode == CaptureSessionMode.InstantReplay
+            ? _settings.StartReplayWithWindows &&
+              !_settings.StartRecordingWithWindows
+            : _settings.StartRecordingWithWindows &&
+              !_settings.StartReplayWithWindows);
+
     private async Task StartReplayCoreAsync(
         bool sourceSafetyMode = false,
         VideoEncodingStrategy? sessionStrategyOverride = null,
         bool retainResilientProfile = false)
     {
-        if (_clipTrimService.HasReplayBlockingTrimWork)
+        await StartCaptureCoreAsync(
+            CaptureSessionMode.InstantReplay,
+            sourceSafetyMode,
+            sessionStrategyOverride,
+            retainResilientProfile);
+    }
+
+    private async Task PreflightRecorderStartAsync()
+    {
+        if (_clipTrimService.HasActiveTrimWork ||
+            _libraryWindow?.IsTrimInProgress == true)
         {
             throw new InvalidOperationException(
-                "Wait for the trim export to finish or cancel it before starting Instant Replay.");
+                "Wait for the trim export to finish or cancel it before starting Recorder.");
         }
 
         if (_ffmpegSetupService.FindExecutable() is null)
         {
             InstallEnginePanel.Visibility = Visibility.Visible;
-            throw new InvalidOperationException("Install the capture engine before starting Instant Replay.");
+            throw new InvalidOperationException(
+                "Install the capture engine before starting Recorder.");
+        }
+
+        if (_appUpdateService.Snapshot.State is
+            AppUpdateState.Downloading or AppUpdateState.ReadyToRestart)
+        {
+            throw new InvalidOperationException(
+                "Finish or apply the pending ClipForge update before starting Recorder.");
         }
 
         SyncSettingsFromControls();
         SyncSaveDirectoryFromControls();
         await PersistSettingsAsync();
-        if (_clipTrimService.HasReplayBlockingTrimWork)
+        if (!IsDefinitelyFixedLocalPath(_settings.SaveDirectory))
         {
             throw new InvalidOperationException(
-                "Wait for the trim export to finish or cancel it before starting Instant Replay.");
+                "Recorder requires a fixed local drive. Choose a folder on an internal disk before starting.");
         }
 
-        var configuration = BuildCaptureConfiguration();
+        var saveDirectory = _settings.SaveDirectory;
+        var availableFreeBytes = await Task.Run(() =>
+        {
+            Directory.CreateDirectory(saveDirectory);
+            return ReplayBufferService.TryGetAvailableFreeSpace(saveDirectory);
+        }, _lifetimeCancellation.Token);
+        if (availableFreeBytes is null ||
+            !RecordingStoragePolicy.HasStartCapacity(availableFreeBytes.Value))
+        {
+            throw new IOException(
+                $"Recorder needs at least {StorageEstimator.FormatBytes(RecordingStoragePolicy.MinimumStartFreeBytes)} free on the selected drive before it can start.");
+        }
+
+        // Resolve the live display/audio selection while Replay is still intact.
+        // StartCaptureCore repeats this after Replay stops to close a hot-plug race.
+        _ = BuildCaptureConfiguration();
+    }
+
+    private async Task StartCaptureCoreAsync(
+        CaptureSessionMode sessionMode,
+        bool sourceSafetyMode = false,
+        VideoEncodingStrategy? sessionStrategyOverride = null,
+        bool retainResilientProfile = false)
+    {
+        // Close the trim/player/library admission window before any preflight
+        // await. RunCaptureCommandAsync restores presentation if startup fails.
+        SetCaptureCriticalPresentationState(isActive: true);
+        if (sessionMode == CaptureSessionMode.Recording
+                ? _clipTrimService.HasActiveTrimWork
+                : _clipTrimService.HasReplayBlockingTrimWork)
+        {
+            throw new InvalidOperationException(
+                "Wait for the trim export to finish or cancel it before starting capture.");
+        }
+
+        if (_ffmpegSetupService.FindExecutable() is null)
+        {
+            InstallEnginePanel.Visibility = Visibility.Visible;
+            throw new InvalidOperationException("Install the capture engine before starting capture.");
+        }
+
+        if (sessionMode == CaptureSessionMode.Recording &&
+            _appUpdateService.Snapshot.State is
+                AppUpdateState.Downloading or AppUpdateState.ReadyToRestart)
+        {
+            throw new InvalidOperationException(
+                "Finish or apply the pending ClipForge update before starting Recorder.");
+        }
+
+        SyncSettingsFromControls();
+        SyncSaveDirectoryFromControls();
+        await PersistSettingsAsync();
+        if (sessionMode == CaptureSessionMode.Recording
+                ? _clipTrimService.HasActiveTrimWork
+                : _clipTrimService.HasReplayBlockingTrimWork)
+        {
+            throw new InvalidOperationException(
+                "Wait for the trim export to finish or cancel it before starting capture.");
+        }
+
+        if (sessionMode == CaptureSessionMode.Recording)
+        {
+            if (!IsDefinitelyFixedLocalPath(_settings.SaveDirectory))
+            {
+                throw new InvalidOperationException(
+                    "Recorder requires a fixed local drive. Choose a folder on an internal disk before starting.");
+            }
+
+            var saveDirectory = _settings.SaveDirectory;
+            var availableFreeBytes = await Task.Run(() =>
+            {
+                Directory.CreateDirectory(saveDirectory);
+                return ReplayBufferService.TryGetAvailableFreeSpace(saveDirectory);
+            }, _lifetimeCancellation.Token);
+            if (availableFreeBytes is null ||
+                !RecordingStoragePolicy.HasStartCapacity(availableFreeBytes.Value))
+            {
+                throw new IOException(
+                    $"Recorder needs at least {StorageEstimator.FormatBytes(RecordingStoragePolicy.MinimumStartFreeBytes)} free on the selected drive before it can start.");
+            }
+        }
+
+        var baseConfiguration = BuildCaptureConfiguration();
+        var initialOutputSize = CaptureGeometry.ResolveOutputSize(
+            baseConfiguration.Display,
+            baseConfiguration.Resolution);
+        var configuration = baseConfiguration with
+        {
+            SessionMode = sessionMode,
+            LockOutputGeometry = sessionMode == CaptureSessionMode.Recording,
+            LockedOutputWidth = sessionMode == CaptureSessionMode.Recording
+                ? initialOutputSize.Width
+                : null,
+            LockedOutputHeight = sessionMode == CaptureSessionMode.Recording
+                ? initialOutputSize.Height
+                : null,
+            Retention = sessionMode == CaptureSessionMode.Recording
+                ? RecordingStoragePolicy.EngineRetention
+                : baseConfiguration.Retention
+        };
         if (sourceSafetyMode)
         {
+            if (sessionMode == CaptureSessionMode.Recording)
+            {
+                throw new InvalidOperationException(
+                    "Recorder recovery keeps the session's original media format and cannot switch to Source safety mode.");
+            }
+
             if (sessionStrategyOverride is not null)
             {
                 throw new InvalidOperationException(
@@ -888,14 +1382,31 @@ public partial class MainWindow : Window
         // Decoder graphs, media helpers, and thumbnail refreshes are presentation
         // work. Release them before FFmpeg starts so capture owns the available
         // GPU/CPU headroom and cannot feed preview audio back into desktop capture.
-        SetCaptureCriticalPresentationState(isActive: true);
         try
         {
             // Cancellation is cooperative: wait until both gallery refresh pipelines
             // have actually unwound before starting capture. This prevents a late
             // ffprobe/thumbnail helper from overlapping the first replay frames.
             await WaitForAutomaticLibraryWorkIdleAsync(_lifetimeCancellation.Token);
+            if (_libraryWindow?.IsTrimInProgress == true ||
+                (sessionMode == CaptureSessionMode.Recording
+                    ? _clipTrimService.HasActiveTrimWork
+                    : _clipTrimService.HasReplayBlockingTrimWork))
+            {
+                throw new InvalidOperationException(
+                    "A trim operation began while capture was preparing. Wait for it to finish and try again.");
+            }
+
+            if (sessionMode == CaptureSessionMode.Recording &&
+                _appUpdateService.Snapshot.State is
+                    AppUpdateState.Downloading or AppUpdateState.ReadyToRestart)
+            {
+                throw new InvalidOperationException(
+                    "Finish or apply the pending ClipForge update before starting Recorder.");
+            }
+
             _replayStartRequested = true;
+            _requestedCaptureMode = sessionMode;
             if (sessionStrategyOverride is null &&
                 !sourceSafetyMode &&
                 !retainResilientProfile)
@@ -929,12 +1440,41 @@ public partial class MainWindow : Window
         {
             if (!_replayBufferService.IsRunning)
             {
-                SetCaptureCriticalPresentationState(_captureRestartInProgress);
+                _replayStartRequested = false;
+                _requestedCaptureMode = null;
+                SetCaptureCriticalPresentationState(
+                    _captureRestartInProgress || _captureModeTransitionInProgress);
             }
 
             throw;
         }
     }
+
+    private bool IsRecorderSession
+    {
+        get
+        {
+            if (_replayBufferService.HasPendingRecording)
+            {
+                return true;
+            }
+
+            var requestedMode = _requestedCaptureMode;
+            var effectiveMode = requestedMode ??
+                _replayBufferService.ActiveSessionMode;
+            return effectiveMode == CaptureSessionMode.Recording &&
+                   (_replayBufferService.IsRunning ||
+                    _replayBufferService.HasUnfinishedRecording ||
+                    requestedMode == CaptureSessionMode.Recording &&
+                    (_captureModeTransitionInProgress ||
+                     _captureCommandInProgress ||
+                     IsReplaySessionState(_latestState)));
+        }
+    }
+
+    private bool IsInstantReplaySession =>
+        (_replayBufferService.IsRunning || IsReplaySessionState(_latestState)) &&
+        !IsRecorderSession;
 
     private CaptureConfiguration BuildCaptureConfiguration()
     {
@@ -1101,18 +1641,31 @@ public partial class MainWindow : Window
 
             if (currentDisplay is null)
             {
+                var lostRecorderSession = IsRecorderSession;
                 if (_replayBufferService.IsRunning)
                 {
-                    await RunCaptureCommandAsync(
-                        () => _replayBufferService.StopAsync(),
-                        showError: false);
+                    if (lostRecorderSession)
+                    {
+                        await RunCaptureCommandAsync(
+                            StopRecordingAndSaveCoreAsync,
+                            showError: false);
+                    }
+                    else
+                    {
+                        _replayStartRequested = false;
+                        _requestedCaptureMode = null;
+                        await RunCaptureCommandAsync(
+                            () => _replayBufferService.StopAsync(),
+                            showError: false);
+                    }
                 }
 
                 var detail = lastDiscoveryError is null
                     ? "The selected display did not return after Windows resumed."
                     : $"Windows could not enumerate the selected display. {lastDiscoveryError.Message}";
-                ShowError(
-                    $"{detail} Instant Replay was stopped safely and will retry when Windows reports that the display has returned.");
+                ShowError(lostRecorderSession
+                    ? $"{detail} Recorder stopped and preserved the session safely. Retry saving if finalization did not complete."
+                    : $"{detail} Instant Replay was stopped safely. Start it again after the display returns.");
                 return;
             }
 
@@ -1134,7 +1687,17 @@ public partial class MainWindow : Window
                         _replayBufferService.LastCapturePlan,
                         currentDisplay))
                 {
-                    await CaptureConfigurationChangedAsync(restartRequired: true);
+                    if (IsRecorderSession &&
+                        await _replayBufferService.UpdateActiveDisplayForRefreshAsync(
+                            currentDisplay,
+                            refreshCancellation.Token))
+                    {
+                        QueueSameGeometryWgcRefresh();
+                    }
+                    else
+                    {
+                        await CaptureConfigurationChangedAsync(restartRequired: true);
+                    }
                 }
                 else if (forceWgcRenewal)
                 {
@@ -1165,6 +1728,18 @@ public partial class MainWindow : Window
                 _captureRestartInProgress,
                 _replayBufferService.LastCapturePlan,
                 currentDisplay);
+            if (restartRequired && IsRecorderSession &&
+                await _replayBufferService.UpdateActiveDisplayForRefreshAsync(
+                    currentDisplay,
+                    refreshCancellation.Token))
+            {
+                // Full-session output geometry is locked at launch. Reacquire
+                // WGC/GDI with the live desktop metadata while retaining the
+                // stable encoded canvas and all known-good earlier segments.
+                QueueSameGeometryWgcRefresh();
+                return;
+            }
+
             await CaptureConfigurationChangedAsync(restartRequired);
             if (forceWgcRenewal && !restartRequired)
             {
@@ -1368,6 +1943,9 @@ public partial class MainWindow : Window
         _settings.CaptureMicrophone = MicrophoneCheckBox.IsChecked == true;
         _settings.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceOption)?.Id;
         _settings.StartReplayWithWindows = StartReplayWithWindowsCheckBox.IsChecked == true;
+        _settings.StartRecordingWithWindows =
+            StartRecordingWithWindowsCheckBox.IsChecked == true;
+        NormalizeAutomaticCapturePreferences(_settings);
         _settings.CheckForUpdatesAutomatically = AutoUpdateCheckBox.IsChecked == true;
         _settings.PlayClipSavedSound = ClipSavedSoundCheckBox.IsChecked == true;
         _settings.BackgroundColor = AppSettings.NormalizeBackgroundColor(_settings.BackgroundColor);
@@ -1803,6 +2381,7 @@ public partial class MainWindow : Window
                     eventArgs.Reason == CaptureRecoveryReason.ScheduledRefresh;
                 var usesRecoveryBudget =
                     UsesAutomaticCaptureRecoveryBudget(eventArgs.Reason);
+                var recoveringRecorder = IsRecorderSession;
                 if (usesRecoveryBudget && _automaticCaptureRecoveryCount >= 2)
                 {
                     _ = _replayBufferService.SuppressCaptureFaultRecovery(
@@ -1812,12 +2391,23 @@ public partial class MainWindow : Window
                     // would present a replay session that can never save,
                     // especially on GDI where no age-based WGC renewal exists.
                     _replayStartRequested = false;
-                    await _replayBufferService.StopAsync();
-                    ShowError(
-                        "Capture pacing is still unstable after automatic recovery. " +
-                        "ClipForge stopped Instant Replay safely instead of saving " +
-                        "a damaged clip or restarting in a loop. Start replay again " +
-                        "after closing other capture tools or changing the game display mode.");
+                    if (recoveringRecorder)
+                    {
+                        await StopRecordingAndSaveCoreAsync();
+                        ShowError(
+                            "Capture pacing remained unstable, so Recorder stopped and saved the known-good session instead of looping or keeping damaged media.");
+                    }
+                    else
+                    {
+                        _requestedCaptureMode = null;
+                        await _replayBufferService.StopAsync();
+                        ShowError(
+                            "Capture pacing is still unstable after automatic recovery. " +
+                            "ClipForge stopped Instant Replay safely instead of saving " +
+                            "a damaged clip or restarting in a loop. Start replay again " +
+                            "after closing other capture tools or changing the game display mode.");
+                    }
+
                     return;
                 }
 
@@ -1829,7 +2419,8 @@ public partial class MainWindow : Window
                     CaptureGeometry.ResolveOutputSize(
                         activePlan.Display,
                         activePlan.Resolution).RequiresScaling;
-                var useSourceSafetyMode = ShouldUseSourceSafetyRecovery(
+                var useSourceSafetyMode = !recoveringRecorder &&
+                    ShouldUseSourceSafetyRecovery(
                     activePlan?.Strategy.CaptureBackend,
                     usesRecoveryBudget,
                     _automaticCaptureRecoveryCount,
@@ -1925,6 +2516,7 @@ public partial class MainWindow : Window
                     if (suspendPresentation)
                     {
                         SetCaptureCriticalPresentationState(
+                            IsRecorderSession ||
                             IsCapturePresentationSuspendedState(_latestState));
                     }
 
@@ -2018,7 +2610,10 @@ public partial class MainWindow : Window
         }
 
         var suspendPresentation =
-            _captureRestartInProgress || IsCapturePresentationSuspendedState(snapshot);
+            _captureRestartInProgress ||
+            _captureModeTransitionInProgress ||
+            IsRecorderSession ||
+            IsCapturePresentationSuspendedState(snapshot);
         if (suspendPresentation)
         {
             // Suspend first so entering Starting/Saving/Stopping cannot launch
@@ -2026,7 +2621,8 @@ public partial class MainWindow : Window
             SetCaptureCriticalPresentationState(isActive: true);
         }
 
-        _libraryWindow?.UpdateReplayRunningState(isReplaySession);
+        _libraryWindow?.UpdateReplayRunningState(
+            isReplaySession || IsRecorderSession);
         if (!suspendPresentation)
         {
             // On the way back to Ready/Stopped, update the replay policy first;
@@ -2055,6 +2651,7 @@ public partial class MainWindow : Window
 
         QueueCaptureSafeReadyLibraryRecovery();
         QueueRecentClipThumbnailHydration();
+        UpdateControlsForState(_appUpdateService.Snapshot);
     }
 
     internal static bool IsReplaySessionState(ReplayStateSnapshot snapshot) =>
@@ -2134,13 +2731,13 @@ public partial class MainWindow : Window
             snapshot);
 
     private bool IsAutomaticLibraryWorkSuppressed =>
-        ShouldSuppressAutomaticLibraryWork(
+        IsRecorderSession || ShouldSuppressAutomaticLibraryWork(
             _captureCriticalPresentationActive,
             _replayBufferService.IsRunning,
             _latestState);
 
     private bool IsCaptureSafeReadyLibraryRefreshAllowed =>
-        CanRunCaptureSafeReadyLibraryRefresh(
+        !IsRecorderSession && CanRunCaptureSafeReadyLibraryRefresh(
             _isClosing,
             IsVisible,
             IsActive,
@@ -2149,7 +2746,7 @@ public partial class MainWindow : Window
             _latestState);
 
     private bool ShouldQueueCaptureSafeReadyLibraryRecovery =>
-        ShouldRecoverAutoStartLibraryDuringReady(
+        !IsRecorderSession && ShouldRecoverAutoStartLibraryDuringReady(
             _autoStartLibraryRecoveryPending,
             RecentClipsItemsControl.Items.Count,
             AppSettings.NormalizeRecentClipCount(_settings.RecentClipCount),
@@ -2255,9 +2852,13 @@ public partial class MainWindow : Window
         var isBusy = snapshot.State is ReplayState.Starting or ReplayState.Stopping;
         var isSaving = snapshot.State == ReplayState.Saving;
         var isRunning = _replayBufferService.IsRunning;
+        var isRecording = IsRecorderSession;
+        var hasPendingRecording = _replayBufferService.HasPendingRecording;
         var canSave = CanSaveClip(snapshot, isRunning);
 
-        StatusText.Text = GetReplayStatusText(snapshot.State);
+        StatusText.Text = hasPendingRecording && !isSaving
+            ? "Recording waiting to be saved"
+            : GetCaptureStatusText(snapshot.State, isRecording);
         StatusDot.Fill = snapshot.State switch
         {
             ReplayState.Starting or ReplayState.Saving => Brush("AccentBrush"),
@@ -2267,13 +2868,59 @@ public partial class MainWindow : Window
             _ => Brush("TextMutedBrush")
         };
 
-        BufferToggleButton.Content = isRunning ? "Stop replay" : "Start replay";
-        BufferToggleButton.IsEnabled = _engineReady && !isBusy && !isSaving && !_isClosing;
+        BufferToggleButton.Content = isRunning && !isRecording
+            ? "Stop replay"
+            : "Start replay";
+        BufferToggleButton.IsEnabled = _engineReady &&
+            !isRecording &&
+            !isBusy &&
+            !isSaving &&
+            !_captureCommandInProgress &&
+            !_isClosing;
         BufferToggleButton.SetValue(
             System.Windows.Automation.AutomationProperties.NameProperty,
-            isRunning ? "Stop instant replay" : "Start instant replay");
+            isRunning && !isRecording
+                ? "Stop instant replay"
+                : "Start instant replay");
 
-        if (isRunning)
+        var canDiscardIncomplete =
+            _replayBufferService.CanDiscardIncompleteRecording;
+        RecordToggleButton.Content = hasPendingRecording && !isSaving
+            ? canDiscardIncomplete
+                ? "Discard incomplete"
+                : "Retry save"
+            : isRecording
+            ? isSaving
+                ? "Finalizing..."
+                : "Stop & save"
+            : "Start recording";
+        RecordToggleButton.IsEnabled = (canDiscardIncomplete || _engineReady) &&
+            !isBusy &&
+            !isSaving &&
+            !_captureCommandInProgress &&
+            !_isClosing;
+        RecordToggleButton.SetValue(
+            System.Windows.Automation.AutomationProperties.NameProperty,
+            hasPendingRecording
+                ? canDiscardIncomplete
+                    ? "Discard incomplete Recorder session"
+                    : "Retry saving full-session recording"
+                : isRecording
+                    ? "Stop and save full-session recording"
+                    : "Start full-session recording");
+
+        if (hasPendingRecording && !isSaving)
+        {
+            AvailableText.Text =
+                $"Stopped session - {StorageEstimator.FormatBytes(snapshot.BufferBytes)} preserved";
+        }
+        else if (isRecording)
+        {
+            AvailableText.Text = snapshot.AvailableDuration > TimeSpan.Zero
+                ? $"Recording {FormatDuration(snapshot.AvailableDuration)} - {StorageEstimator.FormatBytes(snapshot.BufferBytes)}"
+                : "Recorder is starting...";
+        }
+        else if (isRunning)
         {
             AvailableText.Text = snapshot.AvailableDuration > TimeSpan.Zero
                 ? $"{FormatDuration(snapshot.AvailableDuration)} available of {FormatDuration(snapshot.Retention)}"
@@ -2281,10 +2928,15 @@ public partial class MainWindow : Window
         }
         else
         {
-            AvailableText.Text = "No replay buffered";
+            AvailableText.Text = "Capture is off";
         }
 
         SaveClipButton.IsEnabled = canSave;
+        SetCaptureSettingsEnabled(
+            !isRecording &&
+            !isSaving &&
+            !_captureCommandInProgress &&
+            !_captureModeTransitionInProgress);
         if (_replayBufferService.ActiveEncoderDescription is { Length: > 0 } encoderDescription)
         {
             var displayedEncoderDescription = _automaticCaptureSourceFallback &&
@@ -2303,18 +2955,39 @@ public partial class MainWindow : Window
         UpdateTrayStatus(StatusText.Text, canSave);
         if (_overlayWindow is { IsVisible: true } overlay)
         {
-            overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+            if (isRecording)
+            {
+                overlay.Dismiss();
+            }
+            else
+            {
+                overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+            }
         }
+
+        QueueRecordingSafetyCheck(snapshot);
     }
 
     private void UpdateBackgroundIndicators(ReplayStateSnapshot snapshot)
     {
         var isRunning = _replayBufferService.IsRunning;
-        UpdateTrayStatus(GetReplayStatusText(snapshot.State), CanSaveClip(snapshot, isRunning));
+        var isRecording = IsRecorderSession;
+        UpdateTrayStatus(
+            GetCaptureStatusText(snapshot.State, isRecording),
+            CanSaveClip(snapshot, isRunning));
         if (_overlayWindow is { IsVisible: true } overlay)
         {
-            overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+            if (isRecording)
+            {
+                overlay.Dismiss();
+            }
+            else
+            {
+                overlay.UpdateState(snapshot, isRunning, _settings.SaveClipHotkey.DisplayText);
+            }
         }
+
+        QueueRecordingSafetyCheck(snapshot);
     }
 
     private void UpdateTrayStatus(string status, bool canSave)
@@ -2332,9 +3005,24 @@ public partial class MainWindow : Window
 
     private bool CanSaveClip(ReplayStateSnapshot snapshot, bool isRunning) =>
         isRunning &&
+        !IsRecorderSession &&
         snapshot.State is not ReplayState.Starting and not ReplayState.Stopping and not ReplayState.Saving &&
         snapshot.AvailableDuration >= TimeSpan.FromSeconds(1) &&
         !_isClosing;
+
+    private static string GetCaptureStatusText(ReplayState state, bool isRecording) =>
+        isRecording
+            ? state switch
+            {
+                ReplayState.Starting => "Starting Recorder...",
+                ReplayState.Buffering => "Recorder warming up",
+                ReplayState.Ready => "Recording",
+                ReplayState.Saving => "Finalizing recording...",
+                ReplayState.Faulted => "Recorder error",
+                ReplayState.Stopping => "Stopping Recorder...",
+                _ => "Recorder off"
+            }
+            : GetReplayStatusText(state);
 
     private static string GetReplayStatusText(ReplayState state) => state switch
     {
@@ -2346,6 +3034,86 @@ public partial class MainWindow : Window
         ReplayState.Stopping => "Stopping replay…",
         _ => "Replay off"
     };
+
+    private void SetCaptureSettingsEnabled(bool enabled)
+    {
+        DisplayComboBox.IsEnabled = enabled;
+        ReplayLengthComboBox.IsEnabled = enabled;
+        FpsComboBox.IsEnabled = enabled;
+        ResolutionComboBox.IsEnabled = enabled;
+        CaptureCursorCheckBox.IsEnabled = enabled;
+        SystemAudioCheckBox.IsEnabled = enabled && OutputDeviceComboBox.Items.Count > 0;
+        OutputDeviceComboBox.IsEnabled = enabled && SystemAudioCheckBox.IsChecked == true;
+        MicrophoneCheckBox.IsEnabled = enabled && MicrophoneComboBox.Items.Count > 0;
+        MicrophoneComboBox.IsEnabled = enabled && MicrophoneCheckBox.IsChecked == true;
+        BrowseButton.IsEnabled = !_captureCommandInProgress &&
+            !_captureModeTransitionInProgress &&
+            (enabled || _replayBufferService.HasPendingRecording);
+        TrimCurrentClipButton.IsEnabled = enabled && _currentClip is not null;
+        RefreshLibraryButton.IsEnabled = enabled;
+    }
+
+    private void QueueRecordingSafetyCheck(ReplayStateSnapshot snapshot)
+    {
+        if (!IsRecorderSession ||
+            !_replayBufferService.IsRunning ||
+            snapshot.State is not (ReplayState.Buffering or ReplayState.Ready) ||
+            _recordingSafetyCheckRunning ||
+            DateTimeOffset.UtcNow < _recordingSafetyRetryNotBeforeUtc ||
+            _isClosing)
+        {
+            return;
+        }
+
+        _recordingSafetyCheckRunning = true;
+        _recordingSafetyRetryNotBeforeUtc = DateTimeOffset.UtcNow.AddSeconds(30);
+        _ = CheckRecordingSafetyAsync(snapshot);
+    }
+
+    private async Task CheckRecordingSafetyAsync(ReplayStateSnapshot snapshot)
+    {
+        try
+        {
+            var saveDirectory = _settings.SaveDirectory;
+            var availableFreeBytes = await Task.Run(
+                () => ReplayBufferService.TryGetAvailableFreeSpace(saveDirectory),
+                _lifetimeCancellation.Token);
+            var storageUnavailable = availableFreeBytes is null;
+            if (!storageUnavailable &&
+                !RecordingStoragePolicy.ShouldFinalize(
+                    snapshot.AvailableDuration,
+                    snapshot.BufferBytes,
+                    availableFreeBytes!.Value) ||
+                !IsRecorderSession ||
+                !_replayBufferService.IsRunning ||
+                _isClosing)
+            {
+                return;
+            }
+
+            var reason = storageUnavailable
+                ? "Recorder lost access to the selected drive and is stopping to preserve the session."
+                : snapshot.AvailableDuration >= RecordingStoragePolicy.MaximumDuration
+                    ? "Recorder reached its 24-hour safety limit and is finalizing the session."
+                    : "Recorder is finalizing before the drive runs out of safe working space.";
+            ShowError(reason);
+            var error = await RunCaptureCommandAsync(
+                StopRecordingAndSaveCoreAsync,
+                showError: false);
+            if (error is not null && !_isClosing)
+            {
+                ShowError($"{reason} {error.Message}");
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Shutdown superseded the periodic capacity check.
+        }
+        finally
+        {
+            _recordingSafetyCheckRunning = false;
+        }
+    }
 
     private Brush Brush(string resourceKey) => (Brush)FindResource(resourceKey);
 
@@ -2369,7 +3137,7 @@ public partial class MainWindow : Window
         // Trust verification is complete before the UI can offer capture.
         _engineReady = engineReady;
         InstallEnginePanel.Visibility = _engineReady ? Visibility.Collapsed : Visibility.Visible;
-        BufferToggleButton.IsEnabled = _engineReady && !_isClosing;
+        UpdateControlsForState(_latestState);
     }
 
     private void UpdateStorageText()
@@ -2389,19 +3157,32 @@ public partial class MainWindow : Window
             framesPerSecond,
             replayLength.Duration,
             SystemAudioCheckBox.IsChecked == true || MicrophoneCheckBox.IsChecked == true);
+        var recordingEstimate = StorageEstimator.EstimateBufferBytes(
+            display,
+            resolution,
+            framesPerSecond,
+            TimeSpan.FromHours(12),
+            SystemAudioCheckBox.IsChecked == true || MicrophoneCheckBox.IsChecked == true);
         var savePath = string.IsNullOrWhiteSpace(SavePathTextBox.Text)
             ? AppSettings.GetDefaultSaveDirectory()
             : SavePathTextBox.Text;
         var generation = Interlocked.Increment(ref _storageStatusGeneration);
-        StorageText.Text = $"~{StorageEstimator.FormatBytes(estimate)} replay buffer";
+        StorageText.Text =
+            $"~{StorageEstimator.FormatBytes(estimate)} replay · " +
+            $"~{StorageEstimator.FormatBytes(recordingEstimate)} per 12h recording";
         StorageText.Foreground = Brush("TextMutedBrush");
-        _ = UpdateStorageFreeSpaceAsync(generation, savePath, estimate);
+        _ = UpdateStorageFreeSpaceAsync(
+            generation,
+            savePath,
+            estimate,
+            recordingEstimate);
     }
 
     private async Task UpdateStorageFreeSpaceAsync(
         long generation,
         string savePath,
-        long estimatedBufferBytes)
+        long estimatedBufferBytes,
+        long estimatedTwelveHourRecordingBytes)
     {
         if (!CanQueryStorageFreeSpace(savePath))
         {
@@ -2427,9 +3208,16 @@ public partial class MainWindow : Window
             }
 
             StorageText.Text =
-                $"~{StorageEstimator.FormatBytes(estimatedBufferBytes)} replay buffer · " +
+                $"~{StorageEstimator.FormatBytes(estimatedBufferBytes)} replay · " +
+                $"~{StorageEstimator.FormatBytes(estimatedTwelveHourRecordingBytes)} per 12h · " +
                 $"{StorageEstimator.FormatBytes(freeSpace.Value)} free";
-            StorageText.Foreground = freeSpace.Value < estimatedBufferBytes * 2
+            var recommendedRecordingFreeBytes =
+                estimatedTwelveHourRecordingBytes >
+                    (long.MaxValue - RecordingStoragePolicy.FinalizationSafetyReserveBytes) / 2
+                    ? long.MaxValue
+                    : estimatedTwelveHourRecordingBytes * 2 +
+                      RecordingStoragePolicy.FinalizationSafetyReserveBytes;
+            StorageText.Foreground = freeSpace.Value < recommendedRecordingFreeBytes
                 ? Brush("WarningBrush")
                 : Brush("TextMutedBrush");
         }
@@ -2497,6 +3285,16 @@ public partial class MainWindow : Window
 
     private async void BrowseButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isInitializing ||
+            _isClosing ||
+            _captureCommandInProgress ||
+            _captureModeTransitionInProgress ||
+            !BrowseButton.IsEnabled ||
+            IsRecorderSession && !_replayBufferService.HasPendingRecording)
+        {
+            return;
+        }
+
         var dialog = new OpenFolderDialog
         {
             Title = "Choose where ClipForge should save videos",
@@ -2506,6 +3304,20 @@ public partial class MainWindow : Window
         };
 
         if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        // The modal dialog runs a nested dispatcher loop. Recorder or shutdown
+        // may have started while it was open, so revalidate before changing the
+        // drive used by capacity checks and finalization.
+        if (_isInitializing ||
+            _isClosing ||
+            _captureCommandInProgress ||
+            _captureModeTransitionInProgress ||
+            !BrowseButton.IsEnabled ||
+            _latestState.State == ReplayState.Saving ||
+            IsRecorderSession && !_replayBufferService.HasPendingRecording)
         {
             return;
         }
@@ -2697,7 +3509,10 @@ public partial class MainWindow : Window
     {
         if (!_settings.CheckForUpdatesAutomatically ||
             !_appUpdateService.CanCheck ||
-            _isClosing)
+            _isClosing ||
+            _captureCommandInProgress ||
+            _captureModeTransitionInProgress ||
+            IsRecorderSession)
         {
             return;
         }
@@ -2714,8 +3529,16 @@ public partial class MainWindow : Window
 
     private async void UpdateActionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isClosing)
+        if (_isClosing ||
+            _captureCommandInProgress ||
+            _captureModeTransitionInProgress ||
+            IsRecorderSession)
         {
+            if (IsRecorderSession)
+            {
+                ShowError("Stop and save Recorder before installing an update.");
+            }
+
             return;
         }
 
@@ -2776,51 +3599,101 @@ public partial class MainWindow : Window
 
     private async void StartReplayWithWindowsCheckBox_Click(object sender, RoutedEventArgs e)
     {
-        if (_isInitializing || _isClosing)
+        await ChangeStartupPreferenceAsync(CaptureSessionMode.InstantReplay);
+    }
+
+    private async void StartRecordingWithWindowsCheckBox_Click(
+        object sender,
+        RoutedEventArgs e)
+    {
+        await ChangeStartupPreferenceAsync(CaptureSessionMode.Recording);
+    }
+
+    private async Task ChangeStartupPreferenceAsync(CaptureSessionMode changedMode)
+    {
+        if (_isInitializing || _isClosing || _startupPreferenceChangeInProgress)
         {
             return;
         }
 
-        var previous = _settings.StartReplayWithWindows;
-        var requested = StartReplayWithWindowsCheckBox.IsChecked == true;
+        _ = Interlocked.Increment(ref _autoStartIntentGeneration);
+
+        var previousReplay = _settings.StartReplayWithWindows;
+        var previousRecording = _settings.StartRecordingWithWindows;
+        _startupPreferenceChangeInProgress = true;
+        StartReplayWithWindowsCheckBox.IsEnabled = false;
+        StartRecordingWithWindowsCheckBox.IsEnabled = false;
 
         try
         {
-            _startupRegistrationService.SetEnabled(requested);
-            SyncSettingsFromControls();
-            _settings.StartReplayWithWindows = requested;
+            if (changedMode == CaptureSessionMode.InstantReplay &&
+                StartReplayWithWindowsCheckBox.IsChecked == true)
+            {
+                StartRecordingWithWindowsCheckBox.IsChecked = false;
+            }
+            else if (changedMode == CaptureSessionMode.Recording &&
+                     StartRecordingWithWindowsCheckBox.IsChecked == true)
+            {
+                StartReplayWithWindowsCheckBox.IsChecked = false;
+            }
+
+            var requestedReplay = StartReplayWithWindowsCheckBox.IsChecked == true;
+            var requestedRecording = StartRecordingWithWindowsCheckBox.IsChecked == true;
+            _startupRegistrationService.SetEnabled(requestedReplay || requestedRecording);
+            _settings.StartReplayWithWindows = requestedReplay;
+            _settings.StartRecordingWithWindows = requestedRecording;
             await _settingsService.SaveAsync(_settings, _lifetimeCancellation.Token);
-            StartupHintText.Text = requested
-                ? "Enabled. ClipForge will start hidden and begin replay after you sign in."
-                : "ClipForge starts hidden in the tray and uses your saved capture settings.";
+            UpdateStartupHint();
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
-            RestoreStartupPreference(previous);
+            RestoreStartupPreferences(previousReplay, previousRecording);
         }
         catch (Exception exception)
         {
-            RestoreStartupPreference(previous);
+            RestoreStartupPreferences(previousReplay, previousRecording);
             ShowError($"Windows startup could not be changed. {exception.Message}");
+        }
+        finally
+        {
+            _startupPreferenceChangeInProgress = false;
+            var supported = _startupRegistrationService.IsSupported && !_isClosing;
+            StartReplayWithWindowsCheckBox.IsEnabled = supported;
+            StartRecordingWithWindowsCheckBox.IsEnabled = supported;
         }
     }
 
-    private void RestoreStartupPreference(bool enabled)
+    private void RestoreStartupPreferences(bool replayEnabled, bool recordingEnabled)
     {
-        _settings.StartReplayWithWindows = enabled;
-        StartReplayWithWindowsCheckBox.IsChecked = enabled;
+        _settings.StartReplayWithWindows = replayEnabled;
+        _settings.StartRecordingWithWindows = recordingEnabled;
+        StartReplayWithWindowsCheckBox.IsChecked = replayEnabled;
+        StartRecordingWithWindowsCheckBox.IsChecked = recordingEnabled;
 
         try
         {
-            _startupRegistrationService.SetEnabled(enabled);
+            _startupRegistrationService.SetEnabled(replayEnabled || recordingEnabled);
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException or
-            ArgumentException or NotSupportedException or Win32Exception or
-            System.Runtime.InteropServices.COMException)
+                ArgumentException or NotSupportedException or Win32Exception or
+                System.Runtime.InteropServices.COMException)
         {
             // Preserve the previous in-app preference and surface the original failure.
         }
+
+        UpdateStartupHint();
+    }
+
+    private void UpdateStartupHint()
+    {
+        StartupHintText.Text = !_startupRegistrationService.IsSupported
+            ? "Install ClipForge Setup to enable automatic Windows startup."
+            : _settings.StartReplayWithWindows
+                ? "Enabled. ClipForge will start hidden and begin replay after you sign in."
+                : _settings.StartRecordingWithWindows
+                    ? "Enabled. ClipForge will start hidden and begin Recorder after you sign in."
+                    : "ClipForge will not start automatically with Windows.";
     }
 
     private void AppUpdateService_StateChanged(object? sender, AppUpdateSnapshot snapshot)
@@ -2860,6 +3733,19 @@ public partial class MainWindow : Window
             AppUpdateState.Failed => ("Try again", _appUpdateService.CanCheck),
             _ => ("Check for updates", _appUpdateService.CanCheck)
         };
+
+        if (_captureCommandInProgress || _captureModeTransitionInProgress)
+        {
+            UpdateActionButton.IsEnabled = false;
+        }
+
+        if (IsRecorderSession)
+        {
+            UpdateActionButton.IsEnabled = false;
+            UpdateStatusText.Text = snapshot.State == AppUpdateState.ReadyToRestart
+                ? "Update ready. Stop and save Recorder before restarting ClipForge."
+                : "Update actions are paused while Recorder is active.";
+        }
     }
 
     private void HideToTrayButton_Click(object sender, RoutedEventArgs e) => HideToTray();
@@ -2883,6 +3769,7 @@ public partial class MainWindow : Window
 
     private void Application_SessionEnding(object sender, SessionEndingCancelEventArgs e)
     {
+        _sessionEnding = true;
         _exitRequested = true;
         Close();
     }
@@ -2904,7 +3791,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_replayBufferService.IsRunning)
+        if (_replayBufferService.IsRunning && !IsRecorderSession)
         {
             await SaveClipAsync();
         }
@@ -3034,6 +3921,13 @@ public partial class MainWindow : Window
     {
         if (_isClosing)
         {
+            return;
+        }
+
+        if (IsRecorderSession)
+        {
+            _overlayWindow?.Dismiss();
+            ShowError("The replay overlay is disabled while Recorder is active.");
             return;
         }
 
@@ -3952,11 +4846,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (IsReplaySessionState(_latestState) && !autoplay)
+        if (!autoplay)
         {
-            // A gallery refresh during replay updates presentation state without
-            // opening a decoder. The user's Play/clip click is the explicit
-            // opt-in that creates the one foreground media graph.
+            // Automatic selection is metadata/poster-only. This prevents a
+            // freshly finalized multi-hour recording from constructing a huge
+            // decoder graph until the user explicitly presses Play.
             _currentClip = clip;
             _playerSourceReleasedForBackground = true;
             _playWhenOpened = false;
@@ -4203,24 +5097,28 @@ public partial class MainWindow : Window
         }
 
         PlayerEmptyState.Visibility = Visibility.Collapsed;
-        // Stop the muted priming playback before restoring audible volume. This
-        // prevents even a single decoded audio buffer from leaking into speakers
-        // or desktop capture when the clip was opened paused.
-        player.Pause();
         SetPlayerControlsEnabled(true);
         var playbackVolume = _playerVolumeAfterOpen ?? 0;
         _playerVolumeAfterOpen = null;
-        ApplyPlayerVolume(playbackVolume);
         var shouldAutoplay = _playWhenOpened;
         _playWhenOpened = false;
-        if (shouldAutoplay)
+        if (MediaPlaybackStartupPolicy.ShouldKeepPrimedPlaybackRunning(
+                shouldAutoplay,
+                hasRestorePosition: false))
         {
-            player.Play();
+            // The muted Play used to build Media Foundation's graph is already
+            // advancing. Pausing and immediately playing again at the first
+            // rendered frame creates a visible startup hitch on some drivers.
+            ApplyPlayerVolume(playbackVolume);
             SetPlayerPlaying(true);
         }
         else
         {
+            // A paused open must never leak a priming audio buffer or leave the
+            // poster a few frames into the clip.
+            player.Pause();
             player.Position = TimeSpan.Zero;
+            ApplyPlayerVolume(playbackVolume);
             SetPlayerPlaying(false);
             ResumeAttachedPlayerMediaWork();
         }
@@ -4618,7 +5516,7 @@ public partial class MainWindow : Window
 
     private void QueueRecentClipThumbnailHydration()
     {
-        if (_suspendThumbnailHydrationForPlayback)
+        if (_suspendThumbnailHydrationForPlayback || IsRecorderSession)
         {
             return;
         }
@@ -4673,6 +5571,7 @@ public partial class MainWindow : Window
             await _libraryRefreshGate.WaitAsync(hydrationCancellation.Token);
             gateEntered = true;
             if (_suspendThumbnailHydrationForPlayback ||
+                IsRecorderSession ||
                 snapshotVersion != _recentClipSnapshotVersion)
             {
                 _recentThumbnailHydrationPending = true;
@@ -4709,6 +5608,7 @@ public partial class MainWindow : Window
                 .OfType<ClipLibraryItem>()
                 .ToArray();
             if (_suspendThumbnailHydrationForPlayback ||
+                IsRecorderSession ||
                 snapshotVersion != _recentClipSnapshotVersion ||
                 !ShouldHydrateRecentClipThumbnails(
                     _isClosing,
@@ -5251,7 +6151,32 @@ public partial class MainWindow : Window
                     await _captureCommandGate.WaitAsync();
                     try
                     {
-                        await _replayBufferService.StopAsync();
+                        if ((_requestedCaptureMode ??
+                             _replayBufferService.ActiveSessionMode) ==
+                                CaptureSessionMode.Recording &&
+                            (_replayBufferService.IsRunning ||
+                             _replayBufferService.HasPendingRecording ||
+                             IsReplaySessionState(_latestState) ||
+                             _latestState.State == ReplayState.Faulted))
+                        {
+                            if (_sessionEnding)
+                            {
+                                // Windows grants only a short shutdown window.
+                                // Stop capture and preserve the segments; never
+                                // attempt a hundreds-of-gigabytes remux here.
+                                await _replayBufferService.StopAsync();
+                            }
+                            else
+                            {
+                                await _replayBufferService.StopAndSaveRecordingAsync(
+                                    _settings.SaveDirectory,
+                                    CancellationToken.None);
+                            }
+                        }
+                        else
+                        {
+                            await _replayBufferService.StopAsync();
+                        }
                     }
                     finally
                     {
