@@ -2,8 +2,7 @@ namespace ClipForge.Services;
 
 internal static class RecordingStoragePolicy
 {
-    internal static readonly TimeSpan MaximumDuration = TimeSpan.FromHours(24);
-    internal static readonly TimeSpan EngineRetention = MaximumDuration + TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan NoReplayRetention = TimeSpan.Zero;
     internal const long MinimumStartFreeBytes = 4L * 1024 * 1024 * 1024;
     internal const long FinalizationSafetyReserveBytes = 2L * 1024 * 1024 * 1024;
     internal const long AutomaticFinalizationHeadroomBytes = 2L * 1024 * 1024 * 1024;
@@ -12,10 +11,8 @@ internal static class RecordingStoragePolicy
         availableFreeBytes >= MinimumStartFreeBytes;
 
     internal static bool ShouldFinalize(
-        TimeSpan availableDuration,
         long sessionBytes,
         long availableFreeBytes) =>
-        availableDuration >= MaximumDuration ||
         availableFreeBytes <= AddSaturating(
             GetRequiredFinalizationFreeBytes(sessionBytes),
             AutomaticFinalizationHeadroomBytes);

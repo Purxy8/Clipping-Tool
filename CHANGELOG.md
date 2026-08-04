@@ -4,6 +4,11 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Recorder is now controlled by Start and Stop & save rather than an elapsed-time limit. It exposes no Instant Replay retention window, continues past the former 24-hour boundary while storage remains safe, and still preserves the session if the selected drive disappears or lacks finalization headroom.
+- Recorder finalization now has its own full-session stream-copy command without Replay's `-ss` or `-t` clipping bounds, so every trusted segment from Start through Stop & save is retained.
+
 ## [1.9.0-beta.13] - 2026-08-04
 
 ### Release status
