@@ -21,7 +21,8 @@ public sealed class DeviceDiscoveryService
                 screen.Bounds.Width,
                 screen.Bounds.Height,
                 screen.Primary,
-                index))
+                index,
+                TryGetDisplayRefreshRate(screen.DeviceName)))
             .OrderByDescending(display => display.IsPrimary)
             .ThenBy(display => display.Left)
             .ThenBy(display => display.Top)
@@ -71,4 +72,56 @@ public sealed class DeviceDiscoveryService
             return null;
         }
     }
+
+    internal static int TryGetDisplayRefreshRate(string? deviceName)
+    {
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(deviceName))
+        {
+            return 0;
+        }
+
+        IntPtr deviceContext = IntPtr.Zero;
+        try
+        {
+            deviceContext = CreateDC("DISPLAY", deviceName, null, IntPtr.Zero);
+            if (deviceContext == IntPtr.Zero)
+            {
+                return 0;
+            }
+
+            var refreshRate = GetDeviceCaps(deviceContext, VerticalRefreshRate);
+            return refreshRate is >= 24 and <= 1000
+                ? refreshRate
+                : 0;
+        }
+        catch (Exception exception) when (
+            exception is DllNotFoundException or EntryPointNotFoundException or
+                TypeLoadException or MarshalDirectiveException)
+        {
+            return 0;
+        }
+        finally
+        {
+            if (deviceContext != IntPtr.Zero)
+            {
+                _ = DeleteDC(deviceContext);
+            }
+        }
+    }
+
+    private const int VerticalRefreshRate = 116;
+
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateDC(
+        string driver,
+        string deviceName,
+        string? output,
+        IntPtr initializationData);
+
+    [DllImport("gdi32.dll")]
+    private static extern int GetDeviceCaps(IntPtr deviceContext, int index);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteDC(IntPtr deviceContext);
 }

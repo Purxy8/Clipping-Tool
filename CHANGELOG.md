@@ -4,6 +4,33 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.13] - 2026-08-04
+
+### Release status
+
+- Unsigned public beta while the SignPath Foundation application remains pending. Windows can show an unverified-publisher or SmartScreen warning.
+- This beta is not an official trusted release and remains a GitHub pre-release.
+
+### Added
+
+- A full-session Recorder mode shares ClipForge's existing capture process, source selection, audio mix, output-resolution policy, and single overlay. Recorder and Instant Replay are strictly mutually exclusive, and switching modes is transactional so a failed Recorder start restores the previous Replay session.
+- Recorder can start automatically with Windows through its own setting. Delayed startup work is generation-checked, so a manual start, stop, mode switch, settings change, shutdown, update, or recovered recording cannot be overwritten by an older automatic request.
+- Long recordings use two-second recoverable Matroska segments, bounded thirty-minute capture renewals, incremental segment indexing, disk-capacity preflight and monitoring, atomic stream-copy finalization, and a durable recovery journal. A stopped or crash-recovered session blocks overwrite until it is saved, while an unavailable source disk can be reconnected and retried.
+
+### Fixed
+
+- Fresh clip playback no longer performs a visible pause/play cycle while opening. Large Recorder outputs skip eager autoplay/decoder work in Recent clips, while thumbnail work stays bounded and cancellable.
+- Fixed-preset capture keeps one locked output geometry across stretched or custom-resolution transitions. WGC now scales only when live geometry truly differs from the selected output, while Source/native matching geometry stays on the low-overhead no-scale path.
+- High-refresh displays use a divisor-aware WGC input cap, including stable 165 Hz to 60 FPS sampling, to avoid uneven frame delivery without increasing encoder load.
+- Recorder stop and replay export use bounded progress-stall detection and single-pass stream copy. Trim and save operations no longer compete with capture-critical playback, update, thumbnail, or configuration work.
+- Recovery commit order now distinguishes a planned output from a durably committed file, verifies exact output length, preserves source data across partial moves, missing segments, stale or torn journals, offline drives, and failed locator migration, and only removes a recovery locator after an explicitly successful owned-directory deletion. An incomplete zero-safe-segment recovery has a separately labeled, confirmed discard action whose durable terminal state cannot return as a ghost session after a crash.
+
+### Verification
+
+- Release builds complete with zero warnings or errors and the deterministic suite passes 86/86 tests, including Recorder/Replay mutual exclusion policies, startup races, Source/1080p/1440p and stretched geometry, 165 Hz sampling, long-session storage, crash recovery, commit/discard durability, torn journals, missing segments, player startup, trim, updater gating, and concurrent disposal.
+- A synthetic twelve-hour Recorder session generated 21,600 two-second segments with audio and finalized by stream copy in about 12.1 seconds to an exact twelve-hour output. Structural inspection of the eight newest real clips found a keyframe at the first video packet, approximately 16.67 ms cadence, and no startup packet gap above 17 ms.
+- The offline resolution matrix passed 80 geometry checks and 42 real 30/60 FPS encodes, including 1290×980 Source/1080p/1440p, with no duplicate frames. All ten replay lengths from 30 seconds through one hour, eight trim modes, and representative concat/A-V checks passed. A competing live WGC matrix is intentionally not started while the installed ClipForge replay process is active; scheduled 30-minute WGC renewals can create short safety jump-cuts, and final target-game validation still depends on the affected Apex/CS2 GPU driver, overlay, fullscreen mode, and stretched internal resolution.
+
 ## [1.9.0-beta.12] - 2026-07-28
 
 ### Release status

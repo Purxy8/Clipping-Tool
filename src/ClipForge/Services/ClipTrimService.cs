@@ -33,9 +33,13 @@ public sealed class ClipTrimService
     private readonly SemaphoreSlim _trimGate = new(1, 1);
     private readonly Dictionary<EncoderCacheKey, VideoEncodingStrategy> _encoderCache = [];
     private int _replayBlockingTrimWork;
+    private int _activeTrimWork;
 
     public bool HasReplayBlockingTrimWork =>
         Volatile.Read(ref _replayBlockingTrimWork) > 0;
+
+    public bool HasActiveTrimWork =>
+        Volatile.Read(ref _activeTrimWork) > 0;
 
     public ClipTrimService(FfmpegSetupService ffmpegSetupService)
         : this(
@@ -114,6 +118,7 @@ public sealed class ClipTrimService
 
         var enteredGate = false;
         var replayBlockingWork = executionMode == ClipTrimExecutionMode.Standard;
+        Interlocked.Increment(ref _activeTrimWork);
         if (replayBlockingWork)
         {
             Interlocked.Increment(ref _replayBlockingTrimWork);
@@ -157,6 +162,8 @@ public sealed class ClipTrimService
             {
                 Interlocked.Decrement(ref _replayBlockingTrimWork);
             }
+
+            Interlocked.Decrement(ref _activeTrimWork);
         }
     }
 

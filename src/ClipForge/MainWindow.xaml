@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:ClipForge"
         mc:Ignorable="d"
-        Title="ClipForge — Instant Replay"
+        Title="ClipForge — Capture"
         Width="1380"
         Height="880"
         MinWidth="1080"
@@ -187,7 +187,7 @@
                                  VerticalAlignment="Center" Fill="{StaticResource TextMutedBrush}" />
                         <TextBlock x:Name="StatusText" VerticalAlignment="Center" FontSize="12"
                                    FontWeight="SemiBold" Foreground="{StaticResource TextSecondaryBrush}"
-                                   Text="Replay off" />
+                                   Text="Capture off" />
                     </StackPanel>
                 </Border>
                 <Button Width="42" Height="42" Padding="0" Content="—" Click="HideToTrayButton_Click"
@@ -274,7 +274,7 @@
                             <!-- Video -->
                             <Border Margin="0,0,0,12" Style="{StaticResource SidebarSectionStyle}">
                                 <StackPanel>
-                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="REPLAY &amp; VIDEO" />
+                                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="REPLAY, RECORDER &amp; VIDEO" />
                                     <TextBlock Margin="0,10,0,6" Style="{StaticResource FieldLabelStyle}" Text="DISPLAY" />
                                     <ComboBox x:Name="DisplayComboBox" SelectionChanged="DisplayComboBox_SelectionChanged" />
 
@@ -381,6 +381,14 @@
                                               AutomationProperties.Name="Start ClipForge and replay with Windows"
                                               AutomationProperties.HelpText="Starts ClipForge hidden in the notification area and begins the replay buffer after Windows sign-in.">
                                         <TextBlock Text="Start ClipForge and replay with Windows"
+                                                   TextWrapping="Wrap" />
+                                    </CheckBox>
+                                    <CheckBox x:Name="StartRecordingWithWindowsCheckBox" Margin="0,10,0,0"
+                                              Click="StartRecordingWithWindowsCheckBox_Click"
+                                              Style="{StaticResource ToggleCheckBoxStyle}"
+                                              AutomationProperties.Name="Start ClipForge Recorder with Windows"
+                                              AutomationProperties.HelpText="Starts ClipForge hidden in the notification area and begins a full-session recording after Windows sign-in.">
+                                        <TextBlock Text="Start Recorder with Windows"
                                                    TextWrapping="Wrap" />
                                     </CheckBox>
                                     <TextBlock x:Name="StartupHintText" Margin="0,7,0,0"
@@ -511,7 +519,7 @@
                     <RowDefinition Height="214" />
                 </Grid.RowDefinitions>
 
-                <!-- Replay controls -->
+                <!-- Mutually exclusive Replay / Recorder controls -->
                 <Border x:Name="ReplayHeroCard" Grid.Row="0" Padding="18"
                         Style="{StaticResource HeroCardStyle}" ClipToBounds="True">
                     <Grid>
@@ -523,13 +531,16 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <StackPanel VerticalAlignment="Center">
-                                <TextBlock Style="{StaticResource EyebrowStyle}" Text="INSTANT REPLAY" />
-                                <TextBlock Margin="0,4,0,2" FontSize="20" FontWeight="SemiBold" Text="Ready for the moment?" />
-                                <TextBlock x:Name="AvailableText" Style="{StaticResource MutedTextStyle}" Text="No replay buffered" />
+                                <TextBlock Style="{StaticResource EyebrowStyle}" Text="CAPTURE" />
+                                <TextBlock Margin="0,4,0,2" FontSize="20" FontWeight="SemiBold" Text="Replay or record the full session" />
+                                <TextBlock x:Name="AvailableText" Style="{StaticResource MutedTextStyle}" Text="Capture is off" />
                             </StackPanel>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                                 <Button x:Name="BufferToggleButton" MinWidth="120" Margin="0,0,8,0" Content="Start replay"
                                         Click="BufferToggleButton_Click" Style="{StaticResource SecondaryButtonStyle}" />
+                                <Button x:Name="RecordToggleButton" MinWidth="132" Margin="0,0,8,0" Content="Start recording"
+                                        Click="RecordToggleButton_Click" Style="{StaticResource SecondaryButtonStyle}"
+                                        AutomationProperties.Name="Start full-session recording" />
                                 <Button x:Name="SaveClipButton" MinWidth="172" Content="Save last clip" IsEnabled="False"
                                         Click="SaveClipButton_Click" Style="{StaticResource AnimatedPrimaryButtonStyle}" />
                             </StackPanel>

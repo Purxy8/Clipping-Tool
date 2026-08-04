@@ -309,9 +309,7 @@ internal sealed class FfmpegCapabilityProbe
     {
         var diagnostics = new List<string>();
         var hardwareGdiCandidates = new List<VideoEncodingStrategy>();
-        var outputSize = CaptureGeometry.ResolveOutputSize(
-            configuration.Display,
-            configuration.Resolution);
+        var outputSize = CaptureGeometry.ResolveOutputSize(configuration);
         var targetWidth = outputSize.Width;
         var targetHeight = outputSize.Height;
         var graphicsPath = DescribeGraphicsPath(outputSize);

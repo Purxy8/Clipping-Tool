@@ -1799,11 +1799,21 @@ public partial class LibraryWindow : Window
             return;
         }
 
-        // Stop the muted priming playback before restoring position or volume.
-        player.Pause();
         _isMediaReady = true;
         PlayerEmptyState.Visibility = Visibility.Collapsed;
         SetControlsEnabled(true);
+
+        var hasRestorePosition = _positionToRestore is not null;
+        var shouldAutoplay = _playWhenOpened && openPlan.Value.ContinueAfterOpened;
+        _playWhenOpened = false;
+        var keepPrimedPlaybackRunning =
+            MediaPlaybackStartupPolicy.ShouldKeepPrimedPlaybackRunning(
+                shouldAutoplay,
+                hasRestorePosition);
+        if (!keepPrimedPlaybackRunning)
+        {
+            player.Pause();
+        }
 
         if (_positionToRestore is { } restorePosition)
         {
@@ -1816,13 +1826,19 @@ public partial class LibraryWindow : Window
                 : restorePosition;
             _positionToRestore = null;
         }
+        else if (!shouldAutoplay)
+        {
+            player.Position = TimeSpan.Zero;
+        }
 
-        var shouldAutoplay = _playWhenOpened && openPlan.Value.ContinueAfterOpened;
-        _playWhenOpened = false;
         ApplyVolume(openPlan.Value.PlaybackVolume);
         if (shouldAutoplay && IsVisible && IsActive)
         {
-            player.Play();
+            if (!keepPrimedPlaybackRunning)
+            {
+                player.Play();
+            }
+
             SetPlaying(true);
         }
         else
