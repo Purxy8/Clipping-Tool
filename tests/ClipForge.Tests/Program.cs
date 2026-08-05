@@ -1935,6 +1935,29 @@ internal static class Program
             "Live capture and its capability probe must share the divisor-aware 165 Hz sampling rate.");
         Assert.ContainsSequence(liveArguments, "-fps_mode", "cfr", "-r", "60");
         Assert.ContainsSequence(probeArguments, "-fps_mode", "cfr", "-r", "60");
+        Assert.True(
+            FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                probeArguments,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(2.5),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(5.5)),
+                out _),
+            "A healthy 60 FPS WGC output was compared with its 84 FPS input sampling rate on a 165 Hz display.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                probeArguments,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.1),
+                    LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(6.1)),
+                out var slowHighRefreshProbeDiagnostic) &&
+            slowHighRefreshProbeDiagnostic.Contains(
+                "required minimum is 51",
+                StringComparison.Ordinal),
+            "A genuinely slow WGC output passed, or the 165 Hz probe still used 84 FPS as its output contract.");
 
         var unknownRefreshArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration with { Display = unknownRefreshDisplay },
@@ -2444,6 +2467,24 @@ internal static class Program
             HasRecentInput: true);
         var fullscreenIdle = fullscreenRecent with { HasRecentInput = false };
         var windowedRecent = fullscreenRecent with { IsFullscreenOnCapturedDisplay = false };
+        var inactiveWindowedContext = new CaptureForegroundContext(
+            IsFullscreenOnCapturedDisplay: false,
+            HasRecentInput: false,
+            CapturedDisplayCoverage: 0.972,
+            UsedCustomFullscreenFallback: true);
+        var objectiveGdiContext =
+            ReplayBufferService.ResolveCaptureCadenceForegroundContext(
+                DesktopCaptureBackend.Gdi,
+                inactiveWindowedContext);
+        Assert.True(
+            objectiveGdiContext.IsFullscreenOnCapturedDisplay &&
+            objectiveGdiContext.HasRecentInput &&
+            !objectiveGdiContext.UsedCustomFullscreenFallback &&
+            objectiveGdiContext.CapturedDisplayCoverage == 0.972 &&
+            ReplayBufferService.ResolveCaptureCadenceForegroundContext(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                inactiveWindowedContext) == inactiveWindowedContext,
+            "Objective timer-driven GDI cadence still depended on heuristic fullscreen/input classification or altered WGC policy.");
         Assert.True(
             CaptureForegroundContextProbe.IsFullscreenCandidate(
                 capturedDisplayCoverage: 0.60,
@@ -2528,6 +2569,28 @@ internal static class Program
                 assessment is null,
                 "Severe duplicates outside fullscreen must not trigger starvation recovery.");
         }
+
+        var objectiveGdiStarvation = new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? objectiveGdiAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            objectiveGdiAssessment = objectiveGdiStarvation.Observe(
+                CreateProgressSample(
+                    second,
+                    frame: 60L * second,
+                    duplicatedFrames: 58L * second),
+                objectiveGdiContext,
+                captureUptime: TimeSpan.FromSeconds(second),
+                allowChronicLowCadence: true,
+                allowSourceCadence: true);
+        }
+
+        Assert.True(
+            objectiveGdiAssessment is
+            {
+                Kind: CaptureStarvationKind.Severe
+            },
+            "A timer-driven GDI stream made almost entirely of CFR duplicates could still run silently outside fullscreen.");
 
         var transient = new CaptureStarvationWatchdog(60);
         for (var second = 0; second <= 12; second++)
@@ -3881,6 +3944,26 @@ internal static class Program
                     IsFullscreenOnCapturedDisplay: false,
                     HasRecentInput: false)),
             "The real capture/encode reprobe can compete with recent foreground input or never resumes while idle.");
+        Assert.True(
+            ReplayBufferService.ShouldScheduleObjectiveGdiReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                reprobeAttempt: 1,
+                deadlineUtcTicks: deadline + 1,
+                nowUtcTicks: deadline) &&
+            !ReplayBufferService.ShouldScheduleObjectiveGdiReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                reprobeAttempt: 2,
+                deadlineUtcTicks: deadline + 1,
+                nowUtcTicks: deadline) &&
+            ReplayBufferService.ShouldScheduleObjectiveGdiReprobe(
+                DesktopCaptureBackend.Gdi,
+                strategyUsesCapabilityProbe: true,
+                reprobeAttempt: 2,
+                deadlineUtcTicks: deadline,
+                nowUtcTicks: deadline),
+            "Objective GDI starvation lost its one early focused WGC check or escaped the normal retry backoff.");
         Assert.Equal(
             TimeSpan.FromMinutes(5),
             ReplayBufferService.GetDegradedCaptureReprobeDelay(attempt: 0),
@@ -4386,7 +4469,16 @@ internal static class Program
                 "The stale-root inspection cursor did not advance to the next bounded page.");
 
             var bufferParent = Path.Combine(testDirectory, "Session-Buffer");
-            var currentRoot = Path.Combine(bufferParent, "WindowsSession-6");
+            // Keep synthetic roots outside the real interactive Windows
+            // session IDs. The suite is also run while an installed ClipForge
+            // instance is active, and production cleanup correctly refuses to
+            // delete a root owned by that process during its final live-owner
+            // recheck.
+            var syntheticSessionBase = checked(
+                Process.GetCurrentProcess().SessionId + 50_000);
+            var currentRoot = Path.Combine(
+                bufferParent,
+                $"WindowsSession-{syntheticSessionBase + 6}");
             Directory.CreateDirectory(currentRoot);
             var utcNow = DateTime.UtcNow;
 
@@ -4409,19 +4501,19 @@ internal static class Program
 
             var staleRoot = CreateWindowsSessionResidue(
                 bufferParent,
-                1,
+                syntheticSessionBase + 1,
                 utcNow - TimeSpan.FromDays(2));
             var recentRoot = CreateWindowsSessionResidue(
                 bufferParent,
-                2,
+                syntheticSessionBase + 2,
                 utcNow - TimeSpan.FromHours(2));
             var activeRoot = CreateWindowsSessionResidue(
                 bufferParent,
-                3,
+                syntheticSessionBase + 3,
                 utcNow - TimeSpan.FromDays(2));
             var unexpectedRoot = CreateWindowsSessionResidue(
                 bufferParent,
-                4,
+                syntheticSessionBase + 4,
                 utcNow - TimeSpan.FromDays(2),
                 fileName: "unexpected.bin");
 
@@ -4453,7 +4545,7 @@ internal static class Program
                         bufferParent,
                         currentRoot,
                         utcNow,
-                        new HashSet<int> { 3 },
+                        new HashSet<int> { syntheticSessionBase + 3 },
                         ownershipEstablished: true,
                         cancellationToken: cancelledCleanup.Token),
                     "Cancelled startup maintenance continued deleting inactive-session data.");
@@ -4468,7 +4560,7 @@ internal static class Program
                     bufferParent,
                     currentRoot,
                     utcNow,
-                    new HashSet<int> { 3 },
+                    new HashSet<int> { syntheticSessionBase + 3 },
                     ownershipEstablished: true),
                 "Exactly one old, inactive, strictly validated Windows session should be removed.");
             Assert.True(
@@ -4480,15 +4572,15 @@ internal static class Program
 
             var boundedRootA = CreateWindowsSessionResidue(
                 bufferParent,
-                10,
+                syntheticSessionBase + 10,
                 utcNow - TimeSpan.FromDays(5));
             var boundedRootB = CreateWindowsSessionResidue(
                 bufferParent,
-                11,
+                syntheticSessionBase + 11,
                 utcNow - TimeSpan.FromDays(4));
             var boundedRootC = CreateWindowsSessionResidue(
                 bufferParent,
-                12,
+                syntheticSessionBase + 12,
                 utcNow - TimeSpan.FromDays(3));
             Assert.Equal(
                 2,
@@ -4496,7 +4588,7 @@ internal static class Program
                     bufferParent,
                     currentRoot,
                     utcNow,
-                    new HashSet<int> { 3 },
+                    new HashSet<int> { syntheticSessionBase + 3 },
                     ownershipEstablished: true),
                 "One maintenance pass exceeded its Windows-session root deletion bound.");
             Assert.True(
@@ -5184,6 +5276,21 @@ internal static class Program
                     FirstFrame: 1,
                     FirstFrameElapsed: TimeSpan.FromSeconds(0.25),
                     LastFrame: 180,
+                    LastFrameElapsed: TimeSpan.FromSeconds(3.25),
+                    FirstDuplicatedFrames: 0,
+                    LastDuplicatedFrames: 162),
+                out var duplicatedGdiDiagnostic) &&
+            duplicatedGdiDiagnostic.Contains(
+                "unique FPS",
+                StringComparison.Ordinal),
+            "A nominal 60 FPS GDI probe made almost entirely of duplicated frames was accepted.");
+        Assert.True(
+            !FfmpegProbeRunner.IsProbeCadenceAcceptable(
+                gdiProbe,
+                new FfmpegProbeCadenceObservation(
+                    FirstFrame: 1,
+                    FirstFrameElapsed: TimeSpan.FromSeconds(0.25),
+                    LastFrame: 180,
                     LastFrameElapsed: TimeSpan.FromSeconds(6.25)),
                 out var slowGdiDiagnostic) &&
             slowGdiDiagnostic.Contains(
@@ -5689,6 +5796,53 @@ internal static class Program
     private static async Task TestDegradedCapabilityCacheAsync()
     {
         var configuration = CreateCaptureConfiguration(monitorIndex: 1);
+        var currentGdiStrategy = new VideoEncodingStrategy(
+            VideoEncoderKind.NvidiaNvenc,
+            DesktopCaptureBackend.Gdi);
+        var focusedRunner = new ScriptedProbeRunner(arguments =>
+            GetArgumentAfter(arguments, "-c:v") == "h264_nvenc" &&
+            arguments.Any(argument => argument.Contains(
+                "gfxcapture=",
+                StringComparison.Ordinal)) &&
+            !arguments.Any(argument => argument.Contains(
+                "hwdownload",
+                StringComparison.Ordinal)));
+        var focusedProbe = new FfmpegCapabilityProbe(focusedRunner);
+        var focusedSelection =
+            await focusedProbe.ReprobeWindowsGraphicsCaptureAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                currentGdiStrategy,
+                CancellationToken.None);
+        Assert.True(
+            focusedSelection.Strategy.CaptureBackend ==
+                DesktopCaptureBackend.WindowsGraphicsCapture &&
+            focusedRunner.CallCount == 1 &&
+            focusedRunner.Invocations.All(invocation =>
+                invocation.Arguments.Any(argument => argument.Contains(
+                    "gfxcapture=",
+                    StringComparison.Ordinal)) &&
+                !invocation.Arguments.Contains("gdigrab", StringComparer.Ordinal)),
+            "Objective GDI recovery ran the full capability suite instead of one focused WGC check.");
+
+        var unavailableFocusedRunner = new ScriptedProbeRunner(_ => false);
+        var unavailableFocusedProbe = new FfmpegCapabilityProbe(
+            unavailableFocusedRunner);
+        var unavailableFocusedSelection =
+            await unavailableFocusedProbe.ReprobeWindowsGraphicsCaptureAsync(
+                @"C:\Test\ffmpeg.exe",
+                configuration,
+                currentGdiStrategy,
+                CancellationToken.None);
+        Assert.True(
+            unavailableFocusedSelection.Strategy == currentGdiStrategy &&
+            unavailableFocusedRunner.CallCount == 2 &&
+            unavailableFocusedRunner.Invocations.All(invocation =>
+                invocation.Arguments.Any(argument => argument.Contains(
+                    "gfxcapture=",
+                    StringComparison.Ordinal))),
+            "A permanently unavailable WGC path escaped its bounded direct/transfer-only recovery probe.");
+
         var utcNow = new DateTimeOffset(
             2026,
             7,
@@ -6377,6 +6531,12 @@ internal static class Program
                 preserveCompletedSegments: false,
                 reachedSegmentBoundary: true),
             "Unaligned and health-triggered renewals must invalidate the old generation.");
+        Assert.True(
+            ReplayBufferService.ShouldPreserveDegradedCaptureHistory(
+                objectiveGdiStarvation: false) &&
+            !ReplayBufferService.ShouldPreserveDegradedCaptureHistory(
+                objectiveGdiStarvation: true),
+            "Objective GDI starvation retained the already-proven bad Recorder tail during WGC promotion.");
         Assert.True(
             ReplayBufferService.ShouldDeferNonDestructiveCaptureRefresh(
                 requireCompletedSegmentBoundary: true,

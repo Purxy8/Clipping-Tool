@@ -10,7 +10,9 @@ internal readonly record struct FfmpegProbeCadenceObservation(
     int FirstFrame,
     TimeSpan FirstFrameElapsed,
     int LastFrame,
-    TimeSpan LastFrameElapsed);
+    TimeSpan LastFrameElapsed,
+    long FirstDuplicatedFrames = 0,
+    long LastDuplicatedFrames = 0);
 
 internal interface IFfmpegProbeRunner
 {
@@ -189,6 +191,88 @@ internal sealed class FfmpegCapabilityProbe
             }
 
             return selection;
+        }
+        finally
+        {
+            _probeGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Rechecks only the WGC variants of the encoder already sustaining the
+    /// live GDI session. This bounded path is used after objective GDI cadence
+    /// starvation: it avoids running the complete multi-encoder capability
+    /// suite beside an active game and long Recorder session.
+    /// </summary>
+    internal async Task<FfmpegCapabilitySelection>
+        ReprobeWindowsGraphicsCaptureAsync(
+            string ffmpegPath,
+            CaptureConfiguration configuration,
+            VideoEncodingStrategy currentGdiStrategy,
+            CancellationToken cancellationToken,
+            CapturePerformanceProfile performanceProfile =
+                CapturePerformanceProfile.LowImpact)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(currentGdiStrategy);
+        if (currentGdiStrategy.CaptureBackend != DesktopCaptureBackend.Gdi)
+        {
+            throw new ArgumentException(
+                "A focused WGC recheck requires an active GDI strategy.",
+                nameof(currentGdiStrategy));
+        }
+
+        await _probeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var outputSize = CaptureGeometry.ResolveOutputSize(configuration);
+            var graphicsPath = DescribeGraphicsPath(outputSize);
+            var diagnostics = new List<string>();
+            var directStrategy = currentGdiStrategy with
+            {
+                CaptureBackend = DesktopCaptureBackend.WindowsGraphicsCapture,
+                RequiresSystemMemoryTransfer =
+                    currentGdiStrategy.Encoder == VideoEncoderKind.SoftwareX264
+            };
+            var candidates = directStrategy.RequiresSystemMemoryTransfer
+                ? [directStrategy]
+                : new[]
+                {
+                    directStrategy,
+                    directStrategy with { RequiresSystemMemoryTransfer = true }
+                };
+
+            foreach (var candidate in candidates)
+            {
+                var probe = await RunSafelyAsync(
+                        ffmpegPath,
+                        FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
+                            configuration,
+                            candidate,
+                            performanceProfile),
+                        performanceProfile,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (probe.Succeeded)
+                {
+                    diagnostics.Add(
+                        $"Selected {candidate.Description} with {graphicsPath} after a focused degraded-GDI recheck.");
+                    return new FfmpegCapabilitySelection(
+                        candidate,
+                        string.Join(' ', diagnostics));
+                }
+
+                diagnostics.Add(
+                    $"{candidate.Description} with {graphicsPath} unavailable: " +
+                    Summarize(probe.Diagnostic));
+            }
+
+            diagnostics.Add(
+                $"Retained {currentGdiStrategy.Description}; the bounded WGC recheck did not verify a replacement.");
+            return new FfmpegCapabilitySelection(
+                currentGdiStrategy,
+                string.Join(' ', diagnostics));
         }
         finally
         {
@@ -752,15 +836,26 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         }
 
         var requestedFramesPerSecond = 0;
-        var hasRequestedFramesPerSecond = graphicsFilter is not null
-            ? TryReadFilterInteger(
-                graphicsFilter,
-                "max_framerate=",
-                out requestedFramesPerSecond)
-            : TryReadOptionInteger(
+        // FFmpeg's progress counter belongs to the encoded output clock. WGC
+        // can deliberately sample above that rate to avoid refresh-divisor
+        // aliasing (for example, 84 input FPS for 60 FPS output on a 165 Hz
+        // display), so comparing progress with max_framerate would reject a
+        // perfectly healthy 60 FPS graph. Prefer the explicit output -r
+        // contract and retain the input rate only as a defensive fallback.
+        var hasRequestedFramesPerSecond =
+            TryReadOptionInteger(
                 arguments,
-                "-framerate",
-                out requestedFramesPerSecond);
+                "-r",
+                out requestedFramesPerSecond) ||
+            (graphicsFilter is not null
+                ? TryReadFilterInteger(
+                    graphicsFilter,
+                    "max_framerate=",
+                    out requestedFramesPerSecond)
+                : TryReadOptionInteger(
+                    arguments,
+                    "-framerate",
+                    out requestedFramesPerSecond));
         if (!TryReadOptionInteger(arguments, "-frames:v", out var requestedFrames) ||
             !hasRequestedFramesPerSecond ||
             requestedFrames <= 0 ||
@@ -796,14 +891,48 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         var observedFramesPerSecond =
             observedFrameDelta / observedDuration.TotalSeconds;
         var minimumFramesPerSecond = requestedFramesPerSecond * 0.85;
-        if (observedFramesPerSecond >= minimumFramesPerSecond)
+        if (observedFramesPerSecond < minimumFramesPerSecond)
+        {
+            diagnostic = string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"capture probe sustained {observedFramesPerSecond:0.##} FPS; " +
+                $"the required minimum is {minimumFramesPerSecond:0.##} FPS");
+            return false;
+        }
+
+        if (!isGdiCapture)
+        {
+            return true;
+        }
+
+        var duplicatedFrameDelta =
+            sample.LastDuplicatedFrames - sample.FirstDuplicatedFrames;
+        if (sample.FirstDuplicatedFrames < 0 ||
+            duplicatedFrameDelta < 0 ||
+            duplicatedFrameDelta > observedFrameDelta)
+        {
+            diagnostic =
+                "GDI capture probe reported invalid duplicated-frame progress";
+            return false;
+        }
+
+        // CFR output throughput alone can hide a starved GDI source: FFmpeg
+        // keeps writing 60 nominal frames by repeating the last acquired
+        // desktop frame. Validate the source cadence as well so that a graph
+        // producing the same failure mode as a stuttering long recording is
+        // never selected as a healthy fallback.
+        var observedUniqueFramesPerSecond =
+            (observedFrameDelta - duplicatedFrameDelta) /
+            observedDuration.TotalSeconds;
+        if (observedUniqueFramesPerSecond >= minimumFramesPerSecond)
         {
             return true;
         }
 
         diagnostic = string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"capture probe sustained {observedFramesPerSecond:0.##} FPS; " +
+            $"GDI capture probe sustained only {observedUniqueFramesPerSecond:0.##} unique FPS " +
+            $"({duplicatedFrameDelta} duplicated frames); " +
             $"the required minimum is {minimumFramesPerSecond:0.##} FPS");
         return false;
     }
@@ -912,30 +1041,27 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
         long processStartedAt,
         Action? firstFrameObserved = null)
     {
-        int? firstFrame = null;
+        var parser = new CaptureProgressParser();
+        CaptureProgressSample? firstSample = null;
         var firstFrameElapsed = TimeSpan.Zero;
-        var lastFrame = 0;
+        CaptureProgressSample? lastSample = null;
         var lastFrameElapsed = TimeSpan.Zero;
 
         while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
         {
-            const string framePrefix = "frame=";
-            if (!line.StartsWith(framePrefix, StringComparison.Ordinal) ||
-                !int.TryParse(
-                    line.AsSpan(framePrefix.Length).Trim(),
-                    System.Globalization.NumberStyles.Integer,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out var frame) ||
-                frame <= 0 ||
-                frame <= lastFrame)
+            var timestamp = Stopwatch.GetTimestamp();
+            if (!parser.TryParse(line, timestamp, out var sample) ||
+                sample is null ||
+                sample.Frame <= 0 ||
+                sample.Frame <= (lastSample?.Frame ?? 0))
             {
                 continue;
             }
 
             var elapsed = Stopwatch.GetElapsedTime(processStartedAt);
-            if (firstFrame is null)
+            if (firstSample is null)
             {
-                firstFrame = frame;
+                firstSample = sample;
                 firstFrameElapsed = elapsed;
                 try
                 {
@@ -948,16 +1074,18 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
                 }
             }
 
-            lastFrame = frame;
+            lastSample = sample;
             lastFrameElapsed = elapsed;
         }
 
-        return firstFrame is { } first
+        return firstSample is { } first && lastSample is { } last
             ? new FfmpegProbeCadenceObservation(
-                first,
+                checked((int)first.Frame),
                 firstFrameElapsed,
-                lastFrame,
-                lastFrameElapsed)
+                checked((int)last.Frame),
+                lastFrameElapsed,
+                first.DuplicatedFrames,
+                last.DuplicatedFrames)
             : null;
     }
 
