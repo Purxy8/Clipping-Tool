@@ -56,6 +56,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
         TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DegradedCaptureReprobeMaximumDelay =
         TimeSpan.FromMinutes(30);
+    private const string ObjectiveGdiReprobeDiagnosticPrefix =
+        "[objective-gdi-starvation] ";
     // Windows Graphics Capture frame pools can lose delivery cadence after a
     // long, uninterrupted desktop session while FFmpeg itself remains alive.
     // Renew only the capture process at a bounded age; the disk ring survives.
@@ -197,9 +199,20 @@ public sealed class ReplayBufferService : IAsyncDisposable
             (processId, diagnostic, exception) =>
             {
                 DeferDegradedCaptureReprobe();
+                var objectiveGdiStarvation =
+                    IsObjectiveGdiReprobeDiagnostic(diagnostic);
+                var cleanDiagnostic =
+                    StripObjectiveGdiReprobeDiagnosticPrefix(diagnostic);
                 EnqueueDiagnostic(
                     $"Background degraded-capture reprobe for process {processId} failed: " +
-                    $"{diagnostic} {exception.GetBaseException().Message}");
+                    $"{cleanDiagnostic} {exception.GetBaseException().Message}");
+                if (objectiveGdiStarvation)
+                {
+                    RequestCaptureRecovery(
+                        CaptureRecoveryReason.SourceStarvation,
+                        $"The focused WGC recovery check failed while GDI cadence was objectively starved. " +
+                        exception.GetBaseException().Message);
+                }
             });
 
         // Crash residue can contain thousands of large two-second segments.
@@ -3621,7 +3634,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 var degradedReprobeDeadline = Volatile.Read(
                     ref _degradedCaptureReprobeNotBeforeUtcTicks);
-                if (ShouldRunDegradedCaptureReprobe(
+                if (_sessionMode != CaptureSessionMode.Recording &&
+                    ShouldRunDegradedCaptureReprobe(
                         strategy.CaptureBackend,
                         Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
                         degradedReprobeDeadline,
@@ -3761,6 +3775,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var isWindowsGraphicsCapture =
                             strategy.CaptureBackend ==
                             DesktopCaptureBackend.WindowsGraphicsCapture;
+                        var isGdiCapture =
+                            strategy.CaptureBackend ==
+                            DesktopCaptureBackend.Gdi;
+                        var cadenceForegroundContext =
+                            ResolveCaptureCadenceForegroundContext(
+                                strategy.CaptureBackend,
+                                envelope.ForegroundContext);
                         var isInitialNativeLowImpactProfile =
                             isWindowsGraphicsCapture &&
                             !outputRequiresScaling &&
@@ -3782,14 +3803,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var observedAssessment =
                             _captureStarvationWatchdog?.Observe(
                                 envelope.Sample,
-                                envelope.ForegroundContext,
+                                cadenceForegroundContext,
                                 captureProcessUptime,
                                 allowSchedulingPressure:
                                     allowInitialProfileCadence,
                                 allowOutputThroughput: true,
                                 allowChronicLowCadence:
+                                    isGdiCapture ||
                                     allowInitialProfileCadence,
                                 allowSourceCadence:
+                                    isGdiCapture ||
                                     isWindowsGraphicsCapture &&
                                     !suppressNonObjectiveSourceCadence);
                         if (assessment is null &&
@@ -3863,9 +3886,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var faultContext =
                             assessmentForegroundContext ??
                             latestForegroundContext;
+                        var objectiveGdiCadence =
+                            strategy.CaptureBackend ==
+                                DesktopCaptureBackend.Gdi &&
+                            IsContentCadenceAssessment(assessment.Kind);
                         var usedCustomFullscreenFallback =
-                            assessment.UsedCustomFullscreenFallback ||
-                            faultContext.UsedCustomFullscreenFallback;
+                            !objectiveGdiCadence &&
+                            (assessment.UsedCustomFullscreenFallback ||
+                             faultContext.UsedCustomFullscreenFallback);
                         var recoveryReason = SelectSafeCadenceRecoveryReason(
                             outputRequiresScaling,
                             _activeCapturePerformanceProfile,
@@ -3881,6 +3909,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             $"coverage={faultContext.CapturedDisplayCoverage:0.000}; " +
                             $"customFullscreen={usedCustomFullscreenFallback}; " +
                             $"profile={_activeCapturePerformanceProfile}.");
+                        if (objectiveGdiCadence &&
+                            QueueDegradedCaptureReprobe(
+                                process.Id,
+                                diagnostic,
+                                objectiveGdiStarvation: true))
+                        {
+                            RecordCaptureRuntimeEvent(
+                                "capture_gdi_starvation_wgc_reprobe_queued",
+                                process,
+                                configuration,
+                                strategy,
+                                diagnostic);
+                            continue;
+                        }
+
                         if (recoveryReason is null)
                         {
                             // Win32 cannot reliably distinguish a stretched
@@ -4508,6 +4551,24 @@ public sealed class ReplayBufferService : IAsyncDisposable
             CaptureStarvationKind.SchedulingPressure or
             CaptureStarvationKind.ChronicLowCadence;
 
+    internal static CaptureForegroundContext
+        ResolveCaptureCadenceForegroundContext(
+            DesktopCaptureBackend captureBackend,
+            CaptureForegroundContext foregroundContext) =>
+        captureBackend == DesktopCaptureBackend.Gdi
+            ? foregroundContext with
+            {
+                // gdigrab is timer-driven rather than content/change-driven.
+                // Its CFR duplicate counter therefore measures failed desktop
+                // acquisitions even on an idle or windowed desktop. Treat that
+                // source telemetry as objective without depending on Win32's
+                // necessarily heuristic fullscreen/input classification.
+                IsFullscreenOnCapturedDisplay = true,
+                HasRecentInput = true,
+                UsedCustomFullscreenFallback = false
+            }
+            : foregroundContext;
+
     internal static bool ShouldSuppressNonObjectiveCaptureCadence(
         bool usedCustomFullscreenFallback,
         bool outputRequiresScaling,
@@ -4720,6 +4781,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
         bool preserveCompletedSegments,
         bool reachedSegmentBoundary) =>
         preserveCompletedSegments && reachedSegmentBoundary;
+
+    internal static bool ShouldPreserveDegradedCaptureHistory(
+        bool objectiveGdiStarvation) =>
+        !objectiveGdiStarvation;
 
     internal static bool ShouldDeferNonDestructiveCaptureRefresh(
         bool requireCompletedSegmentBoundary,
@@ -5069,30 +5134,45 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private bool QueueDegradedCaptureReprobe(
         int? expectedProcessId,
-        string diagnostic)
+        string diagnostic,
+        bool objectiveGdiStarvation = false)
     {
         var deadlineUtcTicks = Volatile.Read(
             ref _degradedCaptureReprobeNotBeforeUtcTicks);
+        var strategyUsesCapabilityProbe =
+            Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0;
+        var captureBackend = _activeCaptureStrategy?.CaptureBackend;
+        var deadlineReached = ShouldScheduleDegradedCaptureReprobe(
+            captureBackend,
+            strategyUsesCapabilityProbe,
+            deadlineUtcTicks,
+            DateTimeOffset.UtcNow.UtcDateTime.Ticks);
+        var objectiveReprobeAllowed =
+            objectiveGdiStarvation &&
+            ShouldScheduleObjectiveGdiReprobe(
+                captureBackend,
+                strategyUsesCapabilityProbe,
+                Volatile.Read(ref _degradedCaptureReprobeAttempt),
+                deadlineUtcTicks,
+                DateTimeOffset.UtcNow.UtcDateTime.Ticks);
         if (expectedProcessId is not { } processId ||
             processId <= 0 ||
             Volatile.Read(ref _disposed) != 0 ||
             Volatile.Read(ref _isStopping) != 0 ||
             !IsRunning ||
-            _sessionMode == CaptureSessionMode.Recording ||
             IsActiveCaptureGenerationExportBlocked() ||
-            !ShouldScheduleDegradedCaptureReprobe(
-                _activeCaptureStrategy?.CaptureBackend,
-                Volatile.Read(ref _activeStrategyUsesCapabilityProbe) != 0,
-                deadlineUtcTicks,
-                DateTimeOffset.UtcNow.UtcDateTime.Ticks) ||
+            !deadlineReached && !objectiveReprobeAllowed ||
             CaptureProcessId != processId)
         {
             return false;
         }
 
+        var coordinatorDiagnostic = objectiveGdiStarvation
+            ? ObjectiveGdiReprobeDiagnosticPrefix + diagnostic
+            : diagnostic;
         var queued = _degradedCaptureReprobeCoordinator.TrySchedule(
             processId,
-            diagnostic);
+            coordinatorDiagnostic);
         if (queued)
         {
             EnqueueDiagnostic(
@@ -5111,6 +5191,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string diagnostic,
         CancellationToken cancellationToken)
     {
+        var objectiveGdiStarvation =
+            IsObjectiveGdiReprobeDiagnostic(diagnostic);
+        diagnostic = StripObjectiveGdiReprobeDiagnosticPrefix(diagnostic);
         var configuration = _activeConfiguration;
         var ffmpegPath = _activeFfmpegPath;
         var currentStrategy = _activeCaptureStrategy;
@@ -5136,13 +5219,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         var foregroundContext =
             CaptureForegroundContextProbe.Read(configuration!.Display);
-        if (ShouldDeferDegradedCaptureReprobeForGameplay(
+        if (!objectiveGdiStarvation &&
+            ShouldDeferDegradedCaptureReprobeForGameplay(
                 foregroundContext))
         {
             // The capability probe is a real three-second capture/encode graph.
-            // Never launch that competing workload while the user is actively
-            // playing; the monitor will retry the already-due check after an
-            // alt-tab or idle period.
+            // Periodic Instant Replay maintenance can retry the already-due
+            // check after an alt-tab or idle period. Recorder never enters
+            // this periodic path; only objective GDI starvation can request
+            // its focused WGC-only replacement check.
             return;
         }
 
@@ -5175,19 +5260,29 @@ public sealed class ReplayBufferService : IAsyncDisposable
             CancellationTokenSource.CreateLinkedTokenSource(
                 cancellationToken,
                 sessionCancellation);
-        var inputMonitorTask = CancelDegradedCaptureReprobeOnInputAsync(
-            configuration.Display,
-            probeCancellation,
-            inputMonitorCancellation.Token);
+        var inputMonitorTask = objectiveGdiStarvation
+            ? Task.CompletedTask
+            : CancelDegradedCaptureReprobeOnInputAsync(
+                configuration.Display,
+                probeCancellation,
+                inputMonitorCancellation.Token);
         FfmpegCapabilitySelection selection;
         try
         {
-            selection = await _capabilityProbe.SelectAsync(
-                    verifiedFfmpegPath,
-                    configuration,
-                    probeCancellation.Token,
-                    performanceProfile)
-                .ConfigureAwait(false);
+            selection = objectiveGdiStarvation
+                ? await _capabilityProbe.ReprobeWindowsGraphicsCaptureAsync(
+                        verifiedFfmpegPath,
+                        configuration,
+                        currentStrategy!,
+                        probeCancellation.Token,
+                        performanceProfile)
+                    .ConfigureAwait(false)
+                : await _capabilityProbe.SelectAsync(
+                        verifiedFfmpegPath,
+                        configuration,
+                        probeCancellation.Token,
+                        performanceProfile)
+                    .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (
             sessionCancellation.IsCancellationRequested)
@@ -5244,30 +5339,52 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 configuration,
                 selection.Strategy,
                 "WGC was still unavailable; the verified GDI session remains active.");
+            if (objectiveGdiStarvation)
+            {
+                RequestCaptureRecovery(
+                    CaptureRecoveryReason.SourceStarvation,
+                    "GDI source cadence was objectively starved and the focused WGC replacement check remained unavailable. " +
+                    selection.Diagnostics);
+            }
+
             return;
         }
 
         var refreshed = await RefreshCaptureAsync(
                 expectedProcessId,
                 cancellationToken,
-                preserveCompletedSegments: true,
+                // A routine idle promotion retains its healthy GDI history.
+                // Objective starvation has already proven the recent cadence
+                // bad: Recorder's destructive path quarantines only its bounded
+                // recent tail, while Instant Replay safely re-buffers.
+                preserveCompletedSegments:
+                    ShouldPreserveDegradedCaptureHistory(
+                        objectiveGdiStarvation),
                 verifiedReplacement: selection,
                 performanceProfileOverride: performanceProfile)
             .ConfigureAwait(false);
         if (!refreshed)
         {
-            if (IsCurrentDegradedCapture(
+            var degradedCaptureIsStillCurrent =
+                IsCurrentDegradedCapture(
                     expectedProcessId,
                     sessionIdentity,
                     configuration,
                     ffmpegPath,
-                    currentStrategy))
+                    currentStrategy);
+            if (degradedCaptureIsStillCurrent)
             {
                 ScheduleNextDegradedCaptureReprobe(selection.CacheExpiresAtUtc);
             }
 
             EnqueueDiagnostic(
                 $"Skipped stale degraded-capture promotion for process {expectedProcessId}.");
+            if (objectiveGdiStarvation && degradedCaptureIsStillCurrent)
+            {
+                RequestCaptureRecovery(
+                    CaptureRecoveryReason.SourceStarvation,
+                    "GDI cadence was objectively starved and the verified WGC promotion could not complete at a safe segment boundary.");
+            }
         }
     }
 
@@ -5373,6 +5490,22 @@ public sealed class ReplayBufferService : IAsyncDisposable
         deadlineUtcTicks > 0 &&
         nowUtcTicks >= deadlineUtcTicks;
 
+    internal static bool ShouldScheduleObjectiveGdiReprobe(
+        DesktopCaptureBackend? captureBackend,
+        bool strategyUsesCapabilityProbe,
+        int reprobeAttempt,
+        long deadlineUtcTicks,
+        long nowUtcTicks) =>
+        ShouldScheduleDegradedCaptureReprobe(
+            captureBackend,
+            strategyUsesCapabilityProbe,
+            deadlineUtcTicks,
+            nowUtcTicks) ||
+        ShouldMaintainDegradedCaptureReprobe(
+            captureBackend,
+            strategyUsesCapabilityProbe) &&
+        reprobeAttempt <= 1;
+
     internal static bool ShouldRunDegradedCaptureReprobe(
         DesktopCaptureBackend? captureBackend,
         bool strategyUsesCapabilityProbe,
@@ -5390,6 +5523,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
     internal static bool ShouldDeferDegradedCaptureReprobeForGameplay(
         CaptureForegroundContext foregroundContext) =>
         foregroundContext.HasRecentInput;
+
+    internal static bool IsObjectiveGdiReprobeDiagnostic(
+        string diagnostic) =>
+        diagnostic.StartsWith(
+            ObjectiveGdiReprobeDiagnosticPrefix,
+            StringComparison.Ordinal);
+
+    internal static string StripObjectiveGdiReprobeDiagnosticPrefix(
+        string diagnostic) =>
+        IsObjectiveGdiReprobeDiagnostic(diagnostic)
+            ? diagnostic[ObjectiveGdiReprobeDiagnosticPrefix.Length..]
+            : diagnostic;
 
     internal static bool ShouldMaintainDegradedCaptureReprobe(
         DesktopCaptureBackend? captureBackend,
