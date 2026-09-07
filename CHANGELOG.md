@@ -4,6 +4,26 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.18] - 2026-09-07
+
+### Release status
+
+- Unsigned public beta; Windows can show an unverified-publisher or SmartScreen warning. This remains a GitHub pre-release.
+
+### Fixed
+
+- Fixed the reproduced quiet-desktop startup failure: mapped, unrotated monitors now prefer runtime-verified Desktop Duplication, whose frame clock continues when the desktop is unchanged. The one-hour Instant Replay setting is preserved.
+- Explicitly match the selected display to its DXGI adapter/output instead of reusing the unrelated Windows monitor ordinal. Source avoids resizing; NVIDIA 1080p reduction uses the existing CUDA path with a separately verified compatibility path.
+- Keep output-throughput, progress-gap, and bounded recovery checks without misclassifying internally repeated idle frames as distinct desktop updates. Verified Desktop Duplication can replace a degraded GDI session.
+- Reacquire changed display targets safely. Recorder retries temporarily unavailable mapping, then uses safe Stop/Save if the display remains unsupported; a stale display refresh cannot stop a newly started recording.
+
+### Verification
+
+- Release builds passed without warnings/errors; 105/105 deterministic tests passed.
+- Real Source/1080p Replay tests passed with desktop audio and microphone, on static and moving displays. Ten-second static clips contained 600 decoded frames and saved in approximately 0.6 seconds.
+- Movement-to-idle Recorder tests retained more than twelve seconds at 60 FPS with aligned audio and no pending recording; Stop/Save took approximately 0.85–0.91 seconds.
+- These are bounded real tests with one-hour retention configured, not completed one-hour/twelve-hour soaks or saturated-GPU Apex/CS2 certification. See [detailed validation and limitations](docs/desktop-duplication-validation-2026-09-07.md).
+
 ## [1.9.0-beta.17] - 2026-09-07
 
 ### Release status

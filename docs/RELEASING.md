@@ -154,6 +154,14 @@ Get-Content .\artifacts\Releases\SHA256SUMS.txt
 
 On the Windows capture test PC, validate the fixed-resolution and Source paths with the same engine and audio configuration intended for release:
 
+Mapped, unrotated monitors now prefer Desktop Duplication. In addition to the
+compatibility-path checks below, run `--dda-idle-smoke` at Source and 1080p with
+`--audio --microphone`, and repeat with `--recorder --motion-first-seconds 4`.
+The default production motion matrix omits `--force-wgc`; retain that flag only
+when explicitly checking the WGC fallback. See the
+[quiet-desktop validation record](desktop-duplication-validation-2026-09-07.md)
+for measured results and untested scenarios.
+
 ```powershell
 $smokeProject = '.\tests\ClipForge.CaptureSmoke\ClipForge.CaptureSmoke.csproj'
 $smokeRoot = '.\artifacts\capture-release-smoke'

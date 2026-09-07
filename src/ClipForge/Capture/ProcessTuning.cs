@@ -107,16 +107,18 @@ internal static class ProcessTuning
         if (captureOutputRequiresScaling ||
             performanceProfile == CapturePerformanceProfile.Resilient)
         {
-            // gfxcapture's fixed-output resizer can fall below real-time cadence
+            // GPU capture's fixed-output resizer can fall below real-time cadence
             // when Windows schedules its coordination thread at BelowNormal,
-            // even though measured CPU use is very small. Scaled WGC and a
+            // even though measured CPU use is very small. Scaled WGC/DXGI and a
             // native Source/GDI session promoted after measured starvation run
             // at Normal. Low-impact native capture continues yielding to the
             // game.
             return ScaledCapturePriority;
         }
 
-        return strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+        return strategy.CaptureBackend is
+                   DesktopCaptureBackend.WindowsGraphicsCapture or
+                   DesktopCaptureBackend.DesktopDuplication &&
                strategy.IsHardwareEncoder &&
                !strategy.RequiresSystemMemoryTransfer
             ? HardwareCapturePriority
@@ -129,7 +131,7 @@ internal static class ProcessTuning
         CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact) =>
         captureOutputRequiresScaling ||
         performanceProfile == CapturePerformanceProfile.Resilient
-            // The fixed-resolution WGC path performs capture, D3D resize, and
+            // The fixed-resolution GPU path performs capture, resize, and
             // hardware encode in the same FFmpeg process. BelowNormal can starve
             // that scaler while a fullscreen game saturates the GPU. A native
             // Source/GDI session opts into this class only after measured

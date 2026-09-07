@@ -72,6 +72,16 @@ try
         return 0;
     }
 
+    if (args.Contains("--dda-idle-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await DesktopDuplicationSmoke.RunAsync(
+            setup,
+            artifactRoot,
+            args,
+            timeout.Token);
+        return 0;
+    }
+
     if (args.Contains("--resolution-matrix", StringComparer.OrdinalIgnoreCase))
     {
         await RunResolutionMatrixAsync(

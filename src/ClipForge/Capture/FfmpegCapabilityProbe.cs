@@ -145,8 +145,8 @@ internal sealed class FfmpegCapabilityProbe
             // A short, bounded backoff prevents rapid replay restarts from
             // repeating several expensive probes on machines where WGC is
             // permanently unavailable, while still retrying transient failures.
-            if (selection.Strategy.CaptureBackend ==
-                DesktopCaptureBackend.WindowsGraphicsCapture)
+            if (selection.Strategy.CaptureBackend is
+                DesktopCaptureBackend.WindowsGraphicsCapture or DesktopCaptureBackend.DesktopDuplication)
             {
                 var expiresAtUtc = _getUtcNow() + _positiveCacheDuration;
                 selection = selection with { CacheExpiresAtUtc = expiresAtUtc };
@@ -235,7 +235,7 @@ internal sealed class FfmpegCapabilityProbe
                 RequiresSystemMemoryTransfer =
                     currentGdiStrategy.Encoder == VideoEncoderKind.SoftwareX264
             };
-            var candidates = directStrategy.RequiresSystemMemoryTransfer
+            var wgcCandidates = directStrategy.RequiresSystemMemoryTransfer
                 ? [directStrategy]
                 : new[]
                 {
@@ -243,14 +243,29 @@ internal sealed class FfmpegCapabilityProbe
                     directStrategy with { RequiresSystemMemoryTransfer = true }
                 };
 
+            var candidates = new List<VideoEncodingStrategy>();
+            if (configuration.Display.DesktopDuplicationTarget is not null)
+            {
+                var desktop = directStrategy with
+                {
+                    CaptureBackend = DesktopCaptureBackend.DesktopDuplication,
+                    RequiresSystemMemoryTransfer = directStrategy.RequiresSystemMemoryTransfer ||
+                        outputSize.RequiresScaling && directStrategy.Encoder != VideoEncoderKind.NvidiaNvenc
+                };
+                candidates.Add(desktop);
+                if (!desktop.RequiresSystemMemoryTransfer)
+                {
+                    candidates.Add(desktop with { RequiresSystemMemoryTransfer = true });
+                }
+            }
+            candidates.AddRange(wgcCandidates);
             foreach (var candidate in candidates)
             {
                 var probe = await RunSafelyAsync(
                         ffmpegPath,
-                        FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
-                            configuration,
-                            candidate,
-                            performanceProfile),
+                        candidate.CaptureBackend == DesktopCaptureBackend.DesktopDuplication
+                            ? FfmpegArgumentBuilder.BuildDesktopDuplicationProbeArguments(configuration, candidate, performanceProfile)
+                            : FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(configuration, candidate, performanceProfile),
                         performanceProfile,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -269,7 +284,7 @@ internal sealed class FfmpegCapabilityProbe
             }
 
             diagnostics.Add(
-                $"Retained {currentGdiStrategy.Description}; the bounded WGC recheck did not verify a replacement.");
+                $"Retained {currentGdiStrategy.Description}; the bounded graphics recheck did not verify a replacement.");
             return new FfmpegCapabilitySelection(
                 currentGdiStrategy,
                 string.Join(' ', diagnostics));
@@ -398,6 +413,32 @@ internal sealed class FfmpegCapabilityProbe
         var targetHeight = outputSize.Height;
         var graphicsPath = DescribeGraphicsPath(outputSize);
 
+        // Full-monitor WGC is change-driven: a quiet desktop can stall both
+        // its runtime probe and the live segment clock. Prefer the verified
+        // Desktop Duplication producer, which clocks unchanged frames too.
+        // Never guess adapter-local output indices from Screen.AllScreens.
+        if (configuration.Display.DesktopDuplicationTarget is not null)
+        {
+            foreach (var encoder in HardwarePreference)
+            {
+                var direct = new VideoEncodingStrategy(encoder, DesktopCaptureBackend.DesktopDuplication,
+                    RequiresSystemMemoryTransfer: outputSize.RequiresScaling && encoder != VideoEncoderKind.NvidiaNvenc);
+                var candidates = new[] { direct, direct with { RequiresSystemMemoryTransfer = true } }.Distinct();
+                foreach (var candidate in candidates)
+                {
+                    var execution = await RunSafelyAsync(ffmpegPath,
+                        FfmpegArgumentBuilder.BuildDesktopDuplicationProbeArguments(configuration, candidate, performanceProfile),
+                        performanceProfile, cancellationToken).ConfigureAwait(false);
+                    if (execution.Succeeded)
+                    {
+                        diagnostics.Add($"Selected {candidate.Description} with a clocked desktop source after runtime verification.");
+                        return new FfmpegCapabilitySelection(candidate, string.Join(' ', diagnostics));
+                    }
+                    diagnostics.Add($"{candidate.Description} unavailable: {Summarize(execution.Diagnostic)}");
+                }
+            }
+        }
+
         foreach (var encoder in HardwarePreference)
         {
             var gdiStrategy = new VideoEncodingStrategy(encoder, DesktopCaptureBackend.Gdi);
@@ -508,6 +549,19 @@ internal sealed class FfmpegCapabilityProbe
             VideoEncoderKind.SoftwareX264,
             DesktopCaptureBackend.WindowsGraphicsCapture,
             RequiresSystemMemoryTransfer: true);
+        if (configuration.Display.DesktopDuplicationTarget is not null)
+        {
+            var softwareDesktop = softwareGraphics with { CaptureBackend = DesktopCaptureBackend.DesktopDuplication };
+            var desktopProbe = await RunSafelyAsync(ffmpegPath,
+                FfmpegArgumentBuilder.BuildDesktopDuplicationProbeArguments(configuration, softwareDesktop, performanceProfile),
+                performanceProfile, cancellationToken).ConfigureAwait(false);
+            if (desktopProbe.Succeeded)
+            {
+                diagnostics.Add($"Selected {softwareDesktop.Description} after runtime verification.");
+                return new FfmpegCapabilitySelection(softwareDesktop, string.Join(' ', diagnostics));
+            }
+            diagnostics.Add($"{softwareDesktop.Description} unavailable: {Summarize(desktopProbe.Diagnostic)}");
+        }
         var softwareGraphicsProbe = await RunSafelyAsync(
                 ffmpegPath,
                 FfmpegArgumentBuilder.BuildGraphicsCaptureProbeArguments(
@@ -605,6 +659,7 @@ internal sealed class FfmpegCapabilityProbe
             configuration.Display.Top,
             configuration.Display.Width,
             configuration.Display.Height,
+            configuration.Display.DesktopDuplicationTarget,
             configuration.Resolution.Width,
             configuration.Resolution.Height,
             configuration.FramesPerSecond,
@@ -850,7 +905,7 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             (graphicsFilter is not null
                 ? TryReadFilterInteger(
                     graphicsFilter,
-                    "max_framerate=",
+                    graphicsFilter.Contains("ddagrab=", StringComparison.Ordinal) ? "framerate=" : "max_framerate=",
                     out requestedFramesPerSecond)
                 : TryReadOptionInteger(
                     arguments,
@@ -940,7 +995,8 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
     private static string? FindGraphicsCaptureFilter(
         IReadOnlyList<string> arguments) =>
         arguments.FirstOrDefault(argument =>
-            argument.Contains("gfxcapture=", StringComparison.Ordinal));
+            argument.Contains("gfxcapture=", StringComparison.Ordinal) ||
+            argument.Contains("ddagrab=", StringComparison.Ordinal));
 
     internal static bool TryResolveCaptureProbePolicy(
         IReadOnlyList<string> arguments,
@@ -1003,6 +1059,8 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             encoder,
             isGdiCapture
                 ? DesktopCaptureBackend.Gdi
+                : graphicsFilter?.Contains("ddagrab=", StringComparison.Ordinal) == true
+                ? DesktopCaptureBackend.DesktopDuplication
                 : DesktopCaptureBackend.WindowsGraphicsCapture,
             RequiresSystemMemoryTransfer: !isGdiCapture &&
                 arguments.Any(argument =>
