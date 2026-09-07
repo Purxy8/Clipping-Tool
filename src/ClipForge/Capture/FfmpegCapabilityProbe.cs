@@ -628,7 +628,7 @@ internal sealed class FfmpegCapabilityProbe
 
     private static string DescribeGraphicsPath(CaptureOutputSize outputSize) =>
         outputSize.RequiresScaling
-            ? $"low-overhead point scaling to {outputSize.Width}x{outputSize.Height}"
+            ? $"runtime-verified scaling to {outputSize.Width}x{outputSize.Height}"
             : $"native {outputSize.Width}x{outputSize.Height} surfaces";
 
     private sealed record CachedCapabilitySelection(
@@ -963,6 +963,12 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
             outputRequiresScaling =
                 graphicsFilter.Contains(
                     ":resize_mode=scale",
+                    StringComparison.Ordinal) ||
+                graphicsFilter.Contains(
+                    ",scale_cuda=",
+                    StringComparison.Ordinal) ||
+                graphicsFilter.Contains(
+                    ",scale=",
                     StringComparison.Ordinal);
         }
         else
@@ -1000,7 +1006,8 @@ internal sealed class FfmpegProbeRunner : IFfmpegProbeRunner
                 : DesktopCaptureBackend.WindowsGraphicsCapture,
             RequiresSystemMemoryTransfer: !isGdiCapture &&
                 arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal)));
+                    argument.Contains("hwdownload", StringComparison.Ordinal) &&
+                    !argument.Contains("hwupload_cuda", StringComparison.Ordinal)));
         return true;
     }
 

@@ -4,10 +4,34 @@ All notable user-facing changes to ClipForge are recorded here.
 
 ## [Unreleased]
 
+## [1.9.0-beta.17] - 2026-09-07
+
+### Release status
+
+- Unsigned public beta; Windows can show an unverified-publisher or SmartScreen warning. This remains a GitHub pre-release.
+
 ### Fixed
 
 - Recorder is now controlled by Start and Stop & save rather than an elapsed-time limit. It exposes no Instant Replay retention window, continues past the former 24-hour boundary while storage remains safe, and still preserves the session if the selected drive disappears or lacks finalization headroom.
-- Recorder finalization now has its own full-session stream-copy command without Replay's `-ss` or `-t` clipping bounds, so every trusted segment from Start through Stop & save is retained.
+- Recorder writes one permanent fragmented MP4 from Start through Stop while keeping independent ten-second Matroska recovery segments. A normal stop now publishes the already-written MP4 with metadata-only close and an atomic move instead of copying or remuxing a multi-gigabyte session; the segment fallback remains available after an interrupted or invalid direct output.
+- Stop & save signals the exact active FFmpeg process before waiting for lifecycle or save gates, and capture refresh cannot replace that process after the click. This makes stop latency independent of recording length while preserving bounded cleanup and crash recovery.
+- Recorder normalizes video and AAC packet timestamps before both tee outputs. This removes the AAC-priming opening hitch (the first 60 FPS packet previously lasted about 38 ms), preserves the final packets on graceful shutdown, and keeps Source and fixed-resolution WGC/NVENC recordings at an even cadence.
+- Recorder recovery now journals the exact continuous live output, accepts private legacy split-output sessions, rejects missing or unsafe components before promotion, and persists the detached session state before closing its live journal. Short legacy merges normalize both video and optional audio packet timestamps without attaching an audio filter to silent recordings.
+- Recorder finalization has its own full-session stream-copy fallback without Replay's `-ss` or `-t` clipping bounds, so every trusted segment from Start through Stop & save is retained. Long-session manifests store compact contiguous segment ranges instead of an unbounded path list.
+- Recovery-locator collisions now append and flush an immutable `superseded` terminal before best-effort cleanup. A sharing violation can no longer make a stale locator resurrect or delete a replacement Recorder session after restart.
+- Graceful Stop journals the closed partial final segment and its exact duration, including recordings shorter than ten seconds. Repaired locator families preserve terminal precedence, recovery discovery pages past stale candidates, and schema-aware crash recovery retains the valid first segment from current Recorder sessions.
+- Cross-drive Recorder copies pin the validated source throughout copying and commit the destination's own file identity. A byte-for-byte copy no longer fails solely because Windows assigns it a new file ID, while changed source/output identities still preserve recovery media.
+- Capture health checks distinguish a genuinely starved WGC surface from foreground/fullscreen transitions and use the locked Recorder output geometry across Source, 1080p, 1440p, and stretched/custom-resolution changes without repeatedly restarting a healthy process.
+- Replay and Recorder normalize encoded video/AAC packet clocks before their output muxers, preventing an AAC-priming or WGC-startup packet from becoming a visibly long first frame. Replay rejects non-segment-aligned internal save requests instead of silently turning a large stream-copy export into a full software re-encode.
+- Replay-save capacity checks reserve the complete output plus the protected rolling overlap, monitor split buffer/output volumes independently every three seconds, and bind cancellation to the exact save identity even if capture faults. A stale probe cannot cancel a later save or stop a newly started capture session.
+- Recent clips and Library thumbnail hydration now reject stale file identities, release decoded cache files, and refresh missing posters without letting long-running background media work compete with capture or playback.
+
+### Verification
+
+- Release builds complete with zero warnings or errors and the deterministic suite passes 98/98 tests, including immediate Recorder stop, continuous-output recovery, copied-output identity, superseded/corrupt journals, storage arithmetic, legacy short-session promotion, Source/fixed geometry, starvation recovery, thumbnail identity, and concurrent lifecycle coverage.
+- A 12-second 60 FPS/AAC tee test crossed a ten-second recovery boundary with exact direct/recovery packet parity and closed the fragmented MP4 trailer in about 134 ms. Silent and four-second audio variants also passed.
+- Real Windows Graphics Capture/NVIDIA NVENC tests passed at Source 2560x1440 and fixed 1920x1080, both at 60 FPS with desktop audio. A fresh six-second Replay contained exactly 360 frames at 60.01 FPS, a 17 ms first packet and maximum gap, no motion freeze, and saved in about 0.88 seconds. A forced Recorder recovery crossing the ten-second checkpoint retained 745 frames over 12.416 seconds at 60.003 FPS, including its partial tail, and finalized in about 1.64 seconds.
+- The 1290x980 stretched/custom-source matrix passed Source, 720p, 1080p, 1440p, and 2160p at both 30 and 60 FPS with exact frame counts and no duplicate frames. All ten Replay lengths from 30 seconds through one hour passed; the one-hour synthetic timeline saved in about 3.38 seconds. A compact 12-hour/21,600-segment Recorder manifest finalized in about 14.16 seconds, validating bounded indexing/timeline overhead rather than 40 GB disk throughput.
 
 ## [1.9.0-beta.13] - 2026-08-04
 

@@ -49,6 +49,29 @@ try
         return 0;
     }
 
+    if (args.Contains("--recorder-fast-path-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await RecorderFastPathSmoke.RunAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            requestedRealSaveSeconds,
+            args.Contains("--audio", StringComparer.OrdinalIgnoreCase),
+            timeout.Token);
+        return 0;
+    }
+
+    if (args.Contains("--recorder-service-smoke", StringComparer.OrdinalIgnoreCase))
+    {
+        await RecorderServiceWgcSmoke.RunAsync(
+            setup,
+            ffmpeg,
+            artifactRoot,
+            args,
+            timeout.Token);
+        return 0;
+    }
+
     if (args.Contains("--resolution-matrix", StringComparer.OrdinalIgnoreCase))
     {
         await RunResolutionMatrixAsync(
@@ -803,12 +826,24 @@ try
         "v:0",
         "pts_time",
         timeout.Token);
+    var videoPacketDurations = await ReadPacketTimestampsAsync(
+        ffprobe,
+        clipPath,
+        "v:0",
+        "duration_time",
+        timeout.Token);
     var maxVideoFrameDelta = ReadMaximumPositiveDelta(videoPacketTimes);
     var maximumAllowedFrameDelta = 1.6 / framesPerSecond;
-    if (maxVideoFrameDelta > maximumAllowedFrameDelta)
+    var firstVideoPacketDuration = videoPacketDurations[0];
+    if (Math.Abs(videoPacketTimes[0]) > maximumAllowedFrameDelta ||
+        firstVideoPacketDuration < 0.4 / framesPerSecond ||
+        firstVideoPacketDuration > maximumAllowedFrameDelta ||
+        maxVideoFrameDelta > maximumAllowedFrameDelta)
     {
         throw new InvalidDataException(
-            $"Saved video contained a {maxVideoFrameDelta * 1000:0.###} ms frame gap; " +
+            $"Saved video started at {videoPacketTimes[0] * 1000:0.###} ms with a " +
+            $"{firstVideoPacketDuration * 1000:0.###} ms first packet and contained a " +
+            $"{maxVideoFrameDelta * 1000:0.###} ms frame gap; " +
             $"expected at most {maximumAllowedFrameDelta * 1000:0.###} ms at {framesPerSecond} FPS.");
     }
 
@@ -857,6 +892,7 @@ try
         $"Duration: {duration:0.###} seconds; size: {new FileInfo(clipPath).Length:N0} bytes; " +
         $"video: {mediaInfo.Width}x{mediaInfo.Height} at {mediaInfo.AverageFrameRate:0.###} FPS, " +
         $"frames: {mediaInfo.FrameCount.ToString(CultureInfo.InvariantCulture)}; " +
+        $"first video packet: {firstVideoPacketDuration * 1000:0.###} ms; " +
         $"max frame delta: {maxVideoFrameDelta * 1000:0.###} ms; " +
         (motionStats is null
             ? string.Empty

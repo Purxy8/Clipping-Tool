@@ -25,11 +25,13 @@ internal sealed record CaptureStarvationAssessment(
     bool UsedCustomFullscreenFallback = false);
 
 /// <summary>
-/// Detects source starvation from FFmpeg's cumulative CFR counters. It
-/// deliberately requires a fullscreen foreground surface, so a static desktop
-/// cannot be mistaken for a failed game capture. Severe starvation is detected
-/// quickly, while moderate starvation is only considered after a sustained
-/// window in an aged capture session.
+/// Detects source starvation from FFmpeg's cumulative CFR counters. Content
+/// cadence checks deliberately require a fullscreen foreground surface, so a
+/// static desktop cannot be mistaken for a failed game capture. Objective
+/// output-throughput checks remain independent of foreground classification so
+/// custom/windowed resolutions cannot hide a graph that is running below real
+/// time. Severe starvation is detected quickly, while moderate starvation is
+/// only considered after a sustained window in an aged capture session.
 /// </summary>
 internal sealed class CaptureStarvationWatchdog
 {
@@ -50,6 +52,8 @@ internal sealed class CaptureStarvationWatchdog
     private static readonly TimeSpan FullscreenEligibilityLossResetWindow = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan MaximumQueuedProgressReceiptInterval =
         TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan MaximumRecoveredProgressReceiptInterval =
+        TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaximumHistory = TimeSpan.FromSeconds(32);
     // ReplayBufferService retains at most 256 parsed progress records. Permit
     // that entire bounded queue to drain before judging a parent-process pause
@@ -57,6 +61,7 @@ internal sealed class CaptureStarvationWatchdog
     private const int MaximumQueuedProgressCatchUpSamples = 256;
     private readonly int _targetFramesPerSecond;
     private readonly Queue<Observation> _observations = new();
+    private readonly Queue<Observation> _objectiveObservations = new();
     private bool _triggered;
     private bool _observedHealthyActiveCadence;
     private bool _observedHealthyActiveCadenceEver;
@@ -99,6 +104,7 @@ internal sealed class CaptureStarvationWatchdog
              sample.OutputTimeMicroseconds < previous.OutputTimeMicroseconds))
         {
             _observations.Clear();
+            _objectiveObservations.Clear();
             _observedHealthyActiveCadence = false;
             _observedHealthyActiveCadenceEver = false;
             _pendingProgressGap = null;
@@ -110,46 +116,16 @@ internal sealed class CaptureStarvationWatchdog
         _lastTimestamp = sample.Timestamp;
         _lastSample = sample;
         _lastContext = context;
-        if (context.IsFullscreenOnCapturedDisplay)
-        {
-            _fullscreenEligibilityLostAt = -1;
-        }
-        else
-        {
-            if (_fullscreenEligibilityLostAt < 0)
-            {
-                _fullscreenEligibilityLostAt = sample.Timestamp;
-            }
 
-            // Foreground probes can miss a sample while a game changes display
-            // mode, opens a menu, or briefly loses focus. Keep those samples in
-            // the ratio below, but discard the candidate after a sustained loss
-            // so an old fullscreen period cannot trigger after a real alt-tab.
-            if (Stopwatch.GetElapsedTime(
-                    _fullscreenEligibilityLostAt,
-                    sample.Timestamp) >= FullscreenEligibilityLossResetWindow)
-            {
-                _observations.Clear();
-                _observedHealthyActiveCadence = false;
-                _pendingProgressGap = null;
-                return null;
-            }
-        }
-
-        _observations.Enqueue(new Observation(sample, context));
-        TrimHistory(sample.Timestamp);
-
-        // Never request recovery while the user is currently outside the game.
-        // A transient miss still remains in the sampled fullscreen ratio.
-        if (!context.IsFullscreenOnCapturedDisplay)
-        {
-            _pendingProgressGap = null;
-            return null;
-        }
+        _objectiveObservations.Enqueue(new Observation(sample, context));
+        TrimHistory(_objectiveObservations, sample.Timestamp);
 
         CaptureStarvationAssessment? assessment = null;
         var deferAssessmentForProgressCatchUp = false;
-        if (previousSample is not null &&
+        var allowObjectiveThroughput =
+            allowOutputThroughput || allowSchedulingPressure;
+        if (allowObjectiveThroughput &&
+            previousSample is not null &&
             previousContext is not null)
         {
             assessment = AssessProgressGap(
@@ -172,15 +148,50 @@ internal sealed class CaptureStarvationWatchdog
             return null;
         }
 
-        if (assessment is null &&
-            (allowSchedulingPressure || allowOutputThroughput))
+        if (assessment is null && allowObjectiveThroughput)
         {
-            // Counter throughput is objective recorder evidence. Evaluate it
-            // before content-duplicate cadence so a custom/stretched game that
-            // both repeats frames and runs below real time follows the bounded
-            // fault path instead of being mistaken for ambiguous low-FPS
-            // content.
-            assessment = AssessOutputThroughputPressure(sample, context);
+            assessment = AssessOutputThroughputPressure(sample);
+        }
+
+        if (assessment is not null)
+        {
+            _triggered = true;
+            return assessment;
+        }
+
+        if (context.IsFullscreenOnCapturedDisplay)
+        {
+            _fullscreenEligibilityLostAt = -1;
+        }
+        else
+        {
+            if (_fullscreenEligibilityLostAt < 0)
+            {
+                _fullscreenEligibilityLostAt = sample.Timestamp;
+            }
+
+            // Foreground probes can miss a sample while a game changes display
+            // mode, opens a menu, or briefly loses focus. Keep those samples in
+            // the ratio below, but discard the candidate after a sustained loss
+            // so an old fullscreen period cannot trigger after a real alt-tab.
+            if (Stopwatch.GetElapsedTime(
+                    _fullscreenEligibilityLostAt,
+                    sample.Timestamp) >= FullscreenEligibilityLossResetWindow)
+            {
+                _observations.Clear();
+                _observedHealthyActiveCadence = false;
+                return null;
+            }
+        }
+
+        _observations.Enqueue(new Observation(sample, context));
+        TrimHistory(_observations, sample.Timestamp);
+
+        // Never request recovery while the user is currently outside the game.
+        // A transient miss still remains in the sampled fullscreen ratio.
+        if (!context.IsFullscreenOnCapturedDisplay)
+        {
+            return null;
         }
 
         if (assessment is null && allowSourceCadence)
@@ -293,6 +304,22 @@ internal sealed class CaptureStarvationWatchdog
                 return null;
             }
 
+            if (HasRecoveredNormalLocalProgress(
+                    interval,
+                    frameDelta,
+                    outputTimeDelta))
+            {
+                // Sleep/hibernate and a system-wide scheduler pause advance
+                // the monotonic receipt clock while FFmpeg itself cannot run.
+                // If the very next ordinary receipt interval is back at real
+                // time, the graph is healthy and the wall-clock gap must not
+                // invalidate a long Recorder session.
+                _pendingProgressGap = null;
+                RebaseObservationsAfterProgressBacklog(sample, context);
+                awaitingConfirmation = true;
+                return null;
+            }
+
             if (pending.CatchUpSamples <
                     MaximumQueuedProgressCatchUpSamples &&
                 IsRapidQueuedProgressCatchUp(
@@ -314,11 +341,7 @@ internal sealed class CaptureStarvationWatchdog
 
         if (captureUptime is null ||
             captureUptime.Value < ConfirmationWindow ||
-            interval < TimeSpan.FromSeconds(2.5) ||
-            !previousContext.IsFullscreenOnCapturedDisplay ||
-            !context.IsFullscreenOnCapturedDisplay ||
-            !previousContext.HasRecentInput ||
-            !context.HasRecentInput)
+            interval < TimeSpan.FromSeconds(2.5))
         {
             return null;
         }
@@ -419,19 +442,51 @@ internal sealed class CaptureStarvationWatchdog
                outputSpeed >= 1.5;
     }
 
+    private bool HasRecoveredNormalLocalProgress(
+        TimeSpan receiptInterval,
+        long frameDelta,
+        long outputTimeDelta)
+    {
+        if (receiptInterval <= TimeSpan.Zero ||
+            receiptInterval > MaximumRecoveredProgressReceiptInterval ||
+            frameDelta <= 0 ||
+            outputTimeDelta <= 0)
+        {
+            return false;
+        }
+
+        var expectedFrames =
+            _targetFramesPerSecond * receiptInterval.TotalSeconds;
+        var outputFrameRateRatio = expectedFrames > 0
+            ? frameDelta / expectedFrames
+            : 0;
+        var outputSpeed = outputTimeDelta / 1_000_000d /
+                          receiptInterval.TotalSeconds;
+        return outputFrameRateRatio >= 0.85 &&
+               outputSpeed >= 0.85;
+    }
+
     private void RebaseObservationsAfterProgressBacklog(
         CaptureProgressSample sample,
         CaptureForegroundContext context)
     {
+        _objectiveObservations.Clear();
+        _objectiveObservations.Enqueue(new Observation(sample, context));
         _observations.Clear();
-        _observations.Enqueue(new Observation(sample, context));
+        if (context.IsFullscreenOnCapturedDisplay)
+        {
+            _observations.Enqueue(new Observation(sample, context));
+        }
     }
 
     private bool HasHealthyActiveCadence(
         CaptureProgressSample sample,
         CaptureForegroundContext context)
     {
-        var baseline = FindBaseline(sample.Timestamp, HealthyCadenceConfirmationWindow);
+        var baseline = FindBaseline(
+            _observations,
+            sample.Timestamp,
+            HealthyCadenceConfirmationWindow);
         if (baseline is null)
         {
             return false;
@@ -601,14 +656,11 @@ internal sealed class CaptureStarvationWatchdog
     }
 
     private CaptureStarvationAssessment? AssessOutputThroughputPressure(
-        CaptureProgressSample sample,
-        CaptureForegroundContext context)
+        CaptureProgressSample sample)
     {
-        if (!TryGetEligibleWindow(
+        if (!TryGetObjectiveWindow(
                 sample,
-                context,
                 ConfirmationWindow,
-                MinimumInputEvidenceSpan,
                 out var baseline,
                 out var window,
                 out var elapsed))
@@ -620,7 +672,7 @@ internal sealed class CaptureStarvationWatchdog
         var duplicateDelta = sample.DuplicatedFrames - baseline.Sample.DuplicatedFrames;
         var mediaTimeDelta =
             sample.OutputTimeMicroseconds - baseline.Sample.OutputTimeMicroseconds;
-        if (frameDelta <= 0 || duplicateDelta < 0 || mediaTimeDelta <= 0)
+        if (frameDelta < 0 || duplicateDelta < 0 || mediaTimeDelta < 0)
         {
             return null;
         }
@@ -635,13 +687,69 @@ internal sealed class CaptureStarvationWatchdog
         }
 
         return new CaptureStarvationAssessment(
-            duplicateDelta / (double)frameDelta,
+            frameDelta > 0
+                ? duplicateDelta / (double)frameDelta
+                : 1,
             Math.Max(0, frameDelta - duplicateDelta) / elapsed.TotalSeconds,
             elapsed,
             CaptureStarvationKind.OutputThroughput,
             Math.Min(outputFrameRateRatio, outputSpeedRatio),
             window.Any(observation =>
                 observation.Context.UsedCustomFullscreenFallback));
+    }
+
+    private bool TryGetObjectiveWindow(
+        CaptureProgressSample sample,
+        TimeSpan confirmationWindow,
+        out Observation baseline,
+        out Observation[] window,
+        out TimeSpan elapsed)
+    {
+        baseline = default!;
+        window = [];
+        elapsed = TimeSpan.Zero;
+        var candidate = FindBaseline(
+            _objectiveObservations,
+            sample.Timestamp,
+            confirmationWindow);
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        baseline = candidate;
+        elapsed = Stopwatch.GetElapsedTime(
+            baseline.Sample.Timestamp,
+            sample.Timestamp);
+        if (elapsed < confirmationWindow)
+        {
+            return false;
+        }
+
+        var baselineTimestamp = baseline.Sample.Timestamp;
+        window = _objectiveObservations
+            .Where(observation =>
+                observation.Sample.Timestamp >= baselineTimestamp)
+            .ToArray();
+        if (window.Length < 3)
+        {
+            return false;
+        }
+
+        for (var index = 1; index < window.Length; index++)
+        {
+            var previous = window[index - 1].Sample;
+            var current = window[index].Sample;
+            if (current.Frame < previous.Frame ||
+                current.DuplicatedFrames < previous.DuplicatedFrames ||
+                current.OutputTimeMicroseconds <
+                    previous.OutputTimeMicroseconds)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private bool TryGetEligibleWindow(
@@ -656,7 +764,10 @@ internal sealed class CaptureStarvationWatchdog
         baseline = default!;
         window = [];
         elapsed = TimeSpan.Zero;
-        var candidate = FindBaseline(sample.Timestamp, confirmationWindow);
+        var candidate = FindBaseline(
+            _observations,
+            sample.Timestamp,
+            confirmationWindow);
         if (candidate is null)
         {
             return false;
@@ -699,10 +810,13 @@ internal sealed class CaptureStarvationWatchdog
         return true;
     }
 
-    private Observation? FindBaseline(long latestTimestamp, TimeSpan requiredWindow)
+    private static Observation? FindBaseline(
+        Queue<Observation> observations,
+        long latestTimestamp,
+        TimeSpan requiredWindow)
     {
         Observation? result = null;
-        foreach (var observation in _observations)
+        foreach (var observation in observations)
         {
             var age = Stopwatch.GetElapsedTime(observation.Sample.Timestamp, latestTimestamp);
             if (age < requiredWindow)
@@ -716,12 +830,14 @@ internal sealed class CaptureStarvationWatchdog
         return result;
     }
 
-    private void TrimHistory(long latestTimestamp)
+    private static void TrimHistory(
+        Queue<Observation> observations,
+        long latestTimestamp)
     {
-        while (_observations.TryPeek(out var oldest) &&
+        while (observations.TryPeek(out var oldest) &&
                Stopwatch.GetElapsedTime(oldest.Sample.Timestamp, latestTimestamp) > MaximumHistory)
         {
-            _ = _observations.Dequeue();
+            _ = observations.Dequeue();
         }
     }
 
