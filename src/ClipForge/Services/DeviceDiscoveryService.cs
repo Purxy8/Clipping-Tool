@@ -12,6 +12,7 @@ public sealed class DeviceDiscoveryService
 {
     public IReadOnlyList<DisplayOption> GetDisplays()
     {
+        var dxgiOutputs = DxgiDisplayDiscovery.GetOutputs();
         return Forms.Screen.AllScreens
             .Select((screen, index) => new DisplayOption(
                 screen.DeviceName,
@@ -23,6 +24,11 @@ public sealed class DeviceDiscoveryService
                 screen.Primary,
                 index,
                 TryGetDisplayRefreshRate(screen.DeviceName)))
+            .Select(display => display with
+            {
+                DesktopDuplicationTarget =
+                    DxgiDisplayDiscovery.ResolveTarget(display, dxgiOutputs)
+            })
             .OrderByDescending(display => display.IsPrimary)
             .ThenBy(display => display.Left)
             .ThenBy(display => display.Top)

@@ -85,7 +85,8 @@ internal static class FfmpegArgumentBuilder
             "-progress", "pipe:1"
         };
 
-        if (UsesDirectWindowsGraphicsHardwarePath(encodingStrategy))
+        var desktopDuplication = encodingStrategy.CaptureBackend == DesktopCaptureBackend.DesktopDuplication;
+        if (desktopDuplication || UsesDirectWindowsGraphicsHardwarePath(encodingStrategy))
         {
             // gfxcapture already owns a two-frame D3D11 pool. Keep FFmpeg's
             // simple and complex filter executors single-threaded so a live
@@ -111,7 +112,23 @@ internal static class FfmpegArgumentBuilder
             ]);
         }
 
-        arguments.AddRange(["-map", "0:v:0"]);
+        if (desktopDuplication)
+        {
+            // A lavfi input creates its own D3D11 device and silently ignores
+            // -filter_hw_device. Keep DDA in the output graph so the explicitly
+            // selected DXGI adapter/output is the screen actually recorded.
+            var graph = BuildDesktopDuplicationFilter(configuration, encodingStrategy) +
+                        ",setpts=PTS-STARTPTS[captured_video]";
+            if (audioInputs.Count > 0)
+            {
+                graph += ";" + BuildAudioFilter(audioInputs.Count, firstInputIndex: 0);
+            }
+            arguments.AddRange(["-filter_complex", graph, "-map", "[captured_video]"]);
+        }
+        else
+        {
+            arguments.AddRange(["-map", "0:v:0"]);
+        }
         if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.Gdi)
         {
             var encoderPixelFormat = encodingStrategy.Encoder == VideoEncoderKind.SoftwareX264
@@ -122,7 +139,7 @@ internal static class FfmpegArgumentBuilder
                 $"{BuildVideoFilter(configuration)},format={encoderPixelFormat},setpts=PTS-STARTPTS"
             ]);
         }
-        else
+        else if (!desktopDuplication)
         {
             // Each WGC process owns a fresh clock. Normalize that generation at
             // capture time so a delayed first D3D frame cannot retain a positive
@@ -133,6 +150,10 @@ internal static class FfmpegArgumentBuilder
         if (audioInputs.Count == 0)
         {
             arguments.Add("-an");
+        }
+        else if (desktopDuplication)
+        {
+            arguments.AddRange(["-map", "[mixed_audio]"]);
         }
         else
         {
@@ -404,10 +425,9 @@ internal static class FfmpegArgumentBuilder
         // capability probe must not approve a simpler D3D11-to-encoder path than
         // the one that will run continuously.
         arguments.AddRange(["-vf", "setpts=PTS-STARTPTS"]);
-        // Live replay is constant-frame-rate. Without this production output
-        // contract, a quiet desktop or an application that repaints below the
-        // requested rate makes WGC's change-driven input appear slow. Exercise
-        // the complete three-second graph for Source as well as scaled presets.
+        // Match live CFR, but do not mistake this for a wall-clock producer:
+        // WGC can still wait indefinitely for a desktop change. Full-monitor
+        // capture prefers the separately verified, clocked DDA graph below.
         arguments.AddRange([
             "-fps_mode", "cfr",
             "-r", Invariant(configuration.FramesPerSecond)
@@ -416,6 +436,40 @@ internal static class FfmpegArgumentBuilder
         arguments.AddRange([
             "-frames:v", Invariant(probeFrames),
             "-an"
+        ]);
+        AddEncoderArguments(arguments, encodingStrategy);
+        arguments.AddRange(["-f", "null", "NUL"]);
+        return arguments;
+    }
+
+    public static IReadOnlyList<string> BuildDesktopDuplicationProbeArguments(
+        CaptureConfiguration configuration,
+        VideoEncodingStrategy encodingStrategy,
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(encodingStrategy);
+        if (encodingStrategy.CaptureBackend != DesktopCaptureBackend.DesktopDuplication)
+        {
+            throw new ArgumentException("A Desktop Duplication probe requires its matching backend.", nameof(encodingStrategy));
+        }
+        if (configuration.FramesPerSecond is < 1 or > 240)
+        {
+            throw new ArgumentOutOfRangeException(nameof(configuration));
+        }
+        var arguments = new List<string>
+        {
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats",
+            "-stats_period", "0.25", "-progress", "pipe:1",
+            "-filter_threads", "1", "-filter_complex_threads", "1"
+        };
+        AddVideoInput(arguments, configuration, encodingStrategy, performanceProfile);
+        arguments.AddRange([
+            "-filter_complex", BuildDesktopDuplicationFilter(configuration, encodingStrategy) +
+                               ",setpts=PTS-STARTPTS[captured_video]",
+            "-map", "[captured_video]", "-fps_mode", "cfr",
+            "-r", Invariant(configuration.FramesPerSecond),
+            "-frames:v", Invariant(checked(configuration.FramesPerSecond * CaptureProbeSeconds)), "-an"
         ]);
         AddEncoderArguments(arguments, encodingStrategy);
         arguments.AddRange(["-f", "null", "NUL"]);
@@ -852,6 +906,16 @@ internal static class FfmpegArgumentBuilder
     {
         var display = configuration.Display;
 
+        if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.DesktopDuplication)
+        {
+            var target = RequireDesktopDuplicationTarget(display);
+            arguments.AddRange([
+                "-init_hw_device", $"d3d11va=clipforge_dda:{Invariant(target.AdapterIndex)}",
+                "-filter_hw_device", "clipforge_dda"
+            ]);
+            return;
+        }
+
         if (encodingStrategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
         {
             var output = CaptureGeometry.ResolveOutputSize(configuration);
@@ -960,6 +1024,47 @@ internal static class FfmpegArgumentBuilder
             VideoEncoderKind.SoftwareX264 => filter + ",hwdownload,format=bgra,format=yuv420p",
             _ => filter + ",hwdownload,format=bgra"
         };
+    }
+
+    private static DxgiCaptureTarget RequireDesktopDuplicationTarget(DisplayOption display)
+    {
+        var target = display.DesktopDuplicationTarget;
+        if (target is null || target.AdapterIndex < 0 || target.OutputIndex < 0 ||
+            target.Rotation != 1 || !string.Equals(target.DeviceName, display.DeviceName, StringComparison.OrdinalIgnoreCase) ||
+            display.Width < 2 || display.Height < 2)
+        {
+            throw new InvalidOperationException("The selected display has no verified, unrotated Desktop Duplication target.");
+        }
+        return target;
+    }
+
+    private static string BuildDesktopDuplicationFilter(
+        CaptureConfiguration configuration, VideoEncodingStrategy strategy)
+    {
+        var target = RequireDesktopDuplicationTarget(configuration.Display);
+        var output = CaptureGeometry.ResolveOutputSize(configuration);
+        var width = configuration.Display.Width & ~1;
+        var height = configuration.Display.Height & ~1;
+        var filter = $"ddagrab=output_idx={Invariant(target.OutputIndex)}" +
+                     $":draw_mouse={(configuration.CaptureCursor ? "1" : "0")}" +
+                     $":framerate={Invariant(configuration.FramesPerSecond)}:dup_frames=1" +
+                     $":output_fmt=bgra:video_size={width}x{height}";
+        if (output.RequiresScaling && strategy.Encoder == VideoEncoderKind.NvidiaNvenc &&
+            !strategy.RequiresSystemMemoryTransfer)
+        {
+            return filter + ",hwdownload,format=bgra,hwupload_cuda" +
+                   $",scale_cuda=w={output.Width}:h={output.Height}:format=bgra:interp_algo=nearest";
+        }
+        if (output.RequiresScaling || strategy.RequiresSystemMemoryTransfer || !strategy.IsHardwareEncoder)
+        {
+            filter += ",hwdownload,format=bgra";
+            if (output.RequiresScaling)
+            {
+                filter += $",scale={output.Width}:{output.Height}:flags=fast_bilinear";
+            }
+            filter += strategy.Encoder == VideoEncoderKind.SoftwareX264 ? ",format=yuv420p" : ",format=nv12";
+        }
+        return filter;
     }
 
     /// <summary>
@@ -1081,14 +1186,14 @@ internal static class FfmpegArgumentBuilder
     internal static int GetSoftwareEncoderThreadCount(int processorCount) =>
         Math.Clamp(Math.Max(1, processorCount / 2), 1, 4);
 
-    private static string BuildAudioFilter(int inputCount)
+    private static string BuildAudioFilter(int inputCount, int firstInputIndex = 1)
     {
         var parts = new List<string>(inputCount + 1);
         var labels = new List<string>(inputCount);
 
         for (var index = 0; index < inputCount; index++)
         {
-            var inputIndex = index + 1;
+            var inputIndex = index + firstInputIndex;
             var label = $"audio_{index}";
             labels.Add($"[{label}]");
             parts.Add($"[{inputIndex}:a]aresample=48000:async=1:first_pts=0,volume=0.70[{label}]");

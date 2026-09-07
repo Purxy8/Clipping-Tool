@@ -100,6 +100,15 @@ internal static class CaptureGeometry
         ArgumentNullException.ThrowIfNull(currentDisplay);
 
         var previousDisplay = capturePlan.Display;
+        if (capturePlan.Strategy.CaptureBackend == DesktopCaptureBackend.DesktopDuplication &&
+            previousDisplay.DesktopDuplicationTarget != currentDisplay.DesktopDuplicationTarget)
+        {
+            // Adapter/output ordinals can change after docking or a driver
+            // reset even while WinForms retains the same display name. Never
+            // retain a DDA session against a stale or unresolved DXGI target.
+            return true;
+        }
+
         if (!string.Equals(
                 previousDisplay.DeviceName,
                 currentDisplay.DeviceName,
@@ -119,10 +128,12 @@ internal static class CaptureGeometry
             return true;
         }
 
-        if (capturePlan.Strategy.CaptureBackend == DesktopCaptureBackend.Gdi)
+        if (capturePlan.Strategy.CaptureBackend is
+            DesktopCaptureBackend.Gdi or DesktopCaptureBackend.DesktopDuplication)
         {
-            // gdigrab bakes both the desktop coordinates and input dimensions
-            // into its input arguments, so any geometry change needs a restart.
+            // GDI captures a fixed desktop rectangle; DDA uses a topology-bound
+            // output and crops native dimensions into its fixed frame pool.
+            // Any geometry change needs a fresh, resolved capture plan.
             return previousDisplay.Left != currentDisplay.Left ||
                    previousDisplay.Top != currentDisplay.Top ||
                    previousDisplay.Width != currentDisplay.Width ||

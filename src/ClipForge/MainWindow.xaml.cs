@@ -1665,7 +1665,13 @@ public partial class MainWindow : Window
             IReadOnlyList<DisplayOption> displays = [];
             DisplayOption? currentDisplay = null;
             Win32Exception? lastDiscoveryError = null;
-            for (var attempt = 0; attempt < 8 && currentDisplay is null; attempt++)
+            var requiresRecorderDuplicationTarget = IsRecorderSession &&
+                _replayBufferService.LastCapturePlan?.Strategy.CaptureBackend ==
+                    DesktopCaptureBackend.DesktopDuplication;
+            var displayRefreshSessionIdentity = _replayBufferService.ActiveSessionIdentity;
+            for (var attempt = 0; attempt < 8 &&
+                 (currentDisplay is null || requiresRecorderDuplicationTarget &&
+                     currentDisplay.DesktopDuplicationTarget is null); attempt++)
             {
                 try
                 {
@@ -1682,7 +1688,8 @@ public partial class MainWindow : Window
                     lastDiscoveryError = exception;
                 }
 
-                if (currentDisplay is null && attempt < 7)
+                if ((currentDisplay is null || requiresRecorderDuplicationTarget &&
+                     currentDisplay.DesktopDuplicationTarget is null) && attempt < 7)
                 {
                     await Task.Delay(
                         TimeSpan.FromMilliseconds(600),
@@ -1720,6 +1727,40 @@ public partial class MainWindow : Window
                 return;
             }
 
+            if (requiresRecorderDuplicationTarget && currentDisplay.DesktopDuplicationTarget is null)
+            {
+                // A name alone does not prove a usable DDA target after a
+                // driver reset or rotation. The bounded discovery retries
+                // above allow transient changes to settle. If still missing,
+                // use the existing safe Stop/Save workflow before a refresh
+                // could stop the writer and fail with an unmapped target.
+                var stoppedAffectedSession = false;
+                await RunCaptureCommandAsync(async () =>
+                {
+                    // Discovery awaited several times. Never stop a new session
+                    // started by the user while the old display was missing.
+                    var activePlan = _replayBufferService.LastCapturePlan;
+                    if (_isClosing || refreshCancellation.IsCancellationRequested ||
+                        !_replayBufferService.IsRunning || !IsRecorderSession ||
+                        _replayBufferService.ActiveSessionIdentity != displayRefreshSessionIdentity ||
+                        activePlan?.Strategy.CaptureBackend != DesktopCaptureBackend.DesktopDuplication ||
+                        !string.Equals(activePlan.Display.DeviceName,
+                            selectedDisplay.DeviceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+                    stoppedAffectedSession = true;
+                    await StopRecordingAndSaveCoreAsync();
+                }, showError: false);
+                if (stoppedAffectedSession)
+                {
+                    ShowError("Windows changed the display to a mode unavailable to Desktop Duplication. " +
+                        "Recorder stopped and preserved the session safely. Retry saving if finalization did not complete, " +
+                        "then start a new recording to verify the available capture paths.");
+                }
+                return;
+            }
+
             var forceWgcRenewal = Interlocked.Exchange(
                 ref _displayModeWgcRenewalRequested,
                 0) != 0;
@@ -1728,7 +1769,9 @@ public partial class MainWindow : Window
                                   currentDisplay.Top != selectedDisplay.Top ||
                                   currentDisplay.Width != selectedDisplay.Width ||
                                   currentDisplay.Height != selectedDisplay.Height ||
-                                  currentDisplay.MonitorIndex != selectedDisplay.MonitorIndex;
+                                  currentDisplay.MonitorIndex != selectedDisplay.MonitorIndex ||
+                                  currentDisplay.DesktopDuplicationTarget !=
+                                      selectedDisplay.DesktopDuplicationTarget;
             if (!geometryChanged)
             {
                 if (ShouldRestartReplayAfterDisplayChange(
@@ -2463,9 +2506,10 @@ public partial class MainWindow : Window
                 }
 
                 var activePlan = _replayBufferService.LastCapturePlan;
-                var isWgcPath = activePlan?.Strategy.CaptureBackend ==
-                    DesktopCaptureBackend.WindowsGraphicsCapture;
-                var scaledWgcPath = isWgcPath &&
+                var isGraphicsCapturePath = activePlan?.Strategy.CaptureBackend is
+                    DesktopCaptureBackend.WindowsGraphicsCapture or
+                    DesktopCaptureBackend.DesktopDuplication;
+                var scaledGraphicsCapturePath = isGraphicsCapturePath &&
                     activePlan is not null &&
                     CaptureGeometry.ResolveOutputSize(
                         activePlan.Display,
@@ -2475,7 +2519,7 @@ public partial class MainWindow : Window
                     activePlan?.Strategy.CaptureBackend,
                     usesRecoveryBudget,
                     _automaticCaptureRecoveryCount,
-                    scaledWgcPath);
+                    scaledGraphicsCapturePath);
                 var promoteCaptureProfile =
                     eventArgs.Reason is
                         CaptureRecoveryReason.SourceProfilePromotion or
@@ -2550,7 +2594,7 @@ public partial class MainWindow : Window
                         await _replayBufferService.StopAsync();
                         if (!_isClosing && _replayStartRequested)
                         {
-                            // A scaled WGC path falls back on its first confirmed
+                            // A scaled GPU path falls back on its first confirmed
                             // pacing fault; native capture waits for a second
                             // fault. Source is probed independently instead of
                             // reusing a strategy proven for the fixed preset.
@@ -2604,6 +2648,7 @@ public partial class MainWindow : Window
     internal static bool SupportsAutomaticCaptureRecovery(
         DesktopCaptureBackend captureBackend) =>
         captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.DesktopDuplication or
             DesktopCaptureBackend.Gdi;
 
     internal static bool ShouldUseSourceSafetyRecovery(
@@ -2611,7 +2656,8 @@ public partial class MainWindow : Window
         bool usesRecoveryBudget,
         int completedRecoveryCount,
         bool outputRequiresScaling) =>
-        captureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
+        captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.DesktopDuplication &&
         usesRecoveryBudget &&
         (completedRecoveryCount == 1 || outputRequiresScaling);
 

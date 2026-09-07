@@ -11,7 +11,8 @@ internal enum VideoEncoderKind
 internal enum DesktopCaptureBackend
 {
     WindowsGraphicsCapture,
-    Gdi
+    Gdi,
+    DesktopDuplication
 }
 
 internal sealed record VideoEncodingStrategy(
@@ -41,6 +42,9 @@ internal sealed record VideoEncodingStrategy(
 
     public string CaptureBackendName => CaptureBackend switch
     {
+        DesktopCaptureBackend.DesktopDuplication when RequiresSystemMemoryTransfer =>
+            "Desktop Duplication compatibility transfer",
+        DesktopCaptureBackend.DesktopDuplication => "Desktop Duplication",
         DesktopCaptureBackend.WindowsGraphicsCapture when RequiresSystemMemoryTransfer =>
             "Windows Graphics Capture compatibility transfer",
         DesktopCaptureBackend.WindowsGraphicsCapture => "Windows Graphics Capture",

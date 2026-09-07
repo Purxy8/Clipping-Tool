@@ -738,12 +738,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     effectiveStrategyOverride is null &&
                     !sourceSafetyMode;
                 if (sourceSafetyMode &&
-                    capabilitySelection.Strategy.CaptureBackend !=
-                    DesktopCaptureBackend.WindowsGraphicsCapture)
+                    !SupportsGraphicsCaptureRecovery(
+                        capabilitySelection.Strategy.CaptureBackend))
                 {
                     EnqueueDiagnostic(capabilitySelection.Diagnostics);
                     throw new InvalidOperationException(
-                        "ClipForge could not safely verify Windows Graphics Capture at the display's " +
+                        "ClipForge could not safely verify GPU desktop capture at the display's " +
                         "native Source resolution. Instant Replay was stopped instead of starting an " +
                         "unverified high-impact fallback. Try starting replay again or choose Source manually.");
                 }
@@ -6285,6 +6285,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
             {
                 if (process.HasExited)
                 {
+                    if (strategy.CaptureBackend == DesktopCaptureBackend.DesktopDuplication &&
+                        Volatile.Read(ref _isStopping) == 0 &&
+                        CaptureRecoveryRequested is not null)
+                    {
+                        // DXGI duplication can lose access when the desktop mode,
+                        // lock state, or graphics device changes. Keep the logical
+                        // session owned until the existing bounded recovery handler
+                        // replaces this exact exited process or stops the session.
+                        RequestCaptureRecovery(
+                            CaptureRecoveryReason.CaptureHang,
+                            $"Desktop Duplication stopped unexpectedly. {BuildCaptureFailureMessage()}");
+                        if (_captureRecoveryRequestGate.IsPending)
+                        {
+                            return;
+                        }
+                    }
+
                     Volatile.Write(ref _isRunning, 0);
                     if (Volatile.Read(ref _isStopping) == 0)
                     {
@@ -6321,7 +6338,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         "The stream reader reached EOF unexpectedly.";
                     var pumpDiagnostic =
                         $"The FFmpeg {failedPumpName} pump stopped while capture remained alive. {detail}";
-                    if (strategy.CaptureBackend == DesktopCaptureBackend.WindowsGraphicsCapture)
+                    if (SupportsGraphicsCaptureRecovery(strategy.CaptureBackend))
                     {
                         RequestCaptureRecovery(
                             CaptureRecoveryReason.CaptureHang,
@@ -6491,6 +6508,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 if (strategy.CaptureBackend is
                         DesktopCaptureBackend.WindowsGraphicsCapture or
+                        DesktopCaptureBackend.DesktopDuplication or
                         DesktopCaptureBackend.Gdi &&
                     progress is not null)
                 {
@@ -6543,6 +6561,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var isGdiCapture =
                             strategy.CaptureBackend ==
                             DesktopCaptureBackend.Gdi;
+                        // ddagrab repeats the last acquired texture internally on
+                        // a quiet desktop. FFmpeg's CFR duplicate counter cannot
+                        // distinguish those samples from new desktop content.
+                        var supportsSourceCadence =
+                            SupportsSourceCadenceDiagnostics(strategy.CaptureBackend);
                         var cadenceForegroundContext =
                             ResolveCaptureCadenceForegroundContext(
                                 strategy.CaptureBackend,
@@ -6580,12 +6603,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                                     allowInitialProfileCadence,
                                 allowOutputThroughput: true,
                                 allowChronicLowCadence:
-                                    isGdiCapture ||
-                                    allowInitialProfileCadence,
+                                    supportsSourceCadence &&
+                                    (isGdiCapture || allowInitialProfileCadence),
                                 allowSourceCadence:
-                                    isGdiCapture ||
-                                    isWindowsGraphicsCapture &&
-                                    !suppressNonObjectiveSourceCadence);
+                                    supportsSourceCadence &&
+                                    (isGdiCapture ||
+                                     isWindowsGraphicsCapture &&
+                                     !suppressNonObjectiveSourceCadence));
                         if (assessment is null &&
                             observedAssessment is not null)
                         {
@@ -6637,7 +6661,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                                 string.Create(
                                     CultureInfo.InvariantCulture,
                                     $"windowSeconds={sampleWindow.TotalSeconds:0.0}; " +
-                                    $"uniqueFps={uniqueFps:0.0}; duplicateRatio={duplicateRatio:0.000}; " +
+                                    $"{(SupportsSourceCadenceDiagnostics(strategy.CaptureBackend) ? "uniqueFps" : "outputFps")}={uniqueFps:0.0}; duplicateRatio={duplicateRatio:0.000}; " +
+                                    $"sourceCadenceObservable={SupportsSourceCadenceDiagnostics(strategy.CaptureBackend)}; " +
                                     $"outputSpeed={outputSpeed:0.000}; dropped={progress.DroppedFrames - previous.DroppedFrames}; " +
                                     $"worstIntervalDuplicateRatio={worstCadenceIntervalDuplicateRatio:0.000}; " +
                                     $"slowestIntervalOutputSpeed={(double.IsPositiveInfinity(slowestCadenceIntervalOutputSpeed) ? 0 : slowestCadenceIntervalOutputSpeed):0.000}; " +
@@ -6673,7 +6698,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         var diagnostic = string.Create(
                             CultureInfo.InvariantCulture,
                             $"Desktop capture cadence fault backend={strategy.CaptureBackend}; kind={assessment.Kind}; " +
-                            $"uniqueFps={assessment.UniqueFramesPerSecond:0.0}; " +
+                            $"{(SupportsSourceCadenceDiagnostics(strategy.CaptureBackend) ? "uniqueFps" : "outputFps")}={assessment.UniqueFramesPerSecond:0.0}; " +
                             $"windowSeconds={assessment.Window.TotalSeconds:0.0}; " +
                             $"duplicateRatio={assessment.DuplicateRatio:0.000}; " +
                             $"outputSpeed={assessment.OutputSpeedRatio:0.000}; " +
@@ -6734,8 +6759,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 {
                     const string hangDiagnostic =
                         "FFmpeg remained alive but neither progress nor the replay segments advanced for seven seconds.";
-                    if (strategy.CaptureBackend ==
-                        DesktopCaptureBackend.WindowsGraphicsCapture)
+                    if (SupportsGraphicsCaptureRecovery(strategy.CaptureBackend))
                     {
                         RequestCaptureRecovery(
                             CaptureRecoveryReason.CaptureHang,
@@ -6743,7 +6767,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     }
                     else
                     {
-                        // Automatic recovery is deliberately WGC-only. Leaving
+                        // Automatic transport recovery uses GPU capture. Leaving
                         // a hung GDI process marked Running would make saves and
                         // controls operate on a dead buffer, so fail the session
                         // explicitly instead of raising an event MainWindow must
@@ -7418,6 +7442,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
     }
 
     internal static bool CanRefreshCaptureBackend(
+        DesktopCaptureBackend captureBackend) =>
+        captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.DesktopDuplication or
+            DesktopCaptureBackend.Gdi;
+
+    internal static bool SupportsGraphicsCaptureRecovery(
+        DesktopCaptureBackend captureBackend) =>
+        captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
+            DesktopCaptureBackend.DesktopDuplication;
+
+    internal static bool SupportsSourceCadenceDiagnostics(
         DesktopCaptureBackend captureBackend) =>
         captureBackend is DesktopCaptureBackend.WindowsGraphicsCapture or
             DesktopCaptureBackend.Gdi;
@@ -8473,8 +8508,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return;
         }
 
-        if (selection.Strategy.CaptureBackend !=
-            DesktopCaptureBackend.WindowsGraphicsCapture)
+        if (!SupportsGraphicsCaptureRecovery(selection.Strategy.CaptureBackend))
         {
             ScheduleNextDegradedCaptureReprobe(selection.CacheExpiresAtUtc);
             RecordCaptureRuntimeEvent(
@@ -8482,12 +8516,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _captureProcess,
                 configuration,
                 selection.Strategy,
-                "WGC was still unavailable; the verified GDI session remains active.");
+                "GPU desktop capture was still unavailable; the verified GDI session remains active.");
             if (objectiveGdiStarvation)
             {
                 RequestCaptureRecovery(
                     CaptureRecoveryReason.SourceStarvation,
-                    "GDI source cadence was objectively starved and the focused WGC replacement check remained unavailable. " +
+                    "GDI source cadence was objectively starved and the focused GPU capture replacement check remained unavailable. " +
                     selection.Diagnostics);
             }
 
@@ -8712,8 +8746,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(replacementStrategy);
         return strategyUsesCapabilityProbe &&
                currentStrategy.CaptureBackend == DesktopCaptureBackend.Gdi &&
-               replacementStrategy.CaptureBackend ==
-               DesktopCaptureBackend.WindowsGraphicsCapture;
+               SupportsGraphicsCaptureRecovery(replacementStrategy.CaptureBackend);
     }
 
     internal static bool ShouldDeferDegradedCapturePromotion(
