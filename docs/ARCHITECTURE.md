@@ -4,7 +4,7 @@ ClipForge is a Windows-only WPF application targeting `.NET 10` and `win-x64`. T
 
 ## Design goals
 
-- Keep a bounded, disk-backed replay window from 30 seconds to 1 hour.
+- Keep a bounded, disk-backed replay window from 30 seconds to 1 hour, plus a separate manual Recorder that runs until Stop & save.
 - Save the most recent replay without interrupting ongoing capture.
 - Keep capture media on the local PC and write to the clips folder only on an explicit save.
 - Support one display plus optional desktop and microphone audio with explicit endpoint selection.
@@ -23,7 +23,7 @@ ClipForge does not attempt a game-process hook, HDR pipeline, multi-track/effect
 | WPF shell | `MainWindow`, `LibraryWindow`, `OverlayWindow`, `App`, `Themes/Styles.xaml`, `NativeWindowThemeService`, `UiMotionService`, `ClipSavedSoundService` | Present the settings sidebar, replay controls, complete latest/full-library transport, dual-handle Library trim editor, All/Normal/Trimmed filtering, recent gallery, virtualized Library, compact overlay, native dark captions, bounded accessible motion, optional save feedback, and non-blocking error states. |
 | Models | `AppSettings`, `CaptureConfiguration`, `HotkeyGesture`, `ClipLibraryItem`, option records, `ReplayStateSnapshot` | Separate serializable preferences and library views from the validated, immutable configuration used by a running capture. |
 | Device discovery | `DeviceDiscoveryService` | Enumerate Windows displays and active render/capture audio endpoints. Displays come from WinForms `Screen`; audio endpoints come from NAudio/Core Audio. |
-| Replay engine | `ReplayBufferService`, `CaptureProcessJob`, and capture helpers under `Capture/` | Probe capture/encoder capabilities, own the tuned and Job-contained FFmpeg process, WASAPI audio producers, temporary segment set, retention policy, save snapshots, progress health observations, cancellation, and lifecycle state. |
+| Capture engine | `ReplayBufferService`, `CaptureProcessJob`, and capture helpers under `Capture/` | Probe capture/encoder capabilities, own the tuned and Job-contained FFmpeg process, WASAPI audio producers, Replay retention, Recorder live/recovery outputs, save snapshots, progress health observations, cancellation, and lifecycle state. |
 | FFmpeg command construction | `FfmpegArgumentBuilder` | Build argument lists without shell interpolation for both continuous segment capture and MP4 creation. |
 | FFmpeg provisioning | `FfmpegSetupService` | Resolve an existing FFmpeg installation or download a private copy on request. |
 | Clip library and trim export | `ClipLibraryService`, the trim-export service, `ClipMediaProcessRunner`, `ThumbnailPathConverter` | Discover and classify top-level ClipForge-generated normal/trimmed MP4 files, validate local MOV/MP4 media, coalesce/cache identity-bound metadata probes, create/reuse bounded thumbnail decodes, supply the latest clip, selected 4/8/10/15-item gallery, and up-to-100-item Library, and transactionally create a separate validated trim. |
@@ -50,13 +50,17 @@ flowchart LR
     WASAPI --> PIPE
     SOURCE --> FFMPEG["FFmpeg: scale, mix, H.264/AAC encode"]
     PIPE --> FFMPEG
-    FFMPEG --> SEG["Two-second MKV segments"]
+    FFMPEG --> SEG["Replay: 2s MKVs; Recorder: 10s recovery MKVs"]
+    FFMPEG --> LIVE["Recorder: continuous fragmented MP4"]
     FFMPEG --> HEALTH["Progress and duplicate-frame health"]
     HEALTH --> ENG
     SEG --> KEEP["Retention and pruning"]
     HOTKEY["Button, tray, overlay, or Save Clip hotkey"] --> SAVE["Stable segment snapshot + concat manifest"]
     KEEP --> SAVE
     SAVE --> MP4["FFmpeg stream-copy/trim to MP4"]
+    STOP["Recorder Stop & save"] --> LIVE
+    LIVE --> COMMIT["Validate + atomic commit"]
+    COMMIT --> LIB
     MP4 --> LIB["Validated latest clip + recent gallery + Library"]
     LIB --> EDIT["Dual-handle frame-accurate trim"]
     EDIT --> TRIM["Validated separate trimmed MP4"]
@@ -71,7 +75,7 @@ flowchart LR
 4. The engine tries direct FFmpeg Windows Graphics Capture and then a system-memory compatibility transfer for multi-GPU systems across every verified hardware encoder. A hardware or software GDI fallback is accepted only after its real three-second `gdigrab`/scale/encoder graph sustains the requested cadence. Verified results are cached for that FFmpeg binary, display device and coordinates, cursor graph, resolution, frame rate, and performance profile; a degraded GDI selection is cached for only a 15-second exponential backoff capped at one minute, then probed again automatically.
 5. The engine creates an isolated temporary session directory and any named pipes needed for selected audio inputs.
 6. NAudio opens the selected desktop loopback endpoint and/or microphone. Raw PCM is moved through bounded channels and written to the local pipes.
-7. FFmpeg captures the selected display, consumes the PCM inputs, and writes sequential Matroska segments. Source/native WGC and native GDI begin at BelowNormal CPU/GPU scheduling priority; native WGC uses a two-frame input queue. Any path that actually downsizes uses Normal CPU/GPU priority, while scaled WGC also uses a four-frame queue. Measured native recorder pressure promotes only that capture session to the resilient policy. The engine reapplies the selected policy after graph initialization and checks both classes every 30 seconds so only an observed drift is written again. Immediately after launch, the engine assigns the capture child to a private Windows Job Object configured to terminate that child when the owning handle closes.
+7. FFmpeg captures the selected display and consumes the PCM inputs. Instant Replay writes sequential two-second Matroska segments. Recorder uses the same single encode through a tee: ten-second Matroska recovery checkpoints plus one continuously written fragmented MP4. Source/native WGC and native GDI begin at BelowNormal CPU/GPU scheduling priority; native WGC uses a two-frame input queue. Any path that actually downsizes uses Normal CPU/GPU priority, while scaled WGC also uses a four-frame queue. Measured native recorder pressure promotes only that capture session to the resilient policy. The engine reapplies the selected policy after graph initialization and checks both classes every 30 seconds so only an observed drift is written again. Immediately after launch, the engine assigns the capture child to a private Windows Job Object configured to terminate that child when the owning handle closes.
 8. A dedicated stdout pump consumes FFmpeg's machine-readable progress records while stderr diagnostics are drained independently. Completed segments become eligible for saving, and old segments are removed so the retained duration stays bounded.
 
 Long replay windows are disk-backed instead of being held in RAM. The clips folder is untouched until the user saves.
@@ -81,10 +85,10 @@ Long replay windows are disk-backed instead of being held in RAM. The clips fold
 The capture command uses:
 
 - The selected monitor index with FFmpeg `gfxcapture` when its runtime probe succeeds; otherwise the display's desktop coordinates and native dimensions with `gdigrab`.
-- Aspect-preserving output geometry for fixed presets. Each preset is an **up to** width/height bound: it never enlarges a smaller source, aligns scaled dimensions to the nearest encoder-safe even values, and does not add a black padded canvas for square, portrait, 4:3, 16:10, ultrawide, or other custom display modes. When Windows Graphics Capture must reduce the surface, it uses the capture source's point sampler to minimize live shader work; the runtime probe still decides whether that WGC strategy is usable. The capture path bypasses resizing when the source already fits, and **Source** follows the native capture surface after only encoder-safe even-dimension adjustment. GDI uses `fast_bilinear` only when downscaling is required.
+- Aspect-preserving output geometry for fixed presets. Each preset is an **up to** width/height bound: it never enlarges a smaller source, aligns scaled dimensions to encoder-safe even values, and does not add a padded canvas for square, portrait, 4:3, 16:10, ultrawide, or other custom display modes. When NVIDIA WGC must reduce the surface, `gfxcapture` first keeps an even native surface, crosses the D3D11/CUDA boundary through a bounded system-memory transfer, and performs the final nearest-neighbour reduction with `scale_cuda`; this avoids the affected driver's unstable source-resizer cadence. A compatibility transfer instead uses system-memory `fast_bilinear`, while directly compatible QSV/AMF paths retain the probed D3D11 point sampler. The capture path bypasses resizing when the source already fits, and **Source** follows the native capture surface after only encoder-safe even-dimension adjustment. GDI uses `fast_bilinear` only when downscaling is required.
 - A two-frame WGC input queue for initial native/Source capture and a four-frame queue for scaled output or a native session promoted after measured recorder pressure, plus one-worker simple/complex filter pools on the direct hardware path. GDI retains its larger compatibility queue. Cursor composition is off by default and can be enabled explicitly from Capture settings.
 - H.264 through runtime-verified `h264_nvenc`, `h264_qsv`, or `h264_amf`; `libx264` remains the safe software fallback. Each encoder has low-impact settings appropriate to that implementation. NVENC uses the fast P2 preset, single-pass VBR, zero lookahead, and no B-frames to preserve foreground-game headroom.
-- A forced keyframe and a new Matroska segment every two seconds.
+- A forced keyframe every two seconds; Replay opens a new Matroska segment at that cadence, while Recorder groups its independent recovery checkpoints into ten-second files.
 - Optional WASAPI desktop loopback and microphone inputs, resampled to 48 kHz and mixed into one stereo track.
 - AAC audio at 192 Kbps.
 
@@ -100,7 +104,17 @@ Argument values are passed with `ProcessStartInfo.ArgumentList`; they are not co
 
 The engine takes a stable snapshot of completed, non-empty segments from the newest contiguous trusted suffix of one capture generation. A renewal that cannot align to a completed segment boundary or a confirmed health recovery quarantines the previous generation so audio that continued after stalled video cannot be mixed into a new clip. A health fault immediately blocks that generation, cancels any active export that selected it, and the save revalidates the generation under the same gate immediately before commit. ClipForge writes an FFmpeg concat manifest in temporary storage, trims excess time from the oldest selected segment, and remuxes compatible H.264/AAC streams into a staging MP4 in one pass. It validates the staging video's start, duration, frame count/cadence, and audio/video timeline before an atomic non-overwriting commit. Capture can continue producing new segments while that save is running, but duplicate save requests do not queue behind the active export.
 
+Replay-save preflight reserves room for the complete staging output plus the VBR-estimated rolling overlap that remains protected while FFmpeg reads the snapshot. When the output and replay ring use different volumes, each volume is checked independently. A save-identity-bound monitor repeats those checks every three seconds during export, including if capture faults after the snapshot was selected; an unsafe output volume cancels only that exact export, while an unsafe ring volume cancels the export before replay teardown waits for the save gate. The normal Ready/Buffering ring check remains on its lower-frequency cadence.
+
 Stream copy avoids a second video encode. The two-second keyframe/segment cadence bounds seek granularity and makes completed segments independently manageable. Output names must be generated uniquely so repeated or concurrent saves never overwrite an earlier clip.
+
+### Manual Recorder
+
+Recorder and Instant Replay are mutually exclusive session modes; switching modes first tears down the previous capture, so they never stack FFmpeg processes or overlays. Recorder locks the resolved output geometry for the session and does not use the Replay-retention setting. It can therefore keep a stable encoded format through supported Source, fixed-preset, stretched, and custom-resolution transitions while storage remains safe.
+
+The Recorder tee sends the one encoded H.264/AAC stream to ten-second closed Matroska recovery files and to one permanent fragmented MP4 with thirty-second movie fragments. Video and optional AAC packet timestamps are normalized globally before the tee. This avoids the AAC encoder's priming offset stretching the opening video packet and ensures both slaves receive their final packets when FFmpeg flushes. The direct MP4 branch has a bounded FIFO and may invalidate itself without making the closed recovery checkpoints untrusted.
+
+**Stop & save** captures the exact active process identity and sends FFmpeg its graceful `q` request before waiting for save/lifecycle gates. Routine capture refresh cannot replace that process after the stop request. On the normal same-volume path the service validates and fingerprints the already-complete fragmented MP4, journals the commit intent, and atomically renames it to a unique Library-visible clip; recording length does not add another media pass. If that live output is interrupted, missing, unsafe, or timeline-invalid, the durable journal and compact contiguous segment ranges drive an FFmpeg stream-copy repair/fallback. Source media is retained until the committed output identity is proven, and an incomplete session requires an explicit discard. A central-locator collision is closed with an append-only, flushed `superseded` terminal before best-effort deletion, so a locked stale locator cannot resurrect or delete a replacement session after restart.
 
 ### Clip library and playback
 
@@ -128,11 +142,11 @@ Closing `MainWindow` hides it to the notification area. `TrayIconService` can re
 
 `SingleInstanceService` scopes a named mutex and activation event to the current Windows user and logon session. A second launch sends only an activation signal and exits; the primary process restores its main window. This prevents two recorders from competing for the same hotkeys and devices. A legacy pre-v1.1 process is detected and must be exited once before the upgraded build starts.
 
-`StartupRegistrationService` exposes the installed package's per-user Windows Startup shortcut as the **Start ClipForge and replay with Windows** preference. Registration is supported only when Velopack identifies the current non-portable package and its relative executable as `ClipForge.exe`; the shortcut receives only the fixed `--autostart` argument. `AppLaunchOptions` keeps manual launches interactive, starts an autostart launch in the background, and suppresses an accidental window raise when Windows invokes that argument while the primary instance is already alive. Replay is requested only after initialization has completed, the preference is still enabled, the local engine is ready, no replay is running, and shutdown has not begun. Disabling the preference deletes the shortcut, and the uninstall callback performs the same cleanup on a best-effort basis.
+`StartupRegistrationService` exposes the installed package's per-user Windows Startup shortcut through mutually exclusive **Start ClipForge and replay with Windows** and **Start Recorder with Windows** preferences. Registration is supported only when Velopack identifies the current non-portable package and its relative executable as `ClipForge.exe`; the shortcut receives only the fixed `--autostart` argument. `AppLaunchOptions` keeps manual launches interactive, starts an autostart launch in the background, and suppresses an accidental window raise when Windows invokes that argument while the primary instance is already alive. The selected mode is requested only after initialization has completed, its preference is still enabled, the local engine is ready, no capture or recoverable Recorder session is active, and shutdown has not begun. Disabling both preferences deletes the shortcut, and the uninstall callback performs the same cleanup on a best-effort basis.
 
 ### Stopping and failure handling
 
-Stopping cancels segment monitoring, asks FFmpeg to exit, terminates it if necessary, disposes the capture Job Object, audio capture, and named-pipe resources, and removes the session directory. The Job Object uses `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; if ClipForge terminates before the normal shutdown path completes, Windows closes the process-owned handle and terminates the attached FFmpeg capture child. The UI consumes `ReplayStateSnapshot` values (`Stopped`, `Starting`, `Buffering`, `Ready`, `Saving`, `Faulted`, and `Stopping`) rather than inferring engine state from individual controls.
+Stopping cancels segment monitoring, asks FFmpeg to exit, terminates it if necessary, and disposes the capture Job Object, audio capture, and named-pipe resources. Replay then removes its temporary session; Recorder detaches and retains its owned session until the output is durably committed or the user explicitly discards an incomplete recovery. The Job Object uses `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; if ClipForge terminates before the normal shutdown path completes, Windows closes the process-owned handle and terminates the attached FFmpeg capture child. The UI consumes `ReplayStateSnapshot` values (`Stopped`, `Starting`, `Buffering`, `Ready`, `Saving`, `Faulted`, and `Stopping`) rather than inferring engine state from individual controls.
 
 A health-recovery event is tagged with both the capture PID and a generation-specific request ID before it is marshalled to `MainWindow`; stale events cannot replace a newer process or release its request gate. Recovery is serialized through that state machine, the normal capture command gate, and the save/lifecycle gates. A proven fault blocks its capture generation before notification, cancels an export that selected that generation, and rechecks the generation immediately before commit, so a suppressed or stale UI callback cannot make damaged media exportable.
 
@@ -236,4 +250,4 @@ These rules prevent overlapping capture processes, use-after-delete races during
 
 ## Extension points
 
-The next high-value engine changes are explicit free-space enforcement, separate-track audio, per-application audio, and a game-aware capture mode. They can be introduced behind the replay-engine boundary while preserving the option models, settings service, clip library, global shortcuts, Windows autostart boundary, and most of the WPF flow.
+The next high-value engine changes are a publishable rolling container for very large Replay exports, separate-track audio, per-application audio, and a game-aware capture mode. They can be introduced behind the replay-engine boundary while preserving the option models, settings service, clip library, global shortcuts, Windows autostart boundary, and most of the WPF flow.

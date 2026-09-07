@@ -94,6 +94,12 @@ public partial class MainWindow : Window
     private CaptureSessionMode? _requestedCaptureMode;
     private bool _recordingSafetyCheckRunning;
     private DateTimeOffset _recordingSafetyRetryNotBeforeUtc;
+    private bool _replayStorageSafetyCheckRunning;
+    private bool _replayStorageSafetyCheckMonitorsSave;
+    private bool _replaySaveStorageSafetyCheckPending;
+    private bool _replaySaveStorageSafetyCheckScheduled;
+    private DateTimeOffset _replayStorageSafetyRetryNotBeforeUtc;
+    private DateTimeOffset _replaySaveStorageSafetyRetryNotBeforeUtc;
     private bool _startupPreferenceChangeInProgress;
     private int _autoStartIntentGeneration;
     private bool _playerSourceReleasedForBackground;
@@ -1376,6 +1382,32 @@ public partial class MainWindow : Window
             configuration = configuration with { Resolution = sourceResolution };
         }
 
+        if (sessionMode == CaptureSessionMode.InstantReplay)
+        {
+            var estimatedReplayBytes = StorageEstimator.EstimateBufferBytes(
+                configuration.Display,
+                configuration.Resolution,
+                configuration.FramesPerSecond,
+                configuration.Retention,
+                configuration.CaptureSystemAudio ||
+                configuration.CaptureMicrophone);
+            var replayBufferRoot = _replayBufferService.ResolveReplayBufferRoot(
+                configuration.SaveDirectory);
+            var replayFreeBytes = await Task.Run(
+                () => ReplayBufferService.TryGetAvailableFreeSpace(
+                    replayBufferRoot),
+                _lifetimeCancellation.Token);
+            var requiredReplayFreeBytes = RecordingStoragePolicy
+                .GetRequiredReplayStartFreeBytes(estimatedReplayBytes);
+            if (replayFreeBytes is null ||
+                replayFreeBytes.Value <= requiredReplayFreeBytes)
+            {
+                throw new IOException(
+                    $"Instant Replay needs about " +
+                    $"{StorageEstimator.FormatBytes(requiredReplayFreeBytes)} free on its buffer drive before it can start.");
+            }
+        }
+
         // Decoder graphs, media helpers, and thumbnail refreshes are presentation
         // work. Release them before FFmpeg starts so capture owns the available
         // GPU/CPU headroom and cannot feed preview audio back into desktop capture.
@@ -1834,7 +1866,7 @@ public partial class MainWindow : Window
         }
 
         if (_replayBufferService.LastCapturePlan?.Strategy.CaptureBackend is not
-                { } captureBackend ||
+            { } captureBackend ||
             !ReplayBufferService.CanRefreshCaptureBackend(captureBackend))
         {
             Volatile.Write(ref _sameGeometryWgcRefreshPending, 0);
@@ -2985,6 +3017,7 @@ public partial class MainWindow : Window
         }
 
         QueueRecordingSafetyCheck(snapshot);
+        QueueReplayStorageSafetyCheck(snapshot);
     }
 
     private void UpdateBackgroundIndicators(ReplayStateSnapshot snapshot)
@@ -3007,6 +3040,10 @@ public partial class MainWindow : Window
         }
 
         QueueRecordingSafetyCheck(snapshot);
+        // Most real gameplay happens while the main window is hidden in the
+        // tray. Keep the replay drive reserve enforced in that state too; UI
+        // visibility must never decide whether capture can fill the disk.
+        QueueReplayStorageSafetyCheck(snapshot);
     }
 
     private void UpdateTrayStatus(string status, bool canSave)
@@ -3089,10 +3126,287 @@ public partial class MainWindow : Window
         _ = CheckRecordingSafetyAsync(snapshot);
     }
 
+    private void QueueReplayStorageSafetyCheck(ReplayStateSnapshot snapshot)
+    {
+        var hasActiveReplaySave =
+            _replayBufferService.ActiveReplaySaveIdentity > 0;
+        var isSaving = hasActiveReplaySave;
+        var retryNotBeforeUtc = isSaving
+            ? _replaySaveStorageSafetyRetryNotBeforeUtc
+            : _replayStorageSafetyRetryNotBeforeUtc;
+        if (IsRecorderSession ||
+            (!hasActiveReplaySave &&
+             (!_replayBufferService.IsRunning ||
+              snapshot.State is not (ReplayState.Buffering or ReplayState.Ready or ReplayState.Saving))) ||
+            _isClosing)
+        {
+            return;
+        }
+
+        if (_replayStorageSafetyCheckRunning)
+        {
+            // A normal 30-second probe can still be awaiting its drive while a
+            // replay export begins. Remember the higher-priority Saving check
+            // instead of depending on another state publication to retry it.
+            _replaySaveStorageSafetyCheckPending |=
+                isSaving && !_replayStorageSafetyCheckMonitorsSave;
+            return;
+        }
+
+        if (DateTimeOffset.UtcNow < retryNotBeforeUtc)
+        {
+            if (isSaving)
+            {
+                ScheduleReplaySaveStorageSafetyCheck();
+            }
+
+            return;
+        }
+
+        _replayStorageSafetyCheckRunning = true;
+        _replayStorageSafetyCheckMonitorsSave = isSaving;
+        if (isSaving)
+        {
+            _replaySaveStorageSafetyCheckPending = false;
+            // Export can add gigabytes while selected ring segments are protected.
+            // Give it an independent short cadence so a Ready check immediately
+            // before Save cannot suppress monitoring for another 30 seconds.
+            _replaySaveStorageSafetyRetryNotBeforeUtc =
+                DateTimeOffset.UtcNow.AddSeconds(3);
+        }
+        else
+        {
+            _replayStorageSafetyRetryNotBeforeUtc =
+                DateTimeOffset.UtcNow.AddSeconds(30);
+        }
+
+        _ = CheckReplayStorageSafetyAsync(isSaving);
+    }
+
+    private async Task CheckReplayStorageSafetyAsync(bool monitorActiveSave)
+    {
+        try
+        {
+            var sessionIdentity = _replayBufferService.ActiveSessionIdentity;
+            var replayBufferRoot = _replayBufferService.ActiveBufferRoot;
+            var activeReplaySaveIdentity = monitorActiveSave
+                ? _replayBufferService.ActiveReplaySaveIdentity
+                : 0;
+            var activeSaveDirectory = activeReplaySaveIdentity > 0
+                ? _replayBufferService.ActiveReplaySaveDirectory
+                : null;
+            var storage = await Task.Run(
+                () =>
+                {
+                    var sharesVolume = activeSaveDirectory is not null &&
+                        ReplayBufferService.ArePathsOnSameVolume(
+                            replayBufferRoot,
+                            activeSaveDirectory);
+                    var bufferFreeBytes =
+                        ReplayBufferService.TryGetAvailableFreeSpace(
+                            replayBufferRoot);
+                    var saveFreeBytes = activeSaveDirectory is null
+                        ? null
+                        : sharesVolume
+                            ? bufferFreeBytes
+                            : ReplayBufferService.TryGetAvailableFreeSpace(
+                                activeSaveDirectory);
+                    return (
+                        BufferFreeBytes: bufferFreeBytes,
+                        SaveFreeBytes: saveFreeBytes);
+                },
+                _lifetimeCancellation.Token);
+            var liveReplayStillMatches = IsCurrentStorageSafetySession(
+                sessionIdentity,
+                CaptureSessionMode.InstantReplay,
+                replayBufferRoot);
+            var activeSaveStillMatches =
+                activeReplaySaveIdentity > 0 &&
+                IsCurrentStorageSafetySession(
+                    sessionIdentity,
+                    CaptureSessionMode.InstantReplay,
+                    replayBufferRoot,
+                    requireRunning: false) &&
+                activeReplaySaveIdentity ==
+                    _replayBufferService.ActiveReplaySaveIdentity &&
+                activeSaveDirectory is not null &&
+                string.Equals(
+                    activeSaveDirectory,
+                    _replayBufferService.ActiveReplaySaveDirectory,
+                    StringComparison.OrdinalIgnoreCase);
+            if (!liveReplayStillMatches && !activeSaveStillMatches)
+            {
+                return;
+            }
+
+            var bufferUnsafe = RecordingStoragePolicy.ShouldStopReplayForSafety(
+                storage.BufferFreeBytes);
+            var saveUnsafe = activeSaveStillMatches &&
+                RecordingStoragePolicy.ShouldStopReplayForSafety(
+                    storage.SaveFreeBytes);
+            if (!bufferUnsafe && !saveUnsafe)
+            {
+                return;
+            }
+
+            if (!liveReplayStillMatches)
+            {
+                if (_replayBufferService.CancelActiveReplaySaveForStorageSafety(
+                        sessionIdentity,
+                        activeReplaySaveIdentity,
+                        activeSaveDirectory))
+                {
+                    ShowError(
+                        "The replay export was canceled because its source or output drive no longer had safe working space. Capture was already stopped.");
+                }
+
+                return;
+            }
+
+            if (!bufferUnsafe)
+            {
+                // A split output drive can disappear or fill while the live ring
+                // remains healthy elsewhere. Cancel only that export; stopping
+                // replay would discard useful capture for an unrelated volume.
+                if (_replayBufferService.CancelActiveReplaySaveForStorageSafety(
+                        sessionIdentity,
+                        activeReplaySaveIdentity,
+                        activeSaveDirectory))
+                {
+                    var saveReason = storage.SaveFreeBytes is null
+                        ? "The replay export lost access to its selected drive and was canceled safely. Instant Replay is still running."
+                        : $"The replay export was canceled before its selected drive fell below " +
+                          $"{StorageEstimator.FormatBytes(RecordingStoragePolicy.ReplaySafetyReserveBytes)} free. Instant Replay is still running.";
+                    ShowError(saveReason);
+                }
+
+                return;
+            }
+
+            var reason = storage.BufferFreeBytes is null
+                ? "Instant Replay lost access to its buffer drive and was stopped safely."
+                : $"Instant Replay was stopped before its buffer drive fell below " +
+                  $"{StorageEstimator.FormatBytes(RecordingStoragePolicy.ReplaySafetyReserveBytes)} free.";
+            _ = CancelCurrentReplaySaveForStorageSafety(sessionIdentity);
+            var safetyActionStarted = false;
+            var error = await RunCaptureCommandAsync(
+                async () =>
+                {
+                    // The command gate can be occupied by an unrelated stop/start
+                    // transition after the drive query completes. Revalidate only
+                    // after owning that gate so a stale result from session A can
+                    // never stop a newly started session B.
+                    if (!IsCurrentStorageSafetySession(
+                            sessionIdentity,
+                            CaptureSessionMode.InstantReplay,
+                            replayBufferRoot))
+                    {
+                        return;
+                    }
+
+                    safetyActionStarted = true;
+                    ShowError(reason);
+                    // A different Save can start while this safety action waits
+                    // for the UI command gate. Cancel the currently active one
+                    // again before StopAsync waits for the service save gate.
+                    _ = CancelCurrentReplaySaveForStorageSafety(
+                        sessionIdentity);
+                    _replayStartRequested = false;
+                    _requestedCaptureMode = null;
+                    ResetAutomaticCaptureRecovery();
+                    await _replayBufferService.StopAsync();
+                },
+                showError: false);
+            if (safetyActionStarted && error is not null && !_isClosing)
+            {
+                ShowError($"{reason} {error.Message}");
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // Shutdown superseded the periodic replay capacity check.
+        }
+        finally
+        {
+            _replayStorageSafetyCheckRunning = false;
+            _replayStorageSafetyCheckMonitorsSave = false;
+            if (_replaySaveStorageSafetyCheckPending && !_isClosing)
+            {
+                _replaySaveStorageSafetyCheckPending = false;
+                _replaySaveStorageSafetyRetryNotBeforeUtc = DateTimeOffset.MinValue;
+                QueueReplayStorageSafetyCheck(_latestState);
+            }
+            else
+            {
+                ScheduleReplaySaveStorageSafetyCheck();
+            }
+        }
+    }
+
+    private void ScheduleReplaySaveStorageSafetyCheck()
+    {
+        if (_replaySaveStorageSafetyCheckScheduled ||
+            _isClosing ||
+            _replayBufferService.ActiveReplaySaveIdentity <= 0)
+        {
+            return;
+        }
+
+        _replaySaveStorageSafetyCheckScheduled = true;
+        _ = RunScheduledReplaySaveStorageSafetyCheckAsync();
+    }
+
+    private async Task RunScheduledReplaySaveStorageSafetyCheckAsync()
+    {
+        try
+        {
+            var delay = _replaySaveStorageSafetyRetryNotBeforeUtc -
+                DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay, _lifetimeCancellation.Token);
+            }
+        }
+        catch (OperationCanceledException) when (
+            _lifetimeCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+        finally
+        {
+            _replaySaveStorageSafetyCheckScheduled = false;
+        }
+
+        if (_isClosing ||
+            _replayBufferService.ActiveReplaySaveIdentity <= 0)
+        {
+            return;
+        }
+
+        _replaySaveStorageSafetyRetryNotBeforeUtc = DateTimeOffset.MinValue;
+        QueueReplayStorageSafetyCheck(_latestState);
+    }
+
+    private bool CancelCurrentReplaySaveForStorageSafety(
+        int expectedSessionIdentity)
+    {
+        var replaySaveIdentity = _replayBufferService.ActiveReplaySaveIdentity;
+        if (replaySaveIdentity <= 0)
+        {
+            return false;
+        }
+
+        return _replayBufferService.CancelActiveReplaySaveForStorageSafety(
+            expectedSessionIdentity,
+            replaySaveIdentity,
+            _replayBufferService.ActiveReplaySaveDirectory);
+    }
+
     private async Task CheckRecordingSafetyAsync(ReplayStateSnapshot snapshot)
     {
         try
         {
+            var sessionIdentity = _replayBufferService.ActiveSessionIdentity;
             var saveDirectory = _settings.SaveDirectory;
             var availableFreeBytes = await Task.Run(
                 () => ReplayBufferService.TryGetAvailableFreeSpace(saveDirectory),
@@ -3100,11 +3414,11 @@ public partial class MainWindow : Window
             var storageUnavailable = availableFreeBytes is null;
             if (!ShouldFinalizeRecordingForSafety(
                     snapshot.AvailableDuration,
-                    snapshot.BufferBytes,
+                    _replayBufferService.RecordingRecoverySegmentBytes,
                     availableFreeBytes) ||
-                !IsRecorderSession ||
-                !_replayBufferService.IsRunning ||
-                _isClosing)
+                !IsCurrentStorageSafetySession(
+                    sessionIdentity,
+                    CaptureSessionMode.Recording))
             {
                 return;
             }
@@ -3112,11 +3426,23 @@ public partial class MainWindow : Window
             var reason = storageUnavailable
                 ? "Recorder lost access to the selected drive and is stopping to preserve the session."
                 : "Recorder is finalizing before the drive runs out of safe working space.";
-            ShowError(reason);
+            var safetyActionStarted = false;
             var error = await RunCaptureCommandAsync(
-                StopRecordingAndSaveCoreAsync,
+                async () =>
+                {
+                    if (!IsCurrentStorageSafetySession(
+                            sessionIdentity,
+                            CaptureSessionMode.Recording))
+                    {
+                        return;
+                    }
+
+                    safetyActionStarted = true;
+                    ShowError(reason);
+                    await StopRecordingAndSaveCoreAsync();
+                },
                 showError: false);
-            if (error is not null && !_isClosing)
+            if (safetyActionStarted && error is not null && !_isClosing)
             {
                 ShowError($"{reason} {error.Message}");
             }
@@ -3130,6 +3456,21 @@ public partial class MainWindow : Window
             _recordingSafetyCheckRunning = false;
         }
     }
+
+    private bool IsCurrentStorageSafetySession(
+        int expectedSessionIdentity,
+        CaptureSessionMode expectedMode,
+        string? expectedBufferRoot = null,
+        bool requireRunning = true) =>
+        !_isClosing &&
+        (!requireRunning || _replayBufferService.IsRunning) &&
+        _replayBufferService.ActiveSessionIdentity == expectedSessionIdentity &&
+        _replayBufferService.ActiveSessionMode == expectedMode &&
+        (expectedBufferRoot is null ||
+         string.Equals(
+             expectedBufferRoot,
+             _replayBufferService.ActiveBufferRoot,
+             StringComparison.OrdinalIgnoreCase));
 
     internal static bool ShouldFinalizeRecordingForSafety(
         TimeSpan availableDuration,
@@ -3194,26 +3535,45 @@ public partial class MainWindow : Window
             framesPerSecond,
             TimeSpan.FromHours(12),
             SystemAudioCheckBox.IsChecked == true || MicrophoneCheckBox.IsChecked == true);
+        var recordingWorkingEstimate =
+            RecordingStoragePolicy.EstimateWorkingBytes(
+                recordingEstimate);
         var savePath = string.IsNullOrWhiteSpace(SavePathTextBox.Text)
             ? AppSettings.GetDefaultSaveDirectory()
             : SavePathTextBox.Text;
         var generation = Interlocked.Increment(ref _storageStatusGeneration);
+        var activeReplaySessionIdentity =
+            _replayBufferService.IsRunning &&
+            _replayBufferService.ActiveSessionMode ==
+                CaptureSessionMode.InstantReplay
+                ? _replayBufferService.ActiveSessionIdentity
+                : (int?)null;
+        var activeReplayBufferRoot = activeReplaySessionIdentity is not null
+            ? _replayBufferService.ActiveBufferRoot
+            : null;
         StorageText.Text =
             $"Replay buffer: ~{StorageEstimator.FormatBytes(estimate)} · " +
-            $"Recorder estimate for 12 hours: ~{StorageEstimator.FormatBytes(recordingEstimate)}";
+            $"Recorder 12h working: ~{StorageEstimator.FormatBytes(recordingWorkingEstimate)} " +
+            $"(final ~{StorageEstimator.FormatBytes(recordingEstimate)})";
         StorageText.Foreground = Brush("TextMutedBrush");
         _ = UpdateStorageFreeSpaceAsync(
             generation,
             savePath,
             estimate,
-            recordingEstimate);
+            recordingEstimate,
+            recordingWorkingEstimate,
+            activeReplaySessionIdentity,
+            activeReplayBufferRoot);
     }
 
     private async Task UpdateStorageFreeSpaceAsync(
         long generation,
         string savePath,
         long estimatedBufferBytes,
-        long estimatedTwelveHourRecordingBytes)
+        long estimatedTwelveHourRecordingBytes,
+        long estimatedTwelveHourWorkingBytes,
+        int? activeReplaySessionIdentity,
+        string? activeReplayBufferRoot)
     {
         if (!CanQueryStorageFreeSpace(savePath))
         {
@@ -3222,33 +3582,54 @@ public partial class MainWindow : Window
 
         try
         {
-            var freeSpace = await Task.Run(
+            var storage = await Task.Run(
                 () =>
                 {
-                    var root = Path.GetPathRoot(Path.GetFullPath(savePath));
-                    return string.IsNullOrWhiteSpace(root)
-                        ? (long?)null
-                        : new DriveInfo(root).AvailableFreeSpace;
+                    var replayBufferRoot = activeReplayBufferRoot ??
+                        _replayBufferService.ResolveReplayBufferRoot(savePath);
+                    return (
+                        Save: ReplayBufferService.TryGetAvailableFreeSpace(savePath),
+                        Replay: ReplayBufferService.TryGetAvailableFreeSpace(
+                            replayBufferRoot),
+                        SharedVolume: ReplayBufferService.ArePathsOnSameVolume(
+                            savePath,
+                            replayBufferRoot));
                 },
                 _lifetimeCancellation.Token);
             if (_isClosing ||
                 generation != Volatile.Read(ref _storageStatusGeneration) ||
-                freeSpace is null)
+                activeReplaySessionIdentity is { } sessionIdentity &&
+                (!IsCurrentStorageSafetySession(
+                     sessionIdentity,
+                     CaptureSessionMode.InstantReplay,
+                     activeReplayBufferRoot) ||
+                 !string.Equals(
+                     activeReplayBufferRoot,
+                     _replayBufferService.ActiveBufferRoot,
+                     StringComparison.OrdinalIgnoreCase)) ||
+                storage.Save is null ||
+                storage.Replay is null)
             {
                 return;
             }
 
+            var capacityText = storage.SharedVolume
+                ? $"{StorageEstimator.FormatBytes(storage.Save.Value)} free on replay/save drive"
+                : $"{StorageEstimator.FormatBytes(storage.Save.Value)} free for clips · " +
+                  $"{StorageEstimator.FormatBytes(storage.Replay.Value)} free for replay buffer";
             StorageText.Text =
                 $"Replay buffer: ~{StorageEstimator.FormatBytes(estimatedBufferBytes)} · " +
-                $"Recorder 12h estimate: ~{StorageEstimator.FormatBytes(estimatedTwelveHourRecordingBytes)} · " +
-                $"{StorageEstimator.FormatBytes(freeSpace.Value)} free";
+                $"Recorder 12h working: ~{StorageEstimator.FormatBytes(estimatedTwelveHourWorkingBytes)} " +
+                $"(final ~{StorageEstimator.FormatBytes(estimatedTwelveHourRecordingBytes)}) · " +
+                capacityText;
             var recommendedRecordingFreeBytes =
-                estimatedTwelveHourRecordingBytes >
-                    (long.MaxValue - RecordingStoragePolicy.FinalizationSafetyReserveBytes) / 2
-                    ? long.MaxValue
-                    : estimatedTwelveHourRecordingBytes * 2 +
-                      RecordingStoragePolicy.FinalizationSafetyReserveBytes;
-            StorageText.Foreground = freeSpace.Value < recommendedRecordingFreeBytes
+                RecordingStoragePolicy.GetRecommendedStartingFreeBytes(
+                    estimatedTwelveHourRecordingBytes);
+            var requiredReplayFreeBytes = RecordingStoragePolicy
+                .GetRequiredReplayStartFreeBytes(estimatedBufferBytes);
+            StorageText.Foreground =
+                storage.Save.Value < recommendedRecordingFreeBytes ||
+                storage.Replay.Value <= requiredReplayFreeBytes
                 ? Brush("WarningBrush")
                 : Brush("TextMutedBrush");
         }
@@ -4613,10 +4994,11 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var snapshot = await _clipLibraryService.LoadAsync(
+            var refreshBatch = await _clipLibraryService.GetRecentClipRefreshBatchAsync(
                 requestedSaveDirectory,
                 count: requestedCount,
                 includeThumbnails: true,
+                filter: ClipLibraryFilter.All,
                 // Bind validated cards immediately and move new JPEG work to
                 // the cancellable/retrying hydration lane below.
                 thumbnailPolicy: ClipThumbnailPolicy.CachedOnly,
@@ -4639,6 +5021,16 @@ public partial class MainWindow : Window
                 return;
             }
 
+            var displayClips = ClipLibraryService.MergeWithCurrentValidatedCache(
+                requestedSaveDirectory,
+                refreshBatch.Clips,
+                RecentClipsItemsControl.Items.OfType<ClipLibraryItem>().ToArray(),
+                requestedCount,
+                unattemptedCandidates:
+                    refreshBatch.UnattemptedCandidates);
+            var snapshot = displayClips.Count == 0
+                ? ClipLibrarySnapshot.Empty
+                : new ClipLibrarySnapshot(displayClips);
             RecentClipsItemsControl.ItemsSource = snapshot.Clips;
             MarkRecentClipSnapshotChanged();
             UpdateRecentGalleryCardWidth();

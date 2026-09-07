@@ -212,7 +212,46 @@ public sealed class ClipLibraryService
         bool includeThumbnails,
         ClipLibraryFilter filter,
         ClipThumbnailPolicy thumbnailPolicy,
+        CancellationToken cancellationToken = default) =>
+        await GetRecentClipsCoreAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                filter,
+                thumbnailPolicy,
+                unattemptedCandidates: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal async Task<ClipLibraryRefreshBatch> GetRecentClipRefreshBatchAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipLibraryFilter filter,
+        ClipThumbnailPolicy thumbnailPolicy,
         CancellationToken cancellationToken = default)
+    {
+        var unattemptedCandidates = new HashSet<ClipLibraryCacheIdentity>();
+        var clips = await GetRecentClipsCoreAsync(
+                saveDirectory,
+                count,
+                includeThumbnails,
+                filter,
+                thumbnailPolicy,
+                unattemptedCandidates,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new ClipLibraryRefreshBatch(clips, unattemptedCandidates);
+    }
+
+    private async Task<IReadOnlyList<ClipLibraryItem>> GetRecentClipsCoreAsync(
+        string saveDirectory,
+        int count,
+        bool includeThumbnails,
+        ClipLibraryFilter filter,
+        ClipThumbnailPolicy thumbnailPolicy,
+        HashSet<ClipLibraryCacheIdentity>? unattemptedCandidates,
+        CancellationToken cancellationToken)
     {
         if (count is < 1 or > MaximumClipCount)
         {
@@ -269,10 +308,23 @@ public sealed class ClipLibraryService
                 identity,
                 candidate.Length,
                 candidate.LastWriteTimeUtc.Ticks);
+            var libraryCacheIdentity = new ClipLibraryCacheIdentity(
+                identity,
+                candidate.Length,
+                candidate.LastWriteTimeUtc.Ticks,
+                candidate.Kind);
             var cacheHit = TryGetCachedProbe(cacheKey, out var probe);
-            if (!cacheHit && probeAttempts >= maximumProbes)
+            if (!cacheHit &&
+                (probeAttempts >= maximumProbes ||
+                 probeBudget.IsCancellationRequested))
             {
-                break;
+                if (unattemptedCandidates is null)
+                {
+                    break;
+                }
+
+                unattemptedCandidates.Add(libraryCacheIdentity);
+                continue;
             }
 
             if (!cacheHit)
@@ -291,7 +343,13 @@ public sealed class ClipLibraryService
                 catch (OperationCanceledException) when (
                     probeBudget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
-                    break;
+                    if (unattemptedCandidates is null)
+                    {
+                        break;
+                    }
+
+                    unattemptedCandidates.Add(libraryCacheIdentity);
+                    continue;
                 }
             }
 
@@ -601,6 +659,109 @@ public sealed class ClipLibraryService
     }
 
     /// <summary>
+    /// Keeps a previously validated card only when the background discovery
+    /// batch proved that exact file identity was not attempted because its
+    /// bounded FFprobe budget expired. Explicitly invalid candidates are never
+    /// resurrected, and this merge performs no drive I/O on the UI thread.
+    /// </summary>
+    internal static IReadOnlyList<ClipLibraryItem> MergeWithCurrentValidatedCache(
+        string saveDirectory,
+        IReadOnlyList<ClipLibraryItem> freshClips,
+        IReadOnlyList<ClipLibraryItem> cachedClips,
+        int count,
+        ClipLibraryFilter filter = ClipLibraryFilter.All,
+        IReadOnlySet<ClipLibraryCacheIdentity>? unattemptedCandidates = null)
+    {
+        ArgumentNullException.ThrowIfNull(freshClips);
+        ArgumentNullException.ThrowIfNull(cachedClips);
+        if (count is < 1 or > MaximumClipCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(count),
+                $"Clip count must be between 1 and {MaximumClipCount}.");
+        }
+
+        if (!Enum.IsDefined(filter))
+        {
+            throw new ArgumentOutOfRangeException(nameof(filter));
+        }
+
+        static bool MatchesFilter(ClipLibraryItem clip, ClipLibraryFilter activeFilter) =>
+            activeFilter switch
+            {
+                ClipLibraryFilter.Original => !clip.IsTrimmed,
+                ClipLibraryFilter.Trimmed => clip.IsTrimmed,
+                _ => true
+            };
+
+        var cachedByPath = cachedClips
+            .Where(clip => MatchesFilter(clip, filter))
+            .GroupBy(clip => clip.FullPath, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First(),
+                StringComparer.OrdinalIgnoreCase);
+        var merged = new Dictionary<string, ClipLibraryItem>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var fresh in freshClips.Where(clip => MatchesFilter(clip, filter)))
+        {
+            var item = fresh;
+            if (cachedByPath.TryGetValue(fresh.FullPath, out var previous) &&
+                fresh.FileIdentity is { } freshIdentity &&
+                previous.FileIdentity == freshIdentity &&
+                previous.FileSizeBytes == fresh.FileSizeBytes &&
+                previous.RecordedAtUtc.UtcTicks == fresh.RecordedAtUtc.UtcTicks &&
+                previous.Kind == fresh.Kind)
+            {
+                item = fresh with
+                {
+                    Duration = fresh.Duration ?? previous.Duration,
+                    // CachedOnly already validates the deterministic JPEG.
+                    // A null result means the prior path is missing/corrupt and
+                    // must remain null so hydration can regenerate it.
+                    ThumbnailPath = fresh.ThumbnailPath
+                };
+            }
+
+            merged[item.FullPath] = item;
+        }
+
+        if (merged.Count < count)
+        {
+            foreach (var cached in cachedByPath.Values
+                         .OrderByDescending(clip => clip.RecordedAtUtc)
+                         .ThenBy(clip => clip.FileName, StringComparer.OrdinalIgnoreCase))
+            {
+                if (merged.ContainsKey(cached.FullPath) ||
+                    ClipLibraryCacheIdentity.FromClip(cached) is not { } cacheIdentity ||
+                    unattemptedCandidates is null ||
+                    !unattemptedCandidates.Contains(cacheIdentity))
+                {
+                    continue;
+                }
+
+                merged[cached.FullPath] = cached with
+                {
+                    // The batch did not spend thumbnail validation budget on
+                    // this fallback card. Never carry a stale non-null path
+                    // that would suppress the hydration lane.
+                    ThumbnailPath = null
+                };
+                if (merged.Count >= count)
+                {
+                    break;
+                }
+            }
+        }
+
+        return new ReadOnlyCollection<ClipLibraryItem>(merged.Values
+            .OrderByDescending(clip => clip.RecordedAtUtc)
+            .ThenBy(clip => clip.FileName, StringComparer.OrdinalIgnoreCase)
+            .Take(count)
+            .ToArray());
+    }
+
+    /// <summary>
     /// Revalidates a discovered clip immediately before it is handed to an in-process media decoder.
     /// </summary>
     internal static bool IsCurrentClipSafe(string saveDirectory, ClipLibraryItem clip)
@@ -851,7 +1012,8 @@ public sealed class ClipLibraryService
                         ffmpegPath,
                         arguments,
                         _thumbnailTimeout,
-                        cancellationToken)
+                        cancellationToken,
+                        ClipMediaProcessPriority.Background)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1034,7 +1196,8 @@ public sealed class ClipLibraryService
                     ffprobePath,
                     BuildProbeArguments(clipPath),
                     _probeTimeout,
-                    cancellationToken)
+                    cancellationToken,
+                    ClipMediaProcessPriority.Background)
                 .ConfigureAwait(false);
             if (result.TimedOut)
             {
@@ -2368,6 +2531,26 @@ public sealed class ClipLibraryService
         FileInfoByHandleClass fileInformationClass,
         ref FileDispositionInformation fileInformation,
         int bufferSize);
+}
+
+internal sealed record ClipLibraryRefreshBatch(
+    IReadOnlyList<ClipLibraryItem> Clips,
+    IReadOnlySet<ClipLibraryCacheIdentity> UnattemptedCandidates);
+
+internal readonly record struct ClipLibraryCacheIdentity(
+    ClipFileIdentity FileIdentity,
+    long FileSizeBytes,
+    long LastWriteTimeUtcTicks,
+    ClipKind Kind)
+{
+    internal static ClipLibraryCacheIdentity? FromClip(ClipLibraryItem clip) =>
+        clip.FileIdentity is { } identity
+            ? new ClipLibraryCacheIdentity(
+                identity,
+                clip.FileSizeBytes,
+                clip.RecordedAtUtc.UtcTicks,
+                clip.Kind)
+            : null;
 }
 
 internal enum PinnedDirectChildValidationFailure

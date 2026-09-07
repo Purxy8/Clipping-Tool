@@ -50,14 +50,26 @@ internal static class Program
             ("Hotkey gesture validation", TestHotkeyGesturesAsync),
             ("Storage estimate helpers", TestStorageEstimatorAsync),
             ("Long recording storage and segment policy", TestLongRecordingPolicyAsync),
+            ("Recorder graceful short-stop promotion", TestRecorderGracefulShortStopPromotionAsync),
+            ("Recorder copied-output identity", TestRecorderCopiedOutputIdentityAsync),
             ("Recorder recovery state discovery", TestRecorderRecoveryStateAsync),
+            ("Corrupt Recorder locator repair", TestCorruptRecorderLocatorRepairAsync),
+            ("Repaired Recorder locator family", TestRepairedRecorderLocatorFamilyAsync),
+            ("Recorder partial-tail locator migration", TestRecorderPartialTailLocatorMigrationAsync),
+            ("Recorder locator marker collision", TestRecorderLocatorMarkerCollisionAsync),
+            ("Recorder superseded locator durability", TestSupersededRecorderRecoveryJournalAsync),
             ("Central Recorder recovery journal discovery", TestCentralRecorderRecoveryJournalAsync),
+            ("Recorder live-output crash recovery journal", TestRecorderLiveOutputRecoveryJournalAsync),
             ("Unavailable Recorder journal capture gate", TestUnavailableRecorderRecoveryJournalAsync),
             ("Zero-segment Recorder recovery requires explicit discard", TestZeroSegmentRecorderRecoveryAsync),
             ("Discarded Recorder journal crash ordering", TestDiscardedRecorderRecoveryJournalAsync),
             ("Recorder journal newest candidate ordering", TestRecorderRecoveryJournalCandidateOrderingAsync),
+            ("Recorder recovery pages past garbage", TestRecorderRecoveryPagingPastGarbageAsync),
             ("Recorder journal close fault containment", TestRecorderRecoveryJournalCloseFaultAsync),
             ("Recorder journal commit durability", TestRecorderRecoveryJournalCommitDurabilityAsync),
+            ("Recorder journal schema-v1 terminal compatibility", TestRecorderRecoveryJournalLegacyTerminalAsync),
+            ("Recorder journal schema-v2 strictness", TestRecorderRecoveryJournalSchemaStrictnessAsync),
+            ("Recorder journal schema-aware crash tail", TestRecorderRecoveryJournalSchemaAwareTailAsync),
             ("Exact detached recovery beats stale journal", TestExactDetachedRecoveryPreferredAsync),
             ("Recorder journal partial segment recovery", TestRecorderJournalPartialSegmentRecoveryAsync),
             ("FFmpeg capture arguments", TestCaptureArgumentsAsync),
@@ -1568,6 +1580,127 @@ internal static class Program
         Assert.True(
             arguments[^1].EndsWith("segment-%09d.mkv", StringComparison.Ordinal),
             "Capture output must be a numbered Matroska segment pattern.");
+        Assert.ContainsSequence(
+            arguments,
+            "-bsf:v", "setts=ts=N/(60*TB):duration=1/(60*TB)");
+        Assert.ContainsSequence(
+            arguments,
+            "-bsf:a", "setts=ts=N*1024/(SR*TB):duration=1024/(SR*TB)");
+
+        var directRecordingArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration with
+            {
+                SessionMode = CaptureSessionMode.Recording,
+                Retention = RecordingStoragePolicy.NoReplayRetention
+            },
+            audioInputs,
+            VideoEncodingStrategy.SoftwareGdi,
+            @"C:\Buffer folder\Sam's session",
+            directRecordingPath: @"C:\Recorder output\Sam's recording.partial.mp4");
+        Assert.ContainsSequence(
+            directRecordingArguments,
+            "-flags", "+global_header");
+        Assert.ContainsSequence(
+            directRecordingArguments,
+            "-y", "-f", "tee");
+        Assert.ContainsSequence(
+            directRecordingArguments,
+            "-bsf:v", "setts=ts=N/(60*TB):duration=1/(60*TB)");
+        Assert.ContainsSequence(
+            directRecordingArguments,
+            "-bsf:a", "setts=ts=N*1024/(SR*TB):duration=1024/(SR*TB)");
+        var teeOutput = directRecordingArguments[^1];
+        Assert.True(
+            teeOutput.Contains(
+                "[f=segment:onfail=abort:segment_time=10:",
+                StringComparison.Ordinal),
+            "The authoritative Recorder Matroska segment slave must abort capture on failure.");
+        Assert.True(
+            teeOutput.Contains(
+                "segment_format=matroska:segment_start_number=0]" +
+                "C:/Buffer folder/Sam\\'s session/segment-%09d.mkv|",
+                StringComparison.Ordinal),
+            "The tee segment path must preserve Windows spaces and escape apostrophes.");
+        Assert.True(
+            teeOutput.Contains(
+                "[f=mp4:onfail=ignore:use_fifo=1:" +
+                "fifo_options=queue_size=512\\\\:drop_pkts_on_overflow=1:" +
+                "movflags=+empty_moov+default_base_moof:" +
+                "frag_duration=30000000:flush_packets=1]" +
+                "C:/Recorder output/Sam\\'s recording.partial.mp4",
+                StringComparison.Ordinal),
+            "The optional direct output must use a bounded FIFO and write one continuous " +
+            "bounded-fragment fMP4 that closes without a full-file rewrite.");
+        var silentDirectRecordingArguments =
+            FfmpegArgumentBuilder.BuildCaptureArguments(
+                configuration with
+                {
+                    CaptureSystemAudio = false,
+                    OutputAudioDevice = null,
+                    CaptureMicrophone = false,
+                    MicrophoneDevice = null,
+                    SessionMode = CaptureSessionMode.Recording,
+                    Retention = RecordingStoragePolicy.NoReplayRetention
+                },
+                [],
+                VideoEncodingStrategy.SoftwareGdi,
+                @"C:\Buffer\Silent session",
+                directRecordingPath: @"C:\Recorder output\silent.partial.mp4");
+        Assert.True(
+            !silentDirectRecordingArguments.Contains(
+                "-bsf:a",
+                StringComparer.Ordinal),
+            "A silent Recorder tee must not attach an audio bitstream filter.");
+        Assert.Equal(
+            @"C:\Recorder output\Sam's recording.partial.part-%01d.mp4",
+            FfmpegArgumentBuilder.GetDirectRecordingPartPattern(
+                @"C:\Recorder output\Sam's recording.partial.mp4"),
+            "The legacy direct recording part pattern was not deterministic.");
+        Assert.Equal(
+            @"C:\Recorder output\Sam's recording.partial.part-0.mp4",
+            FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                @"C:\Recorder output\Sam's recording.partial.mp4",
+                0),
+            "The legacy warmup path did not match the muxer pattern.");
+        Assert.Equal(
+            @"C:\Recorder output\Sam's recording.partial.part-1.mp4",
+            FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                @"C:\Recorder output\Sam's recording.partial.mp4",
+                1),
+            "The legacy post-warmup path did not match the muxer pattern.");
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                @"C:\Recorder output\recording.mp4",
+                -1),
+            "A negative direct recording part number must be rejected.");
+        Assert.Equal(
+            1,
+            directRecordingArguments.Count(argument => argument == "-c:v"),
+            "Tee recording must share one video encode across both muxers.");
+        Assert.Throws<ArgumentException>(
+            () => FfmpegArgumentBuilder.BuildCaptureArguments(
+                configuration,
+                audioInputs,
+                VideoEncodingStrategy.SoftwareGdi,
+                @"C:\Buffer",
+                directRecordingPath: " "),
+            "An empty direct recording path must not silently enable tee output.");
+
+        var percentPathArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
+            configuration,
+            audioInputs,
+            VideoEncodingStrategy.SoftwareGdi,
+            @"C:\100%-Buffer\Session",
+            directRecordingPath:
+                @"C:\100%-Recorder\recording.partial.mp4");
+        Assert.True(
+            percentPathArguments[^1].Contains(
+                "C:/100%%-Buffer/Session/segment-%09d.mkv|",
+                StringComparison.Ordinal) &&
+            percentPathArguments[^1].Contains(
+                "C:/100%-Recorder/recording.partial.mp4",
+                StringComparison.Ordinal),
+            "Literal percent signs must be escaped only for the segment muxer's filename pattern.");
 
         var resumedArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration,
@@ -1606,6 +1739,42 @@ internal static class Program
                 DesktopCaptureBackend.Gdi,
                 TimeSpan.FromHours(24)),
             "The compatibility GDI backend must not enter the WGC renewal path.");
+        Assert.True(
+            !ReplayBufferService.ShouldScheduleCaptureRefresh(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                TimeSpan.FromHours(24),
+                CaptureSessionMode.Recording),
+            "A healthy Recorder must not split its live MP4 on a blind timed WGC renewal.");
+        Assert.True(
+            ReplayBufferService.ShouldScheduleCaptureRefresh(
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                ReplayBufferService.CaptureProcessMaximumAge,
+                CaptureSessionMode.Recording,
+                recordingFastPathEligible: false),
+            "An aged Recorder already using segment fallback must still renew WGC.");
+        var agedWindowedRecorderContext =
+            ReplayBufferService.ResolveAgedRecorderCadenceForegroundContext(
+                CaptureSessionMode.Recording,
+                DesktopCaptureBackend.WindowsGraphicsCapture,
+                ReplayBufferService.CaptureProcessMaximumAge,
+                new CaptureForegroundContext(
+                    IsFullscreenOnCapturedDisplay: false,
+                    HasRecentInput: true,
+                    CapturedDisplayCoverage: 0.6));
+        Assert.True(
+            !agedWindowedRecorderContext.IsFullscreenOnCapturedDisplay,
+            "Process age and input activity must not turn a healthy windowed Recorder into a destructive fullscreen cadence assessment.");
+        Assert.True(
+            !ReplayBufferService.ResolveAgedRecorderCadenceForegroundContext(
+                    CaptureSessionMode.Recording,
+                    DesktopCaptureBackend.WindowsGraphicsCapture,
+                    ReplayBufferService.CaptureProcessMaximumAge,
+                    new CaptureForegroundContext(
+                        IsFullscreenOnCapturedDisplay: false,
+                        HasRecentInput: false,
+                        CapturedDisplayCoverage: 1))
+                .IsFullscreenOnCapturedDisplay,
+            "An idle static desktop was incorrectly promoted to destructive cadence checks.");
 
         var sourceArguments = FfmpegArgumentBuilder.BuildCaptureArguments(
             configuration with
@@ -1648,12 +1817,15 @@ internal static class Program
 
         Assert.True(
             captureFilter.Contains(
-                ":width=1920:height=1080:resize_mode=scale:scale_mode=point",
+                ":width=-2:height=-2:resize_mode=crop:scale_mode=point," +
+                "hwdownload,format=bgra,hwupload_cuda," +
+                "scale_cuda=w=1920:h=1080:format=bgra:interp_algo=nearest",
                 StringComparison.Ordinal),
-            "Fixed-resolution WGC capture must use the low-overhead point scaler.");
+            "Scaled NVENC capture must use native WGC surfaces and the verified CUDA scaler.");
         Assert.True(
-            !captureFilter.Contains("scale_mode=bilinear", StringComparison.Ordinal),
-            "The live WGC path must not reintroduce the expensive bilinear sampler.");
+            !captureFilter.Contains("resize_mode=scale", StringComparison.Ordinal) &&
+            !captureFilter.Contains("scale_d3d11", StringComparison.Ordinal),
+            "Scaled NVENC capture reintroduced the long-session WGC/D3D11 scaler failure.");
         Assert.True(
             captureFilter.Split(',').All(part =>
                 !part.StartsWith("fps=", StringComparison.OrdinalIgnoreCase)),
@@ -2058,16 +2230,18 @@ internal static class Program
         var renewedProbeFilter =
             GetArgumentAfter(renewedProbeArguments, "-i") ?? string.Empty;
         const string lockedGeometry =
-            ":width=1920:height=1080:resize_mode=scale:scale_mode=point";
+            ":width=-2:height=-2:resize_mode=crop:scale_mode=point," +
+            "hwdownload,format=bgra,hwupload_cuda," +
+            "scale_cuda=w=1920:h=1080:format=bgra:interp_algo=nearest";
         Assert.True(
             renewedFilter.Contains(lockedGeometry, StringComparison.Ordinal) &&
             renewedProbeFilter.Contains(lockedGeometry, StringComparison.Ordinal),
             "A renewed 1280x960 custom-mode capture must retain the Recorder's original 1920x1080 canvas.");
         Assert.True(
-            !renewedFilter.Contains("resize_mode=crop", StringComparison.Ordinal) &&
-            !renewedFilter.Contains("scale_mode=bilinear", StringComparison.Ordinal) &&
+            !renewedFilter.Contains("resize_mode=scale", StringComparison.Ordinal) &&
+            !renewedFilter.Contains("scale_d3d11", StringComparison.Ordinal) &&
             !renewedFilter.Contains("resize_mode=scale_aspect", StringComparison.Ordinal),
-            "Recorder renewal must use the bounded point scaler without crop, bilinear, or padding paths.");
+            "Recorder renewal must keep native WGC capture and the verified CUDA scaling path.");
         Assert.Equal(
             FfmpegArgumentBuilder.ScaledVideoInputQueuePackets.ToString(),
             GetArgumentAfter(renewedArguments, "-thread_queue_size"),
@@ -2467,6 +2641,9 @@ internal static class Program
             HasRecentInput: true);
         var fullscreenIdle = fullscreenRecent with { HasRecentInput = false };
         var windowedRecent = fullscreenRecent with { IsFullscreenOnCapturedDisplay = false };
+        var windowedIdle = new CaptureForegroundContext(
+            IsFullscreenOnCapturedDisplay: false,
+            HasRecentInput: false);
         var inactiveWindowedContext = new CaptureForegroundContext(
             IsFullscreenOnCapturedDisplay: false,
             HasRecentInput: false,
@@ -2547,6 +2724,30 @@ internal static class Program
                 foregroundAspectRatio: 4d / 3,
                 monitorAspectRatio: 16d / 9),
             "The custom-fullscreen boundary admitted an undersized or unanchored window.");
+        Assert.True(
+            CaptureForegroundContextProbe.IsWorkAreaFullscreenCandidate(
+                capturedDisplayCoverage: 0.972,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToWorkArea: true),
+            "A borderless game filling the taskbar work area was excluded from cadence monitoring.");
+        Assert.True(
+            !CaptureForegroundContextProbe.IsWorkAreaFullscreenCandidate(
+                capturedDisplayCoverage: 0.972,
+                monitorMatches: true,
+                isBorderless: false,
+                isAnchoredToWorkArea: true) &&
+            !CaptureForegroundContextProbe.IsWorkAreaFullscreenCandidate(
+                capturedDisplayCoverage: 0.89,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToWorkArea: true) &&
+            !CaptureForegroundContextProbe.IsWorkAreaFullscreenCandidate(
+                capturedDisplayCoverage: 0.972,
+                monitorMatches: true,
+                isBorderless: true,
+                isAnchoredToWorkArea: false),
+            "An ordinary maximized or partial desktop window was mistaken for a borderless game.");
 
         var healthy = new CaptureStarvationWatchdog(60);
         for (var second = 0; second <= 12; second++)
@@ -2568,6 +2769,132 @@ internal static class Program
             Assert.True(
                 assessment is null,
                 "Severe duplicates outside fullscreen must not trigger starvation recovery.");
+        }
+
+        var objectiveWindowedSlowOutput =
+            new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? objectiveWindowedAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            objectiveWindowedAssessment ??=
+                objectiveWindowedSlowOutput.Observe(
+                    new CaptureProgressSample(
+                        Frame: 30L * second,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds: 500_000L * second,
+                        Timestamp: checked(
+                            second * (long)Stopwatch.Frequency)),
+                    windowedIdle,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: false);
+        }
+
+        Assert.True(
+            objectiveWindowedAssessment is
+            {
+                Kind: CaptureStarvationKind.OutputThroughput,
+                OutputSpeedRatio: < 0.85
+            },
+            "A windowed/custom capture running at 30 FPS and 0.5x media speed escaped objective monitoring.");
+
+        var objectiveWindowedStatic =
+            new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 16; second++)
+        {
+            Assert.True(
+                objectiveWindowedStatic.Observe(
+                    CreateProgressSample(
+                        second,
+                        frame: 60L * second,
+                        duplicatedFrames: 59L * second),
+                    windowedIdle,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: true) is null,
+                "Real-time output with static/windowed content was mistaken for an objective graph fault.");
+        }
+
+        var objectiveHistoryAcrossFullscreenLoss =
+            new CaptureStarvationWatchdog(60);
+        CaptureStarvationAssessment? fullscreenLossAssessment = null;
+        for (var second = 0; second <= 8; second++)
+        {
+            fullscreenLossAssessment ??=
+                objectiveHistoryAcrossFullscreenLoss.Observe(
+                    new CaptureProgressSample(
+                        Frame: 30L * second,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds: 500_000L * second,
+                        Timestamp: checked(
+                            second * (long)Stopwatch.Frequency)),
+                    second <= 3 ? fullscreenRecent : windowedIdle,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: false);
+        }
+
+        Assert.True(
+            fullscreenLossAssessment is
+            {
+                Kind: CaptureStarvationKind.OutputThroughput
+            },
+            "Losing fullscreen classification erased objective throughput history along with content history.");
+
+        var objectiveCounterRollback =
+            new CaptureStarvationWatchdog(60);
+        for (var second = 0; second <= 6; second++)
+        {
+            Assert.True(
+                objectiveCounterRollback.Observe(
+                    new CaptureProgressSample(
+                        Frame: 30L * second,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds: 500_000L * second,
+                        Timestamp: checked(
+                            second * (long)Stopwatch.Frequency)),
+                    windowedIdle,
+                    captureUptime: TimeSpan.FromSeconds(second),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: false) is null,
+                "Objective monitoring triggered before its confirmation window.");
+        }
+
+        Assert.True(
+            objectiveCounterRollback.Observe(
+                new CaptureProgressSample(
+                    Frame: 0,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 0,
+                    Timestamp: checked(7L * Stopwatch.Frequency)),
+                windowedIdle,
+                captureUptime: TimeSpan.Zero,
+                allowOutputThroughput: true,
+                allowSourceCadence: false) is null,
+            "A restarted FFmpeg counter set was compared with the prior process.");
+        for (var second = 8; second <= 16; second++)
+        {
+            var elapsedSinceRestart = second - 7;
+            Assert.True(
+                objectiveCounterRollback.Observe(
+                    new CaptureProgressSample(
+                        Frame: 60L * elapsedSinceRestart,
+                        DuplicatedFrames: 0,
+                        DroppedFrames: 0,
+                        OutputTimeMicroseconds:
+                            1_000_000L * elapsedSinceRestart,
+                        Timestamp: checked(
+                            second * (long)Stopwatch.Frequency)),
+                    windowedIdle,
+                    captureUptime:
+                        TimeSpan.FromSeconds(elapsedSinceRestart),
+                    allowOutputThroughput: true,
+                    allowSourceCadence: false) is null,
+                "Objective history did not rebase after a counter rollback.");
         }
 
         var objectiveGdiStarvation = new CaptureStarvationWatchdog(60);
@@ -3049,6 +3376,50 @@ internal static class Program
             },
             "A visible multi-second capture progress freeze escaped cadence recovery.");
 
+        var systemResumeGap = new CaptureStarvationWatchdog(60);
+        Assert.True(
+            systemResumeGap.Observe(
+                new CaptureProgressSample(
+                    Frame: 2_592_000,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 43_200_000_000,
+                    Timestamp: 0),
+                windowedIdle,
+                captureUptime: TimeSpan.FromHours(12),
+                allowOutputThroughput: true,
+                allowSourceCadence: false) is null,
+            "The long-session resume fixture triggered on its baseline.");
+        Assert.True(
+            systemResumeGap.Observe(
+                new CaptureProgressSample(
+                    Frame: 2_592_000,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 43_200_000_000,
+                    Timestamp: checked(10L * Stopwatch.Frequency)),
+                windowedIdle,
+                captureUptime: TimeSpan.FromHours(12) + TimeSpan.FromSeconds(10),
+                allowOutputThroughput: true,
+                allowSourceCadence: false) is null,
+            "A system sleep gap was treated as a confirmed graph failure on its first post-resume sample.");
+        Assert.True(
+            systemResumeGap.Observe(
+                new CaptureProgressSample(
+                    Frame: 2_592_015,
+                    DuplicatedFrames: 0,
+                    DroppedFrames: 0,
+                    OutputTimeMicroseconds: 43_200_250_000,
+                    Timestamp: checked(
+                        10L * Stopwatch.Frequency +
+                        Stopwatch.Frequency / 4)),
+                windowedIdle,
+                captureUptime:
+                    TimeSpan.FromHours(12) + TimeSpan.FromSeconds(10.25),
+                allowOutputThroughput: true,
+                allowSourceCadence: false) is null,
+            "Normal real-time progress immediately after resume invalidated a healthy long Recorder session.");
+
         var parentPipeBacklog = new CaptureStarvationWatchdog(60);
         for (var second = 0; second <= 8; second++)
         {
@@ -3058,10 +3429,10 @@ internal static class Program
                         second,
                         frame: 60L * second,
                         duplicatedFrames: 0),
-                    fullscreenRecent,
+                    windowedIdle,
                     captureUptime: TimeSpan.FromSeconds(second),
                     allowOutputThroughput: true) is null,
-                "Healthy pre-backlog progress unexpectedly triggered recovery.");
+                "Healthy windowed pre-backlog progress unexpectedly triggered recovery.");
         }
 
         Assert.True(
@@ -3072,7 +3443,7 @@ internal static class Program
                     DroppedFrames: 0,
                     OutputTimeMicroseconds: 8_250_000,
                     Timestamp: checked(12L * Stopwatch.Frequency)),
-                fullscreenRecent,
+                windowedIdle,
                 captureUptime: TimeSpan.FromSeconds(12),
                 allowOutputThroughput: true) is null,
             "The first stale progress block after a parent-process pause was treated as a capture fault.");
@@ -3086,7 +3457,7 @@ internal static class Program
                     Timestamp: checked(
                         12L * Stopwatch.Frequency +
                         Stopwatch.Frequency / 200)),
-                fullscreenRecent,
+                windowedIdle,
                 captureUptime: TimeSpan.FromSeconds(12.005),
                 allowOutputThroughput: true) is null,
             "A queued progress burst triggered recovery before its cumulative counters could catch up.");
@@ -3100,10 +3471,10 @@ internal static class Program
                     Timestamp: checked(
                         12L * Stopwatch.Frequency +
                         Stopwatch.Frequency / 100)),
-                fullscreenRecent,
+                windowedIdle,
                 captureUptime: TimeSpan.FromSeconds(12.01),
                 allowOutputThroughput: true) is null,
-            "Queued FFmpeg progress that caught up immediately after the parent resumed still triggered recovery.");
+            "Queued windowed FFmpeg progress that caught up immediately after the parent resumed still triggered recovery.");
 
         var longParentPipeBacklog =
             new CaptureStarvationWatchdog(60);
@@ -3300,8 +3671,9 @@ internal static class Program
                 outputRequiresScaling: true,
                 CapturePerformanceProfile.Resilient,
                 flickerAssessment.Kind,
-                flickerAssessment.UsedCustomFullscreenFallback) is null,
-            "One exact-fullscreen probe flicker discarded the custom/stretched history and enabled destructive duplicate-only recovery.");
+                flickerAssessment.UsedCustomFullscreenFallback) ==
+                CaptureRecoveryReason.SourceStarvation,
+            "A severe custom/stretched cadence collapse remained invisible after one exact-fullscreen probe flicker.");
 
         var customObjectiveThroughput =
             new CaptureStarvationWatchdog(60);
@@ -3378,13 +3750,14 @@ internal static class Program
                 outputRequiresScaling: false,
                 CapturePerformanceProfile.Resilient,
                 CaptureStarvationKind.Severe,
-                usedCustomFullscreenFallback: true) is null &&
+                usedCustomFullscreenFallback: true) ==
+                CaptureRecoveryReason.SourceStarvation &&
             ReplayBufferService.SelectSafeCadenceRecoveryReason(
                 outputRequiresScaling: true,
                 CapturePerformanceProfile.LowImpact,
                 CaptureStarvationKind.SchedulingPressure,
                 usedCustomFullscreenFallback: true) is null,
-            "Ambiguous custom fullscreen content cadence remained destructive after promotion or scaling.");
+            "Custom fullscreen recovery did not distinguish a severe collapse from ambiguous scheduling pressure.");
         Assert.Equal(
             CaptureRecoveryReason.SourceStarvation,
             ReplayBufferService.SelectSafeCadenceRecoveryReason(
@@ -3394,7 +3767,7 @@ internal static class Program
                 usedCustomFullscreenFallback: true),
             "Objective custom-fullscreen throughput failure was incorrectly suppressed.");
         Assert.True(
-            ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
+            !ReplayBufferService.ShouldSuppressNonObjectiveCaptureCadence(
                 usedCustomFullscreenFallback: true,
                 outputRequiresScaling: false,
                 CapturePerformanceProfile.Resilient,
@@ -4266,6 +4639,14 @@ internal static class Program
             await service!.WaitForInitialBufferMaintenanceAsync()
                 .WaitAsync(TimeSpan.FromSeconds(2))
                 .ConfigureAwait(false);
+            var preferredReplayRoot = service.ResolveReplayBufferRoot(
+                Path.Combine(testDirectory, "Clips"));
+            Assert.True(
+                preferredReplayRoot.StartsWith(
+                    Path.Combine(testDirectory, "Clips", ".clipforge-replay-buffer") +
+                    Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase),
+                "Replay did not place its disk ring on the selected fixed clip drive.");
             await service.DisposeAsync().ConfigureAwait(false);
 
             Assert.True(
@@ -4843,12 +5224,20 @@ internal static class Program
                     @"C:\Buffer");
                 var wgcFilter = GetArgumentAfter(wgcArguments, "-i") ?? string.Empty;
                 var expectedWgcGeometry = expected.RequiresScaling
-                    ? $":width={expected.Width}:height={expected.Height}:resize_mode=scale:scale_mode=point"
+                    ? ":width=-2:height=-2:resize_mode=crop:scale_mode=point," +
+                      "hwdownload,format=bgra,hwupload_cuda," +
+                      $"scale_cuda=w={expected.Width}:h={expected.Height}:" +
+                      "format=bgra:interp_algo=nearest"
                     : ":width=-2:height=-2:resize_mode=crop:scale_mode=point";
                 Assert.True(wgcFilter.Contains(expectedWgcGeometry, StringComparison.Ordinal),
                     $"{context} built the wrong WGC geometry path: {wgcFilter}");
                 Assert.True(!wgcFilter.Contains("resize_mode=scale_aspect", StringComparison.Ordinal),
                     $"{context} reintroduced the padded WGC aspect scaler.");
+                Assert.True(
+                    !expected.RequiresScaling ||
+                    !wgcFilter.Contains("resize_mode=scale", StringComparison.Ordinal) &&
+                    !wgcFilter.Contains("scale_d3d11", StringComparison.Ordinal),
+                    $"{context} reintroduced the failing fixed-size WGC/D3D11 scaler.");
                 Assert.Equal(
                     expected.RequiresScaling
                         ? FfmpegArgumentBuilder.ScaledVideoInputQueuePackets.ToString()
@@ -5088,8 +5477,11 @@ internal static class Program
             !graphicsNvenc.Contains("gdigrab", StringComparer.Ordinal),
             "The low-overhead graphics backend must not also start GDI capture.");
         Assert.True(
-            !graphicsNvenc.Any(argument => argument.Contains("hwdownload", StringComparison.Ordinal)),
-            "Direct graphics capture should keep frames on the GPU.");
+            graphicsNvenc.Any(argument => argument.Contains(
+                "hwdownload,format=bgra,hwupload_cuda,scale_cuda=",
+                StringComparison.Ordinal)) &&
+            !IsSystemMemoryTransferGraph(graphicsNvenc),
+            "Scaled direct NVENC capture must return native WGC frames to CUDA rather than end in system memory.");
         Assert.ContainsSequence(graphicsNvenc, "-vf", "setpts=PTS-STARTPTS");
 
         var nativeFullHdConfiguration = configuration with
@@ -5119,9 +5511,11 @@ internal static class Program
             "A fixed preset that matches the native display must bypass WGC resizing.");
         Assert.True(
             graphicsNvenc.Any(argument => argument.Contains(
-                ":width=1920:height=1080:resize_mode=scale:scale_mode=point",
+                ":width=-2:height=-2:resize_mode=crop:scale_mode=point," +
+                "hwdownload,format=bgra,hwupload_cuda," +
+                "scale_cuda=w=1920:h=1080:format=bgra:interp_algo=nearest",
                 StringComparison.Ordinal)),
-            "A smaller fixed preset must use the low-overhead WGC point scaler.");
+            "A smaller fixed preset must bypass the failing fixed-size WGC surface pool.");
         Assert.ContainsSequence(
             nativeFullHdGraphics,
             "-thread_queue_size", "2",
@@ -5157,9 +5551,10 @@ internal static class Program
                 RequiresSystemMemoryTransfer: true));
         Assert.True(
             graphicsQsvProbe.Any(argument => argument.Contains(
-                "hwdownload,format=bgra,format=nv12",
+                "hwdownload,format=bgra,scale=1920:1080:" +
+                "flags=fast_bilinear,format=nv12",
                 StringComparison.Ordinal)),
-            "Quick Sync graphics capture must use its supported NV12 system-memory format.");
+            "Quick Sync transfer capture must scale native WGC frames into its NV12 system-memory format.");
         Assert.ContainsSequence(
             graphicsQsvProbe,
             "-nostats",
@@ -5645,8 +6040,7 @@ internal static class Program
             var encoderName = GetArgumentAfter(arguments, "-c:v");
             var isGraphicsCapture = arguments.Any(argument =>
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
-            var isTransfer = arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal));
+            var isTransfer = IsSystemMemoryTransferGraph(arguments);
 
             return encoderName switch
             {
@@ -5683,8 +6077,7 @@ internal static class Program
             var encoderName = GetArgumentAfter(arguments, "-c:v");
             var isGraphicsCapture = arguments.Any(argument =>
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
-            var isTransfer = arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal));
+            var isTransfer = IsSystemMemoryTransferGraph(arguments);
 
             return encoderName switch
             {
@@ -5722,8 +6115,7 @@ internal static class Program
             var encoderName = GetArgumentAfter(arguments, "-c:v");
             var isGraphicsCapture = arguments.Any(argument =>
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
-            var isTransfer = arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal));
+            var isTransfer = IsSystemMemoryTransferGraph(arguments);
             return encoderName == "h264_nvenc" &&
                    (!isGraphicsCapture ||
                     recoveredGraphicsCapture && !isTransfer);
@@ -5804,9 +6196,7 @@ internal static class Program
             arguments.Any(argument => argument.Contains(
                 "gfxcapture=",
                 StringComparison.Ordinal)) &&
-            !arguments.Any(argument => argument.Contains(
-                "hwdownload",
-                StringComparison.Ordinal)));
+            !IsSystemMemoryTransferGraph(arguments));
         var focusedProbe = new FfmpegCapabilityProbe(focusedRunner);
         var focusedSelection =
             await focusedProbe.ReprobeWindowsGraphicsCaptureAsync(
@@ -5857,8 +6247,7 @@ internal static class Program
             var encoderName = GetArgumentAfter(arguments, "-c:v");
             var isGraphicsCapture = arguments.Any(argument =>
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
-            var isTransfer = arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal));
+            var isTransfer = IsSystemMemoryTransferGraph(arguments);
             return encoderName == "h264_nvenc" &&
                    (!isGraphicsCapture ||
                     graphicsCaptureRecovered && !isTransfer);
@@ -6267,8 +6656,7 @@ internal static class Program
                 argument.Contains("gfxcapture=", StringComparison.Ordinal));
             var isGdiCapture = arguments.Any(argument =>
                 argument.Equals("gdigrab", StringComparison.Ordinal));
-            var isTransfer = arguments.Any(argument =>
-                argument.Contains("hwdownload", StringComparison.Ordinal));
+            var isTransfer = IsSystemMemoryTransferGraph(arguments);
             productionGdiProbeObserved |= isGdiCapture;
             return requestedEncoder == availableEncoder &&
                    (!isGraphicsCapture ||
@@ -6324,6 +6712,16 @@ internal static class Program
         }
 
         return null;
+    }
+
+    private static bool IsSystemMemoryTransferGraph(
+        IReadOnlyList<string> arguments)
+    {
+        var graphicsFilter = arguments.FirstOrDefault(argument =>
+            argument.Contains("gfxcapture=", StringComparison.Ordinal));
+        return graphicsFilter is not null &&
+               graphicsFilter.Contains("hwdownload", StringComparison.Ordinal) &&
+               !graphicsFilter.Contains("hwupload_cuda", StringComparison.Ordinal);
     }
 
     private static CaptureConfiguration CreateCaptureConfiguration(int monitorIndex) => new(
@@ -6385,6 +6783,10 @@ internal static class Program
         Assert.ContainsSequence(recordingArguments, "-f", "concat", "-safe", "0");
         Assert.ContainsSequence(recordingArguments, "-map", "0:v:0", "-map", "0:a?");
         Assert.ContainsSequence(recordingArguments, "-c", "copy", "-avoid_negative_ts", "make_zero");
+        Assert.ContainsSequence(
+            recordingArguments,
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", "30000000", "-f", "mp4");
         Assert.True(
             !recordingArguments.Contains("-ss", StringComparer.Ordinal) &&
             !recordingArguments.Contains("-t", StringComparer.Ordinal),
@@ -6393,6 +6795,69 @@ internal static class Program
             @"C:\Clips\recording.mp4",
             recordingArguments[^1],
             "The Recorder output path must remain one argument.");
+        var boundedRecordingArguments =
+            FfmpegArgumentBuilder.BuildRecordingConcatArguments(
+                @"C:\Buffer\recording-manifest.txt",
+                @"C:\Clips\recording.mp4",
+                TimeSpan.FromSeconds(13.25));
+        Assert.ContainsSequence(
+            boundedRecordingArguments,
+            "-i", @"C:\Buffer\recording-manifest.txt",
+            "-t", "13.25",
+            "-map", "0:v:0");
+
+        var shortRecordingArguments =
+            FfmpegArgumentBuilder.BuildShortRecordingConcatArguments(
+                @"C:\Buffer\short-recording-manifest.txt",
+                @"C:\Clips\short-recording.mp4",
+                framesPerSecond: 60,
+                hasAudio: true);
+        Assert.ContainsSequence(
+            shortRecordingArguments,
+            "-c", "copy",
+            "-bsf:v", "setts=ts=N/(60*TB):duration=1/(60*TB)");
+        Assert.ContainsSequence(
+            shortRecordingArguments,
+            "-bsf:a",
+            "setts=ts=N*1024/(SR*TB):duration=1024/(SR*TB)");
+        Assert.ContainsSequence(
+            shortRecordingArguments,
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", "30000000", "-f", "mp4");
+        Assert.Equal(
+            @"C:\Clips\short-recording.mp4",
+            shortRecordingArguments[^1],
+            "Short Recorder finalization changed its exact output path.");
+        var silentShortRecordingArguments =
+            FfmpegArgumentBuilder.BuildShortRecordingConcatArguments(
+                @"C:\Buffer\silent-short-recording-manifest.txt",
+                @"C:\Clips\silent-short-recording.mp4",
+                framesPerSecond: 60,
+                hasAudio: false);
+        Assert.True(
+            !silentShortRecordingArguments.Contains("-bsf:a", StringComparer.Ordinal),
+            "Silent short Recorder output must not apply an unmatched audio bitstream filter.");
+
+        var recoveryArguments =
+            FfmpegArgumentBuilder.BuildRecordingRecoveryArguments(
+                @"C:\Buffer\live.part-1.mp4",
+                @"C:\Clips\recovered.partial.mp4");
+        Assert.ContainsSequence(
+            recoveryArguments,
+            "-fflags", "+discardcorrupt",
+            "-protocol_whitelist", "file");
+        Assert.ContainsSequence(
+            recoveryArguments,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy", "-shortest");
+        Assert.ContainsSequence(
+            recoveryArguments,
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", "30000000", "-f", "mp4", "-y");
+        Assert.Equal(
+            @"C:\Clips\recovered.partial.mp4",
+            recoveryArguments[^1],
+            "Recorder crash repair changed its exact output path.");
 
         return Task.CompletedTask;
     }
@@ -6501,6 +6966,39 @@ internal static class Program
                 expectedAudio: false,
                 out _),
             "A deliberately silent capture should validate without audio.");
+
+        const string liveRecordingWithShortTail = """
+            {
+              "streams": [
+                {
+                  "codec_type": "video",
+                  "r_frame_rate": "60/1",
+                  "avg_frame_rate": "60/1",
+                  "start_time": "0",
+                  "duration": "30.75",
+                  "nb_frames": "1845"
+                }
+              ],
+              "format": { "duration": "30.75" }
+            }
+            """;
+        Assert.True(
+            !ReplayBufferService.TryValidateExportProbe(
+                liveRecordingWithShortTail,
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: false,
+                out _),
+            "Normal replay validation must keep its strict duration contract.");
+        Assert.True(
+            ReplayBufferService.TryValidateExportProbe(
+                liveRecordingWithShortTail,
+                TimeSpan.FromSeconds(30),
+                60,
+                expectedAudio: false,
+                out var liveTailFailure,
+                durationToleranceOverride: TimeSpan.FromSeconds(1)),
+            $"Recorder validation rejected its bounded final fragment: {liveTailFailure}");
         Assert.True(
             !ReplayBufferService.TryValidateExportProbe(
                 "[]",
@@ -7339,6 +7837,53 @@ internal static class Program
 
         const long sessionBytes = 100L * 1024 * 1024 * 1024;
         Assert.Equal(
+            sessionBytes * 2,
+            RecordingStoragePolicy.EstimateWorkingBytes(sessionBytes),
+            "Recorder working-space estimate omitted its recovery stream or direct output.");
+        Assert.Equal(
+            sessionBytes * 3 +
+            RecordingStoragePolicy.FinalizationSafetyReserveBytes +
+            RecordingStoragePolicy.AutomaticFinalizationHeadroomBytes,
+            RecordingStoragePolicy.GetRecommendedStartingFreeBytes(
+                sessionBytes),
+            "Recorder starting-space guidance did not preserve a full fallback export copy and automatic-stop headroom.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(3),
+            ReplayBufferService.GetCaptureBoundaryWaitTimeout(
+                CaptureSessionMode.InstantReplay),
+            "Instant Replay boundary waiting changed from its bounded two-second cadence.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(
+                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds + 1),
+            ReplayBufferService.GetCaptureBoundaryWaitTimeout(
+                CaptureSessionMode.Recording),
+            "Recorder boundary waiting cannot cover one recovery-segment interval.");
+        Assert.True(
+            RecordingRecoveryJournal.GetUncleanRecoverySafetyTailSegments(2) == 15 &&
+            RecordingRecoveryJournal.GetUncleanRecoverySafetyTailSegments(
+                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds) == 6,
+            "Recorder crash recovery did not preserve the 24-second invalidation window across journal schemas.");
+        Assert.True(
+            ReplayBufferService.HasUsableRecordingSourceMetadata(
+                segmentCount: 0,
+                liveRecordingPath: @"C:\Recorder\live.part-1.mp4",
+                liveRecordingExpectedDuration: TimeSpan.FromSeconds(3),
+                liveRecordingFastPathEligible: true,
+                liveRecordingRecoveryPath: null) &&
+            !ReplayBufferService.HasUsableRecordingSourceMetadata(
+                segmentCount: 0,
+                liveRecordingPath: @"C:\Recorder\missing.part-1.mp4",
+                liveRecordingExpectedDuration: null,
+                liveRecordingFastPathEligible: false,
+                liveRecordingRecoveryPath: null) &&
+            ReplayBufferService.HasUsableRecordingSourceMetadata(
+                segmentCount: 0,
+                liveRecordingPath: null,
+                liveRecordingExpectedDuration: null,
+                liveRecordingFastPathEligible: false,
+                liveRecordingRecoveryPath: @"C:\Recorder\interrupted.part-1.mp4"),
+            "Recorder source metadata could trap an empty session or hide a repairable live output.");
+        Assert.Equal(
             sessionBytes + RecordingStoragePolicy.FinalizationSafetyReserveBytes,
             RecordingStoragePolicy.GetRequiredFinalizationFreeBytes(sessionBytes),
             "Finalization reserve did not include one complete output copy.");
@@ -7380,6 +7925,49 @@ internal static class Program
             long.MaxValue,
             RecordingStoragePolicy.GetRequiredFinalizationFreeBytes(long.MaxValue),
             "Finalization free-space math overflowed instead of saturating.");
+        Assert.True(
+            RecordingStoragePolicy.EstimateWorkingBytes(long.MaxValue) ==
+                long.MaxValue &&
+            RecordingStoragePolicy.GetRecommendedStartingFreeBytes(
+                long.MaxValue) == long.MaxValue,
+            "Recorder working-space estimates overflowed instead of saturating.");
+        Assert.Equal(
+            sessionBytes + RecordingStoragePolicy.ReplaySafetyReserveBytes,
+            RecordingStoragePolicy.GetRequiredReplayStartFreeBytes(sessionBytes),
+            "Replay start capacity omitted its emergency free-space reserve.");
+        Assert.Equal(
+            sessionBytes * 2 + RecordingStoragePolicy.ReplaySafetyReserveBytes,
+            RecordingStoragePolicy.GetRequiredReplaySaveFreeBytes(
+                sessionBytes,
+                sessionBytes,
+                sharesBufferVolume: true),
+            "A same-volume replay save omitted its output or protected-ring overlap allowance.");
+        Assert.Equal(
+            sessionBytes + RecordingStoragePolicy.ReplaySafetyReserveBytes,
+            RecordingStoragePolicy.GetRequiredReplaySaveFreeBytes(
+                sessionBytes,
+                sessionBytes * 2,
+                sharesBufferVolume: false),
+            "A split-volume replay save omitted its per-volume overlap allowance.");
+        Assert.Equal(
+            long.MaxValue,
+            RecordingStoragePolicy.GetRequiredReplaySaveFreeBytes(
+                long.MaxValue,
+                long.MaxValue,
+                sharesBufferVolume: true),
+            "Replay save free-space math overflowed instead of saturating.");
+        Assert.Equal(
+            sessionBytes * 2 + RecordingStoragePolicy.ReplaySafetyReserveBytes,
+            RecordingStoragePolicy.GetRequiredReplaySaveBufferFreeBytes(
+                sessionBytes * 2),
+            "A split-volume replay buffer omitted its VBR overlap allowance.");
+        Assert.True(
+            RecordingStoragePolicy.ShouldStopReplayForSafety(null) &&
+            RecordingStoragePolicy.ShouldStopReplayForSafety(
+                RecordingStoragePolicy.ReplaySafetyReserveBytes) &&
+            !RecordingStoragePolicy.ShouldStopReplayForSafety(
+                RecordingStoragePolicy.ReplaySafetyReserveBytes + 1),
+            "Replay low-space protection did not fail closed at its reserve boundary.");
 
         const int twelveHourSegmentCount = 21_600;
         var manifest = ReplayBufferService.BuildConcatManifestLines(
@@ -7401,8 +7989,301 @@ internal static class Program
             TimeSpan.Zero,
             RecordingStoragePolicy.NoReplayRetention,
             "Recorder unexpectedly exposed an Instant Replay retention window.");
+        Assert.True(
+            ReplayBufferService.ArePathsOnSameVolume(
+                @"C:\Clips\.clipforge-recordings\session-1\.clipforge-live-recording.mp4",
+                @"c:\Clips\Clip_2026-09-02_12-00-00.mp4"),
+            "A case-only drive-root difference prevented Recorder's metadata-only move.");
+        Assert.True(
+            !ReplayBufferService.ArePathsOnSameVolume(
+                @"C:\Clips\.clipforge-recordings\session-1\.clipforge-live-recording.mp4",
+                @"D:\Clips\Clip_2026-09-02_12-00-00.mp4"),
+            "Recorder must not promise an instant rename across volumes.");
+        var destinationFixture = CreateTestDirectory();
+        try
+        {
+            var safeDestination = Path.Combine(destinationFixture, "Clips");
+            var recordingRoot = Path.Combine(
+                safeDestination,
+                ".clipforge-recordings");
+            var recordingSession = Path.Combine(recordingRoot, "session-1");
+            var nestedDestination = Path.Combine(recordingSession, "Exports");
+            Directory.CreateDirectory(nestedDestination);
+            Assert.True(
+                ReplayBufferService.IsSafeRecordingSaveDestination(
+                    safeDestination,
+                    recordingRoot,
+                    recordingSession) &&
+                !ReplayBufferService.IsSafeRecordingSaveDestination(
+                    recordingSession,
+                    recordingRoot,
+                    recordingSession) &&
+                !ReplayBufferService.IsSafeRecordingSaveDestination(
+                    nestedDestination,
+                    recordingRoot,
+                    recordingSession),
+                "Recorder allowed its committed output to be placed inside a working directory that cleanup deletes.");
+        }
+        finally
+        {
+            DeleteTestDirectory(destinationFixture);
+        }
+        Assert.True(
+            ReplayBufferService.IsDirectRecordingTeeFailureDiagnostic(
+                "[fifo @ 000001] FIFO queue full") &&
+            ReplayBufferService.IsDirectRecordingTeeFailureDiagnostic(
+                "[tee @ 000002] Slave muxer #1 failed: I/O error") &&
+            !ReplayBufferService.IsDirectRecordingTeeFailureDiagnostic(
+                "[tee @ 000002] Slave muxer #0 finished normally"),
+            "Recorder did not fail closed after optional direct-output packet loss.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(3.25),
+            ReplayBufferService.ResolveGracefulRecordingTailDuration(
+                outputTimeMicroseconds: 23_250_000,
+                tailSegmentNumber: 102,
+                generationStartSegmentNumber: 100,
+                segmentDurationSeconds:
+                    FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                framesPerSecond: 60),
+            "Recorder did not derive a partial graceful tail from generation-local progress.");
+        Assert.Equal(
+            TimeSpan.FromSeconds(
+                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds),
+            ReplayBufferService.ResolveGracefulRecordingTailDuration(
+                outputTimeMicroseconds: 20_020_000,
+                tailSegmentNumber: 101,
+                generationStartSegmentNumber: 100,
+                segmentDurationSeconds:
+                    FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                framesPerSecond: 60),
+            "A boundary-adjacent graceful tail was not clamped to one complete segment.");
+        Assert.True(
+            ReplayBufferService.ResolveGracefulRecordingTailDuration(
+                outputTimeMicroseconds: 20_000_000,
+                tailSegmentNumber: 102,
+                generationStartSegmentNumber: 100,
+                segmentDurationSeconds:
+                    FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                framesPerSecond: 60) is null,
+            "Recorder accepted a zero-length post-boundary tail that began after Stop.");
 
         return Task.CompletedTask;
+    }
+
+    private static async Task TestRecorderGracefulShortStopPromotionAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var bufferRoot = Path.Combine(testDirectory, ".clipforge-recordings");
+            var sessionDirectory = Path.Combine(
+                bufferRoot,
+                "session-20260804-115900-01010101010101010101010101010101");
+            Directory.CreateDirectory(sessionDirectory);
+            var basePath = Path.Combine(
+                sessionDirectory,
+                ".clipforge-live-recording.mp4");
+            var partZeroPath = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                basePath,
+                partNumber: 0);
+            var partOnePath = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                basePath,
+                partNumber: 1);
+            var payload = Enumerable.Range(0, 4096)
+                .Select(index => (byte)(index % 251))
+                .ToArray();
+            await File.WriteAllBytesAsync(partZeroPath, payload)
+                .ConfigureAwait(false);
+
+            Assert.True(
+                ReplayBufferService.TryPromoteGracefulShortRecordingOutput(
+                    sessionDirectory,
+                    partOnePath,
+                    stoppedOutputTimeMicroseconds: 1_000_000,
+                    framesPerSecond: 60),
+                "A graceful one-second recording did not preserve its pre-Stop part zero.");
+            Assert.True(
+                !File.Exists(partZeroPath) && File.Exists(partOnePath),
+                "Short-stop promotion did not atomically move the complete pre-Stop MP4.");
+            Assert.SequenceEqual(
+                payload,
+                await File.ReadAllBytesAsync(partOnePath).ConfigureAwait(false),
+                "Short-stop promotion changed the captured MP4 bytes.");
+
+            var longSession = Path.Combine(
+                bufferRoot,
+                "session-20260804-115901-02020202020202020202020202020202");
+            Directory.CreateDirectory(longSession);
+            var longBasePath = Path.Combine(
+                longSession,
+                ".clipforge-live-recording.mp4");
+            var longPartZero = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                longBasePath,
+                partNumber: 0);
+            var longPartOne = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                longBasePath,
+                partNumber: 1);
+            await File.WriteAllBytesAsync(longPartZero, payload).ConfigureAwait(false);
+            Assert.True(
+                !ReplayBufferService.TryPromoteGracefulShortRecordingOutput(
+                    longSession,
+                    longPartOne,
+                    stoppedOutputTimeMicroseconds: 2_500_000,
+                    framesPerSecond: 60) &&
+                File.Exists(longPartZero) &&
+                !File.Exists(longPartOne),
+                "Recorder promoted a warmup-only part after the short-session boundary.");
+
+            var boundarySession = Path.Combine(
+                bufferRoot,
+                "session-20260804-115902-03030303030303030303030303030303");
+            Directory.CreateDirectory(boundarySession);
+            var boundaryBasePath = Path.Combine(
+                boundarySession,
+                ".clipforge-live-recording.mp4");
+            var boundaryPartZero = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                boundaryBasePath,
+                partNumber: 0);
+            var boundaryPartOne = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                boundaryBasePath,
+                partNumber: 1);
+            await File.WriteAllBytesAsync(boundaryPartZero, payload)
+                .ConfigureAwait(false);
+            await File.WriteAllBytesAsync(boundaryPartOne, payload.Reverse().ToArray())
+                .ConfigureAwait(false);
+            Assert.True(
+                ReplayBufferService.TryResolveGracefulShortRecordingPrefixOutput(
+                    boundarySession,
+                    boundaryPartOne,
+                    stoppedOutputTimeMicroseconds: 2_100_000,
+                    framesPerSecond: 60,
+                    out var resolvedPrefix) &&
+                string.Equals(
+                    boundaryPartZero,
+                    resolvedPrefix,
+                    StringComparison.OrdinalIgnoreCase),
+                "Recorder did not retain both canonical MP4 parts just after the startup split.");
+            Assert.SequenceEqual(
+            [
+                $"file '{boundaryPartZero.Replace('\\', '/')}'",
+                "duration 2.000000",
+                $"file '{boundaryPartOne.Replace('\\', '/')}'"
+            ],
+                ReplayBufferService.BuildShortRecordingConcatManifestLines(
+                    boundaryPartZero,
+                    boundaryPartOne),
+                "Short Recorder concat did not anchor part 1 at the exact GOP boundary.");
+            Assert.True(
+                !ReplayBufferService.TryResolveGracefulShortRecordingPrefixOutput(
+                    boundarySession,
+                    boundaryPartOne,
+                    stoppedOutputTimeMicroseconds: 4_100_000,
+                    framesPerSecond: 60,
+                    out _),
+                "Recorder used the short-session merge path after the bounded startup window.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderCopiedOutputIdentityAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            var copySource = Path.Combine(testDirectory, "copy-source.mp4");
+            var copyOutput = Path.Combine(testDirectory, "copy-output.partial.mp4");
+            var copyPayload = Enumerable.Range(0, 1024 * 1024 + 257)
+                .Select(index => (byte)(index % 251))
+                .ToArray();
+            await File.WriteAllBytesAsync(copySource, copyPayload)
+                .ConfigureAwait(false);
+            var sourceFingerprint =
+                RecordingRecoveryJournal.ComputeOutputFingerprint(copySource);
+            var copiedFingerprint = await ReplayBufferService.CopyRecordingOutputAsync(
+                    copySource,
+                    copyOutput,
+                    CancellationToken.None,
+                    expectedSourceFingerprint: sourceFingerprint)
+                .ConfigureAwait(false);
+            Assert.SequenceEqual(
+                copyPayload,
+                await File.ReadAllBytesAsync(copyOutput).ConfigureAwait(false),
+                "Recorder's cross-volume staging copy changed the validated MP4 bytes.");
+            Assert.True(
+                !string.Equals(
+                    sourceFingerprint,
+                    copiedFingerprint,
+                    StringComparison.Ordinal),
+                "A copied Recorder output incorrectly retained the source file identity.");
+            Assert.Equal(
+                RecordingRecoveryJournal.ComputeOutputContentSampleFingerprint(copySource),
+                RecordingRecoveryJournal.ComputeOutputContentSampleFingerprint(copyOutput),
+                "Equal Recorder payloads with different file identities failed content comparison.");
+
+            var committedOutput = Path.Combine(testDirectory, "saved-copy.mp4");
+            File.Move(copyOutput, committedOutput);
+            Assert.True(
+                RecordingRecoveryJournal.HasMatchingOutputIdentity(
+                    committedOutput,
+                    copyPayload.Length,
+                    copiedFingerprint),
+                "The copied Recorder commit identity changed after its atomic rename.");
+
+            var committedStamp = File.GetLastWriteTimeUtc(committedOutput);
+            await using (var changedOutput = new FileStream(
+                             committedOutput,
+                             FileMode.Open,
+                             FileAccess.Write,
+                             FileShare.None))
+            {
+                changedOutput.Position = copyPayload.Length / 2;
+                changedOutput.WriteByte((byte)(copyPayload[copyPayload.Length / 2] ^ 0xff));
+            }
+            File.SetLastWriteTimeUtc(committedOutput, committedStamp.AddSeconds(1));
+            Assert.True(
+                !RecordingRecoveryJournal.HasMatchingOutputIdentity(
+                    committedOutput,
+                    copyPayload.Length,
+                    copiedFingerprint),
+                "A same-length middle edit retained the copied Recorder commit identity.");
+
+            var sourceStamp = File.GetLastWriteTimeUtc(copySource);
+            await using (var changedSource = new FileStream(
+                             copySource,
+                             FileMode.Open,
+                             FileAccess.Write,
+                             FileShare.None))
+            {
+                changedSource.Position = copyPayload.Length / 2;
+                changedSource.WriteByte((byte)(copyPayload[copyPayload.Length / 2] ^ 0xff));
+            }
+            File.SetLastWriteTimeUtc(copySource, sourceStamp.AddSeconds(1));
+            var staleCopyRejected = false;
+            try
+            {
+                _ = await ReplayBufferService.CopyRecordingOutputAsync(
+                        copySource,
+                        copyOutput,
+                        CancellationToken.None,
+                        expectedSourceFingerprint: sourceFingerprint)
+                    .ConfigureAwait(false);
+            }
+            catch (IOException)
+            {
+                staleCopyRejected = true;
+            }
+            Assert.True(
+                staleCopyRejected && !File.Exists(copyOutput),
+                "Recorder copied a source changed since validation or created a partial before rejecting it.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
     }
 
     private static async Task TestRecorderRecoveryStateAsync()
@@ -7477,6 +8358,29 @@ internal static class Program
                     "Recovery recomputation did not retain segment bytes.");
             }
 
+            var migratedRecoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                Path.Combine(testDirectory, "ReplayBuffer"));
+            var migratedJournalPath = RecordingRecoveryJournal
+                .EnumerateCandidatePaths(migratedRecoveryRoot)
+                .Single();
+            var migratedSnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    migratedRecoveryRoot,
+                    migratedJournalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.True(
+                migratedSnapshot is
+                {
+                    SourceAvailable: true,
+                    Detached: true,
+                    SegmentPaths.Count: 4
+                },
+                "Legacy exact recovery did not migrate all segments into its central locator.");
+            Assert.SequenceEqual(
+                segmentPaths,
+                migratedSnapshot?.SegmentPaths ?? [],
+                "Central-locator migration changed the exact recovery segment ordering.");
+
             var invalidSaveDirectory = Path.Combine(testDirectory, "InvalidClips");
             var invalidRoot = RecordingStoragePolicy.GetWorkingRoot(invalidSaveDirectory);
             var invalidSession = Path.Combine(
@@ -7507,6 +8411,767 @@ internal static class Program
                         CancellationToken.None)
                     .ConfigureAwait(false),
                 "Recovery accepted a segment path outside its identity-bound session directory.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestCorruptRecorderLocatorRepairAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var originalSaveDirectory = Path.Combine(testDirectory, "OriginalClips");
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                originalSaveDirectory);
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-135000-12121212121212121212121212121212");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPaths = Enumerable.Range(0, 2)
+                .Select(index => Path.Combine(
+                    sessionDirectory,
+                    $"segment-{index:D9}.mkv"))
+                .ToArray();
+            for (var index = 0; index < segmentPaths.Length; index++)
+            {
+                await File.WriteAllBytesAsync(
+                        segmentPaths[index],
+                        Enumerable.Repeat((byte)(index + 1), index + 4).ToArray())
+                    .ConfigureAwait(false);
+            }
+
+            string journalPath;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: true,
+                             segmentDurationSeconds: 10,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                journalPath = journal.JournalPath;
+                await journal.CloseAsync(detached: true).ConfigureAwait(false);
+            }
+            await File.WriteAllTextAsync(
+                    journalPath,
+                    "corrupt central locator" + Environment.NewLine)
+                .ConfigureAwait(false);
+
+            await File.WriteAllTextAsync(
+                    Path.Combine(
+                        sessionDirectory,
+                        ".clipforge-recording-recovery.json"),
+                    JsonSerializer.Serialize(new
+                    {
+                        Version = 2,
+                        SessionDirectory = sessionDirectory,
+                        SegmentPaths = (string[]?)null,
+                        SegmentBytes = segmentPaths.Sum(
+                            path => new FileInfo(path).Length),
+                        FramesPerSecond = 60,
+                        HasAudio = true,
+                        SegmentRanges = new[]
+                        {
+                            new { FirstSegmentNumber = 0, LastSegmentNumber = 1 }
+                        },
+                        SegmentDurationSeconds = 10
+                    }))
+                .ConfigureAwait(false);
+
+            await using (var migrationService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "MigrationTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await migrationService.TryLoadPendingRecordingAsync(
+                            originalSaveDirectory,
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "A valid exact state did not recover behind its corrupt central locator.");
+            }
+
+            RecordingRecoveryJournalSnapshot? repairedSnapshot = null;
+            foreach (var candidatePath in
+                     RecordingRecoveryJournal.EnumerateCandidatePaths(recoveryRoot))
+            {
+                var candidateSnapshot =
+                    await RecordingRecoveryJournal.TryReadAsync(
+                            recoveryRoot,
+                            candidatePath,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                if (candidateSnapshot is
+                    {
+                        SourceAvailable: true,
+                        Detached: true,
+                        SegmentPaths.Count: 2
+                    })
+                {
+                    repairedSnapshot = candidateSnapshot;
+                    break;
+                }
+            }
+            Assert.True(
+                repairedSnapshot is
+                {
+                    SourceAvailable: true,
+                    Detached: true,
+                    SegmentPaths.Count: 2,
+                    SegmentDurationSeconds: 10
+                },
+                "Exact recovery did not atomically publish an identity-bound locator beside its corrupt predecessor.");
+            Assert.SequenceEqual(
+                segmentPaths,
+                repairedSnapshot?.SegmentPaths ?? [],
+                "The repaired central locator changed the exact segment ordering.");
+
+            await using var changedDirectoryService = new ReplayBufferService(
+                new FfmpegSetupService(Path.Combine(testDirectory, "ChangedTools")),
+                serviceBufferRoot,
+                () => Task.CompletedTask);
+            Assert.True(
+                await changedDirectoryService.TryLoadPendingRecordingAsync(
+                        Path.Combine(testDirectory, "DifferentCurrentClips"),
+                        CancellationToken.None)
+                    .ConfigureAwait(false) &&
+                changedDirectoryService.PendingRecordingDirectory == sessionDirectory,
+                "The repaired locator did not survive a subsequent SaveDirectory change.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderPartialTailLocatorMigrationAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var saveDirectory = Path.Combine(testDirectory, "Clips");
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                saveDirectory);
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260902-193000-34343434343434343434343434343434");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPaths = Enumerable.Range(0, 2)
+                .Select(index => Path.Combine(
+                    sessionDirectory,
+                    $"segment-{index:D9}.mkv"))
+                .ToArray();
+            for (var index = 0; index < segmentPaths.Length; index++)
+            {
+                await File.WriteAllBytesAsync(
+                        segmentPaths[index],
+                        Enumerable.Repeat((byte)(index + 1), index + 4).ToArray())
+                    .ConfigureAwait(false);
+            }
+
+            var statePath = Path.Combine(
+                sessionDirectory,
+                ".clipforge-recording-recovery.json");
+            await File.WriteAllTextAsync(
+                    statePath,
+                    JsonSerializer.Serialize(new
+                    {
+                        Version = 2,
+                        SessionDirectory = sessionDirectory,
+                        SegmentPaths = (string[]?)null,
+                        SegmentBytes = segmentPaths.Sum(
+                            path => new FileInfo(path).Length),
+                        FramesPerSecond = 60,
+                        HasAudio = false,
+                        SegmentRanges = new[]
+                        {
+                            new { FirstSegmentNumber = 0, LastSegmentNumber = 1 }
+                        },
+                        SegmentTimelineDurationSeconds = 11d,
+                        SegmentDurationSeconds = 10
+                    }))
+                .ConfigureAwait(false);
+
+            await using (var migrationService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "MigrationTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await migrationService.TryLoadPendingRecordingAsync(
+                            saveDirectory,
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "The exact 10s + 1s Recorder state was not discovered for locator migration.");
+            }
+
+            RecordingRecoveryJournalSnapshot? migratedSnapshot = null;
+            foreach (var candidatePath in
+                     RecordingRecoveryJournal.EnumerateCandidatePaths(recoveryRoot))
+            {
+                var candidate = await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        candidatePath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (candidate is
+                    {
+                        SessionDirectory: var candidateSession,
+                        Detached: true,
+                        SegmentPaths.Count: 2
+                    } &&
+                    string.Equals(
+                        candidateSession,
+                        sessionDirectory,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    migratedSnapshot = candidate;
+                    break;
+                }
+            }
+
+            Assert.Equal<TimeSpan?>(
+                TimeSpan.FromSeconds(11),
+                migratedSnapshot?.SegmentTimelineDuration,
+                "The central Recorder locator did not durably preserve its one-second final-segment outpoint.");
+
+            File.Delete(statePath);
+            await using (var reloadService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "ReloadTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await reloadService.TryLoadPendingRecordingAsync(
+                            Path.Combine(testDirectory, "DifferentCurrentClips"),
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "The central locator did not recover after its exact state was removed.");
+
+                var pendingField = typeof(ReplayBufferService).GetField(
+                    "_pendingDetachedRecordingBuffer",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.NonPublic);
+                var pending = pendingField?.GetValue(reloadService);
+                var timelineProperty = pending?.GetType().GetProperty(
+                    "SegmentTimelineDuration",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic);
+                Assert.Equal<TimeSpan?>(
+                    TimeSpan.FromSeconds(11),
+                    timelineProperty?.GetValue(pending) as TimeSpan?,
+                    "Reload did not feed the journal's exact partial-tail duration into the pending Recorder buffer.");
+            }
+
+            var requiredSnapshot = migratedSnapshot
+                ?? throw new InvalidOperationException(
+                    "The migration fixture did not expose its journal snapshot.");
+            var journalPath = requiredSnapshot.JournalPath;
+            var journalLines = await File.ReadAllLinesAsync(journalPath)
+                .ConfigureAwait(false);
+            var detachedLineIndex = Array.FindIndex(
+                journalLines,
+                line => line.Contains("\"kind\":\"detached\"", StringComparison.Ordinal));
+            Assert.True(
+                detachedLineIndex >= 0,
+                "The migrated journal did not contain a detached timeline record.");
+            journalLines[detachedLineIndex] = JsonSerializer.Serialize(new
+            {
+                version = 2,
+                kind = "detached",
+                sessionId = requiredSnapshot.SessionId,
+                segmentTimelineDurationSeconds = 20.5d
+            });
+            await File.WriteAllLinesAsync(journalPath, journalLines)
+                .ConfigureAwait(false);
+            Assert.True(
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        journalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false) is null,
+                "The journal accepted a partial-tail duration beyond its two 10-second segments.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRepairedRecorderLocatorFamilyAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var saveDirectory = Path.Combine(testDirectory, "OriginalClips");
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                saveDirectory);
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260902-181500-67676767676767676767676767676767");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPath = Path.Combine(
+                sessionDirectory,
+                "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(segmentPath, [6, 7, 6, 7])
+                .ConfigureAwait(false);
+
+            string corruptJournalPath;
+            string sessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds:
+                                 FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                corruptJournalPath = journal.JournalPath;
+                sessionId = journal.SessionId;
+                Assert.True(
+                    await journal.CloseAsync(detached: true).ConfigureAwait(false),
+                    "The repaired-family fixture could not close its original locator.");
+            }
+
+            await File.WriteAllTextAsync(corruptJournalPath, "corrupt locator\n")
+                .ConfigureAwait(false);
+            await File.WriteAllTextAsync(
+                    Path.Combine(
+                        sessionDirectory,
+                        ".clipforge-recording-recovery.json"),
+                    JsonSerializer.Serialize(new
+                    {
+                        Version = 2,
+                        SessionDirectory = sessionDirectory,
+                        SegmentPaths = (string[]?)null,
+                        SegmentBytes = new FileInfo(segmentPath).Length,
+                        FramesPerSecond = 60,
+                        HasAudio = false,
+                        SegmentRanges = new[]
+                        {
+                            new { FirstSegmentNumber = 0, LastSegmentNumber = 0 }
+                        },
+                        SegmentDurationSeconds =
+                            FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds
+                    }))
+                .ConfigureAwait(false);
+
+            await using (var repairService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "RepairTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await repairService.TryLoadPendingRecordingAsync(
+                            saveDirectory,
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "The repaired-family fixture did not publish its first repair.");
+            }
+
+            var repairedFamily = await RecordingRecoveryJournal
+                .TryReadJournalFamilyAsync(
+                    recoveryRoot,
+                    sessionDirectory,
+                    sessionId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            var repaired = repairedFamily.Single(candidate =>
+                !candidate.Superseded &&
+                !candidate.Discarded &&
+                candidate.SourceAvailable);
+
+            var duplicateRepairRejected = false;
+            try
+            {
+                await using var duplicateRepair =
+                    await RecordingRecoveryJournal.RepairAsync(
+                            recoveryRoot,
+                            sessionDirectory,
+                            sourceBufferRoot,
+                            framesPerSecond: 60,
+                            hasAudio: false,
+                            segmentDurationSeconds:
+                                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                            liveRecordingPath: null,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                duplicateRepairRejected = true;
+            }
+
+            Assert.True(
+                duplicateRepairRejected,
+                "A valid suffixed repair was not reused and allowed another locator duplicate.");
+
+            var canonicalStem = Path.GetFileNameWithoutExtension(
+                RecordingRecoveryJournal.GetJournalPath(
+                    recoveryRoot,
+                    sessionDirectory,
+                    sessionId));
+            var newerDuplicatePath = Path.Combine(
+                recoveryRoot,
+                $"{canonicalStem}-{Guid.NewGuid():N}.jsonl");
+            File.Copy(repaired.JournalPath, newerDuplicatePath);
+            await RecordingRecoveryJournal.MarkDiscardedAsync(
+                    recoveryRoot,
+                    repaired.JournalPath,
+                    sessionId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(
+                repaired.JournalPath,
+                DateTime.UtcNow.AddMinutes(-2));
+            File.SetLastWriteTimeUtc(newerDuplicatePath, DateTime.UtcNow);
+
+            await using var terminalService = new ReplayBufferService(
+                new FfmpegSetupService(Path.Combine(testDirectory, "TerminalTools")),
+                serviceBufferRoot,
+                () => Task.CompletedTask);
+            Assert.True(
+                !await terminalService.TryLoadPendingRecordingAsync(
+                        Path.Combine(testDirectory, "DifferentCurrentClips"),
+                        CancellationToken.None)
+                    .ConfigureAwait(false) &&
+                !terminalService.HasPendingRecording,
+                "A newer active repair overrode an older durable family terminal.");
+            Assert.True(
+                !Directory.Exists(sessionDirectory),
+                "Family terminalization did not clean the discarded Recorder source.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderLocatorMarkerCollisionAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            async Task VerifyCollisionAsync(string caseName, bool discarded)
+            {
+                var caseDirectory = Path.Combine(testDirectory, caseName);
+                var serviceBufferRoot = Path.Combine(caseDirectory, "ReplayBuffer");
+                var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                    serviceBufferRoot);
+                var saveDirectory = Path.Combine(caseDirectory, "Clips");
+                var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                    saveDirectory);
+                var sessionDirectory = Path.Combine(
+                    sourceBufferRoot,
+                    "session-20260902-170000-56565656565656565656565656565656");
+                Directory.CreateDirectory(sessionDirectory);
+                var segmentPath = Path.Combine(
+                    sessionDirectory,
+                    "segment-000000000.mkv");
+                await File.WriteAllBytesAsync(segmentPath, [5, 6, 5, 6])
+                    .ConfigureAwait(false);
+
+                string staleJournalPath;
+                string staleSessionId;
+                await using (var staleJournal =
+                             await RecordingRecoveryJournal.CreateAsync(
+                                     recoveryRoot,
+                                     sessionDirectory,
+                                     sourceBufferRoot,
+                                     framesPerSecond: 60,
+                                     hasAudio: false,
+                                     segmentDurationSeconds:
+                                         FfmpegArgumentBuilder
+                                             .RecordingRecoverySegmentSeconds,
+                                     liveRecordingPath: null,
+                                     CancellationToken.None)
+                                 .ConfigureAwait(false))
+                {
+                    staleJournalPath = staleJournal.JournalPath;
+                    staleSessionId = staleJournal.SessionId;
+                    Assert.True(
+                        staleJournal.RecordCompleted(
+                            segmentPath,
+                            new FileInfo(segmentPath).Length,
+                            segmentNumber: 0),
+                        "The stale-locator fixture could not index its segment.");
+                    Assert.True(
+                        await staleJournal.CloseAsync(detached: true)
+                            .ConfigureAwait(false),
+                        "The stale-locator fixture could not close its journal.");
+                }
+
+                if (discarded)
+                {
+                    await RecordingRecoveryJournal.MarkDiscardedAsync(
+                            recoveryRoot,
+                            staleJournalPath,
+                            staleSessionId,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+
+                var currentSessionId = Guid.NewGuid().ToString("N");
+                await File.WriteAllTextAsync(
+                        Path.Combine(
+                            sessionDirectory,
+                            RecordingRecoveryJournal.SessionMarkerFileName),
+                        currentSessionId)
+                    .ConfigureAwait(false);
+                await File.WriteAllTextAsync(
+                        Path.Combine(
+                            sessionDirectory,
+                            ".clipforge-recording-recovery.json"),
+                        JsonSerializer.Serialize(new
+                        {
+                            Version = 2,
+                            SessionDirectory = sessionDirectory,
+                            SegmentPaths = (string[]?)null,
+                            SegmentBytes = new FileInfo(segmentPath).Length,
+                            FramesPerSecond = 60,
+                            HasAudio = false,
+                            SegmentRanges = new[]
+                            {
+                                new
+                                {
+                                    FirstSegmentNumber = 0,
+                                    LastSegmentNumber = 0
+                                }
+                            },
+                            SegmentDurationSeconds =
+                                FfmpegArgumentBuilder
+                                    .RecordingRecoverySegmentSeconds
+                        }))
+                    .ConfigureAwait(false);
+
+                var staleSnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        staleJournalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                Assert.True(
+                    staleSnapshot is { SourceAvailable: false } &&
+                    staleSnapshot.Discarded == discarded,
+                    "The collision fixture did not expose an unavailable stale locator.");
+
+                await using var service = new ReplayBufferService(
+                    new FfmpegSetupService(Path.Combine(caseDirectory, "Tools")),
+                    serviceBufferRoot,
+                    () => Task.CompletedTask);
+                Assert.True(
+                    await service.TryLoadPendingRecordingAsync(
+                            saveDirectory,
+                            CancellationToken.None)
+                        .ConfigureAwait(false) &&
+                    service.HasPendingRecording &&
+                    string.Equals(
+                        service.PendingRecordingDirectory,
+                        sessionDirectory,
+                        StringComparison.OrdinalIgnoreCase),
+                    discarded
+                        ? "A terminal locator from a different marker identity suppressed the current exact recovery."
+                        : "An unavailable locator from a different marker identity masked the current exact recovery.");
+                Assert.True(
+                    File.Exists(segmentPath) &&
+                    string.Equals(
+                        currentSessionId,
+                        (await File.ReadAllTextAsync(
+                                Path.Combine(
+                                    sessionDirectory,
+                                    RecordingRecoveryJournal.SessionMarkerFileName))
+                            .ConfigureAwait(false)).Trim(),
+                        StringComparison.Ordinal),
+                    "Marker-collision handling changed or deleted the authenticated current source.");
+                if (File.Exists(staleJournalPath))
+                {
+                    var retiredStaleSnapshot =
+                        await RecordingRecoveryJournal.TryReadAsync(
+                                recoveryRoot,
+                                staleJournalPath,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    Assert.True(
+                        retiredStaleSnapshot is { Superseded: true },
+                        "A stale locator survived cleanup without a durable superseded terminal.");
+                }
+            }
+
+            await VerifyCollisionAsync("Nonterminal", discarded: false)
+                .ConfigureAwait(false);
+            await VerifyCollisionAsync("Terminal", discarded: true)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestSupersededRecorderRecoveryJournalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceSaveDirectory = Path.Combine(testDirectory, "OriginalClips");
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                sourceSaveDirectory);
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260902-171000-67676767676767676767676767676767");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPath = Path.Combine(
+                sessionDirectory,
+                "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(segmentPath, [6, 7, 6, 7])
+                .ConfigureAwait(false);
+
+            string journalPath;
+            string sessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds:
+                                 FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                journalPath = journal.JournalPath;
+                sessionId = journal.SessionId;
+                Assert.True(
+                    journal.RecordCompleted(
+                        segmentPath,
+                        new FileInfo(segmentPath).Length,
+                        segmentNumber: 0),
+                    "The superseded-locator fixture could not index its segment.");
+                Assert.True(
+                    await journal.CloseAsync(detached: true).ConfigureAwait(false),
+                    "The superseded-locator fixture could not close its journal.");
+            }
+
+            var outputDirectory = Path.Combine(testDirectory, "Committed");
+            Directory.CreateDirectory(outputDirectory);
+            var outputPath = Path.Combine(outputDirectory, "recording.mp4");
+            await File.WriteAllBytesAsync(outputPath, [1, 3, 5, 7, 9])
+                .ConfigureAwait(false);
+            var outputLength = new FileInfo(outputPath).Length;
+            var outputFingerprint =
+                RecordingRecoveryJournal.ComputeOutputFingerprint(outputPath);
+            await RecordingRecoveryJournal.MarkCommittingAsync(
+                    recoveryRoot,
+                    journalPath,
+                    sessionId,
+                    outputPath,
+                    outputLength,
+                    outputFingerprint,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            await RecordingRecoveryJournal.MarkSupersededAsync(
+                    recoveryRoot,
+                    journalPath,
+                    sessionId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+
+            var supersededSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        journalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.True(
+                supersededSnapshot is
+                {
+                    Superseded: true,
+                    SourceAvailable: false,
+                    SegmentPaths.Count: 0,
+                    SegmentBytes: 0,
+                    CommittedOutputPath: null
+                },
+                "A superseded terminal did not permanently suppress its prior recovery state.");
+
+            var terminalBytes = await File.ReadAllBytesAsync(journalPath)
+                .ConfigureAwait(false);
+            var terminalMutationRejected = false;
+            try
+            {
+                await RecordingRecoveryJournal.MarkCommittedAsync(
+                        recoveryRoot,
+                        journalPath,
+                        sessionId,
+                        outputPath,
+                        outputLength,
+                        outputFingerprint,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                terminalMutationRejected = true;
+            }
+
+            Assert.True(
+                terminalMutationRejected,
+                "Recorder accepted a non-superseded record after its terminal tombstone.");
+            Assert.SequenceEqual(
+                terminalBytes,
+                await File.ReadAllBytesAsync(journalPath).ConfigureAwait(false),
+                "Rejecting a post-supersession mutation changed the durable journal.");
+
+            using (var deleteBlocker = new FileStream(
+                       journalPath,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.ReadWrite))
+            {
+                Assert.True(
+                    !RecordingRecoveryJournal.TryDeleteJournal(journalPath),
+                    "The failed-delete fixture did not keep the superseded locator in place.");
+                Directory.Delete(sourceBufferRoot, recursive: true);
+
+                await using var service = new ReplayBufferService(
+                    new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
+                    serviceBufferRoot,
+                    () => Task.CompletedTask);
+                Assert.True(
+                    !await service.TryLoadPendingRecordingAsync(
+                            Path.Combine(testDirectory, "DifferentCurrentClips"),
+                            CancellationToken.None)
+                        .ConfigureAwait(false) &&
+                    !service.HasPendingRecording &&
+                    File.Exists(journalPath),
+                    "A superseded locator whose physical deletion failed resurrected an offline pending recording.");
+            }
         }
         finally
         {
@@ -7549,6 +9214,9 @@ internal static class Program
                              sourceBufferRoot,
                              framesPerSecond: 60,
                              hasAudio: true,
+                             segmentDurationSeconds:
+                                 FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                             liveRecordingPath: null,
                              CancellationToken.None)
                          .ConfigureAwait(false))
             {
@@ -7578,6 +9246,16 @@ internal static class Program
                 Path.GetFullPath(recoveryRoot),
                 Path.GetDirectoryName(Path.GetFullPath(journalPath)),
                 "Recorder recovery placed its journal outside the central buffer-root index.");
+            var journalLines = await File.ReadAllLinesAsync(journalPath)
+                .ConfigureAwait(false);
+            Assert.True(
+                journalLines[0].Contains(
+                    "\"version\":2",
+                    StringComparison.Ordinal) &&
+                journalLines.Skip(1).Take(segmentPaths.Length).All(line =>
+                    !line.Contains("segmentPath", StringComparison.OrdinalIgnoreCase) &&
+                    !line.Contains("sessionId", StringComparison.OrdinalIgnoreCase)),
+                "The compact schema version or its bounded per-segment records were not emitted.");
 
             var snapshot = await RecordingRecoveryJournal.TryReadAsync(
                     recoveryRoot,
@@ -7590,7 +9268,9 @@ internal static class Program
                     SourceAvailable: true,
                     Detached: true,
                     FramesPerSecond: 60,
-                    HasAudio: true
+                    HasAudio: true,
+                    SegmentDurationSeconds:
+                        FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds
                 },
                 "The detached central journal did not restore its trusted session metadata.");
             Assert.Equal(
@@ -7633,11 +9313,11 @@ internal static class Program
             {
                 unsafeJournalPath = unsafeJournal.JournalPath;
                 Assert.True(
-                    unsafeJournal.RecordCompleted(
+                    !unsafeJournal.RecordCompleted(
                         outsideSegmentPath,
                         new FileInfo(outsideSegmentPath).Length,
                         segmentNumber: 0),
-                    "The path-security fixture could not append its deliberately unsafe record.");
+                    "The journal writer accepted a completed segment outside its session directory.");
                 await unsafeJournal.CloseAsync(detached: true).ConfigureAwait(false);
             }
 
@@ -7646,8 +9326,9 @@ internal static class Program
                         recoveryRoot,
                         unsafeJournalPath,
                         CancellationToken.None)
-                    .ConfigureAwait(false) is null,
-                "Journal recovery accepted a completed segment outside its marker-bound session directory.");
+                    .ConfigureAwait(false) is { SegmentPaths.Count: 0 },
+                "A rejected outside segment reappeared in the recovered journal.");
+            RecordingRecoveryJournal.TryDeleteJournal(unsafeJournalPath);
 
             var differentCurrentSaveDirectory =
                 Path.Combine(testDirectory, "CurrentClips");
@@ -7682,6 +9363,182 @@ internal static class Program
                 ReplayState.Faulted,
                 recoveredState?.State,
                 "The recovered detached recording did not surface the Retry-save state.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderLiveOutputRecoveryJournalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                Path.Combine(testDirectory, "Clips"));
+
+            async Task<(string JournalPath, string SessionDirectory, string LivePath)>
+                CreateFixtureAsync(string suffix, bool invalidate)
+            {
+                var sessionDirectory = Path.Combine(
+                    sourceBufferRoot,
+                    $"session-20260804-141000-{suffix}");
+                Directory.CreateDirectory(sessionDirectory);
+                var livePath = Path.Combine(
+                    sessionDirectory,
+                    RecordingRecoveryJournal.LiveRecordingRecoveryFileName);
+                await File.WriteAllBytesAsync(
+                        livePath,
+                        Enumerable.Repeat((byte)0x5A, 4096).ToArray())
+                    .ConfigureAwait(false);
+
+                string journalPath;
+                await using (var journal =
+                             await RecordingRecoveryJournal.CreateAsync(
+                                     recoveryRoot,
+                                     sessionDirectory,
+                                     sourceBufferRoot,
+                                     framesPerSecond: 60,
+                                     hasAudio: true,
+                                     livePath,
+                                     CancellationToken.None)
+                                 .ConfigureAwait(false))
+                {
+                    journalPath = journal.JournalPath;
+                    if (invalidate)
+                    {
+                        Assert.True(
+                            journal.RecordLiveOutputInvalidated(),
+                            "The live-output invalidation was not made durable.");
+                    }
+
+                    Assert.True(
+                        await journal.CloseAsync(detached: false)
+                            .ConfigureAwait(false),
+                        "The live-output crash fixture could not close its journal.");
+                }
+
+                return (journalPath, sessionDirectory, livePath);
+            }
+
+            var recoverable = await CreateFixtureAsync(
+                    "66666666666666666666666666666666",
+                    invalidate: false)
+                .ConfigureAwait(false);
+            var snapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    recoverable.JournalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                Path.GetFullPath(recoverable.LivePath),
+                snapshot?.LiveRecordingRecoveryPath,
+                "An interrupted fragmented MP4 was not surfaced for guarded repair.");
+            Assert.True(
+                snapshot is
+                {
+                    SourceAvailable: true,
+                    Detached: false,
+                    SegmentPaths.Count: 0
+                },
+                "Live-output-only recovery changed the hard-crash journal state.");
+
+            await using (var service = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "Tools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await service.TryLoadPendingRecordingAsync(
+                            Path.Combine(testDirectory, "DifferentClips"),
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "A live-output-only crash recovery was not published for Retry save.");
+                Assert.True(
+                    service.PendingRecordingHasSafeSegments &&
+                    !service.CanDiscardIncompleteRecording,
+                    "A repairable live output was exposed as disposable incomplete data.");
+            }
+
+            RecordingRecoveryJournal.TryDeleteJournal(recoverable.JournalPath);
+            DeleteTestDirectory(recoverable.SessionDirectory);
+
+            var invalidated = await CreateFixtureAsync(
+                    "77777777777777777777777777777777",
+                    invalidate: true)
+                .ConfigureAwait(false);
+            var invalidatedSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        invalidated.JournalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.True(
+                invalidatedSnapshot is
+                {
+                    SourceAvailable: true,
+                    LiveRecordingRecoveryPath: null
+                },
+                "A known-dropped direct MP4 remained eligible for crash repair.");
+            Assert.True(
+                File.Exists(Path.Combine(
+                    invalidated.SessionDirectory,
+                    RecordingRecoveryJournal
+                        .LiveRecordingInvalidationMarkerFileName)),
+                "The direct-output invalidation marker was not persisted beside the payload.");
+
+            await File.WriteAllTextAsync(
+                    Path.Combine(
+                        invalidated.SessionDirectory,
+                        ".clipforge-recording-recovery.json"),
+                    JsonSerializer.Serialize(new
+                    {
+                        Version = 2,
+                        SessionDirectory = invalidated.SessionDirectory,
+                        SegmentPaths = (string[]?)null,
+                        SegmentBytes = 0L,
+                        FramesPerSecond = 60,
+                        HasAudio = true,
+                        LiveRecordingPath = invalidated.LivePath,
+                        LiveRecordingExpectedDurationSeconds = 12d,
+                        LiveRecordingFastPathEligible = true,
+                        SegmentRanges = Array.Empty<object>(),
+                        SegmentDurationSeconds =
+                            FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds
+                    }))
+                .ConfigureAwait(false);
+            await using (var invalidatedService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "InvalidatedTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    await invalidatedService.TryLoadPendingRecordingAsync(
+                            Path.Combine(testDirectory, "CurrentClips"),
+                            CancellationToken.None)
+                        .ConfigureAwait(false),
+                    "The invalidated live-only session was not surfaced for explicit cleanup.");
+                Assert.True(
+                    invalidatedService.HasPendingRecording &&
+                    !invalidatedService.PendingRecordingHasSafeSegments &&
+                    invalidatedService.CanDiscardIncompleteRecording,
+                    "A stale exact-state live path bypassed its durable invalidation marker.");
+            }
+
+            Assert.True(
+                ReplayBufferService.RecoveredOutputCoversTrustedTimeline(
+                    TimeSpan.FromSeconds(120),
+                    TimeSpan.FromSeconds(120)) &&
+                !ReplayBufferService.RecoveredOutputCoversTrustedTimeline(
+                    TimeSpan.FromSeconds(20),
+                    TimeSpan.FromSeconds(120)),
+                "A short valid prefix could supersede a longer trusted segment timeline.");
         }
         finally
         {
@@ -7738,7 +9595,9 @@ internal static class Program
                     unavailableSessionDirectory,
                     RecordingRecoveryJournal.SessionMarkerFileName)),
                 "The unavailable-drive fixture never established its session identity marker.");
-            Directory.Delete(unavailableSessionDirectory, recursive: true);
+            // Model a genuinely offline source volume/root, not merely an
+            // already-deleted child beneath a reachable working root.
+            Directory.Delete(sourceBufferRoot, recursive: true);
 
             var unavailableSnapshot = await RecordingRecoveryJournal.TryReadAsync(
                     recoveryRoot,
@@ -8097,7 +9956,9 @@ internal static class Program
                     unavailableSessionId,
                     CancellationToken.None)
                 .ConfigureAwait(false);
-            Directory.Delete(unavailableSessionDirectory, recursive: true);
+            // Model a genuinely offline source volume/root, not merely an
+            // already-deleted child beneath a reachable working root.
+            Directory.Delete(sourceBufferRoot, recursive: true);
 
             await using (var crashGapService = new ReplayBufferService(
                              new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
@@ -8189,6 +10050,95 @@ internal static class Program
                 "Recorder recovery did not inspect the newest central journal first.");
 
             return Task.CompletedTask;
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderRecoveryPagingPastGarbageAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                Path.Combine(testDirectory, "OriginalClips"));
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260902-183000-78787878787878787878787878787878");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPath = Path.Combine(
+                sessionDirectory,
+                "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(segmentPath, [7, 8, 7, 8])
+                .ConfigureAwait(false);
+
+            string actionableJournalPath;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds:
+                                 FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                actionableJournalPath = journal.JournalPath;
+                Assert.True(
+                    journal.RecordCompleted(
+                        segmentPath,
+                        new FileInfo(segmentPath).Length,
+                        segmentNumber: 0),
+                    "The paged-discovery fixture could not index its segment.");
+                Assert.True(
+                    await journal.CloseAsync(detached: true).ConfigureAwait(false),
+                    "The paged-discovery fixture could not close its locator.");
+            }
+
+            var oldestTimestamp = DateTime.UtcNow.AddDays(-1);
+            File.SetLastWriteTimeUtc(actionableJournalPath, oldestTimestamp);
+            for (var index = 0; index < 256; index++)
+            {
+                var garbagePath = Path.Combine(
+                    recoveryRoot,
+                    $"session-garbage-{index:D4}.jsonl");
+                await File.WriteAllTextAsync(garbagePath, "{not-json}\n")
+                    .ConfigureAwait(false);
+                File.SetLastWriteTimeUtc(
+                    garbagePath,
+                    oldestTimestamp.AddMinutes(index + 1));
+            }
+
+            var pages = RecordingRecoveryJournal.EnumerateCandidatePathPages(
+                recoveryRoot);
+            Assert.True(
+                pages.Count >= 2 &&
+                pages.SelectMany(static page => page).Any(path =>
+                    string.Equals(
+                        path,
+                        actionableJournalPath,
+                        StringComparison.OrdinalIgnoreCase)),
+                "Paged Recorder discovery did not retain an older candidate beyond its first bounded page.");
+
+            await using var service = new ReplayBufferService(
+                new FfmpegSetupService(Path.Combine(testDirectory, "Tools")),
+                serviceBufferRoot,
+                () => Task.CompletedTask);
+            Assert.True(
+                await service.TryLoadPendingRecordingAsync(
+                        Path.Combine(testDirectory, "DifferentCurrentClips"),
+                        CancellationToken.None)
+                    .ConfigureAwait(false) &&
+                service.HasPendingRecording &&
+                service.PendingRecordingDirectory == sessionDirectory,
+                "Exactly 256 newer corrupt locators hid an actionable older Recorder recovery.");
         }
         finally
         {
@@ -8309,11 +10259,27 @@ internal static class Program
                 "Recording_2026-08-04_17-00-00.mp4");
             await File.WriteAllBytesAsync(plannedOutputPath, [9, 9, 9, 9, 9])
                 .ConfigureAwait(false);
+            var commitSourcePath = Path.Combine(
+                sessionDirectory,
+                "validated-output.partial.mp4");
+            var committedBytes = new byte[256 * 1024];
+            for (var index = 0; index < committedBytes.Length; index++)
+            {
+                committedBytes[index] = (byte)(index * 31 + 17);
+            }
+            await File.WriteAllBytesAsync(commitSourcePath, committedBytes)
+                .ConfigureAwait(false);
+            var committedLength = new FileInfo(commitSourcePath).Length;
+            var committedFingerprint =
+                RecordingRecoveryJournal.ComputeOutputFingerprint(
+                    commitSourcePath);
             await RecordingRecoveryJournal.MarkCommittingAsync(
                     recoveryRoot,
                     journalPath,
                     sessionId,
                     plannedOutputPath,
+                    committedLength,
+                    committedFingerprint,
                     CancellationToken.None)
                 .ConfigureAwait(false);
 
@@ -8336,13 +10302,57 @@ internal static class Program
                 plannedSnapshot?.SegmentPaths.Single(),
                 "A planned commit discarded its still-recoverable source segment.");
 
-            var committedLength = new FileInfo(plannedOutputPath).Length;
+            var committingJournalBytes = await File.ReadAllBytesAsync(journalPath)
+                .ConfigureAwait(false);
+            var discardAfterCommitRejected = false;
+            try
+            {
+                await RecordingRecoveryJournal.MarkDiscardedAsync(
+                        recoveryRoot,
+                        journalPath,
+                        sessionId,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                discardAfterCommitRejected = true;
+            }
+            Assert.True(
+                discardAfterCommitRejected,
+                "Recorder accepted a discard after a durable but unfinished commit plan.");
+            Assert.SequenceEqual(
+                committingJournalBytes,
+                await File.ReadAllBytesAsync(journalPath).ConfigureAwait(false),
+                "Rejected discard truncated or appended to the committing journal.");
+
+            File.Delete(plannedOutputPath);
+            File.Move(commitSourcePath, plannedOutputPath);
+            var interruptedCommitSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        journalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.Equal(
+                Path.GetFullPath(plannedOutputPath),
+                interruptedCommitSnapshot?.CommittedOutputPath,
+                "A crash after the atomic output move but before the committed marker was not recovered.");
+            Assert.True(
+                interruptedCommitSnapshot is
+                {
+                    SegmentPaths.Count: 0,
+                    SegmentBytes: 0
+                },
+                "An identity-verified interrupted commit still requested a duplicate retry export.");
+
             await RecordingRecoveryJournal.MarkCommittedAsync(
                     recoveryRoot,
                     journalPath,
                     sessionId,
                     plannedOutputPath,
                     committedLength,
+                    committedFingerprint,
                     CancellationToken.None)
                 .ConfigureAwait(false);
             var committedSnapshot = await RecordingRecoveryJournal.TryReadAsync(
@@ -8358,7 +10368,38 @@ internal static class Program
                 committedSnapshot is { SegmentPaths.Count: 0, SegmentBytes: 0 },
                 "A validated committed output did not supersede its recoverable source segments.");
 
-            await File.AppendAllTextAsync(plannedOutputPath, "changed")
+            var committedLastWriteUtc = File.GetLastWriteTimeUtc(
+                plannedOutputPath);
+            await using (var middleMutation = new FileStream(
+                             plannedOutputPath,
+                             FileMode.Open,
+                             FileAccess.Write,
+                             FileShare.None))
+            {
+                middleMutation.Position = committedBytes.Length / 2;
+                await middleMutation.WriteAsync(
+                        new[] { (byte)(committedBytes[committedBytes.Length / 2] ^ 0xff) })
+                    .ConfigureAwait(false);
+                await middleMutation.FlushAsync().ConfigureAwait(false);
+            }
+            var middleMutationSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        journalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.True(
+                middleMutationSnapshot is
+                {
+                    SourceAvailable: true,
+                    CommittedOutputPath: null,
+                    SegmentPaths.Count: 1
+                },
+                "A same-length middle mutation bypassed Recorder's durable output identity.");
+
+            await File.WriteAllBytesAsync(
+                    plannedOutputPath,
+                    Enumerable.Repeat((byte)1, committedBytes.Length).ToArray())
                 .ConfigureAwait(false);
             var lengthMismatchSnapshot = await RecordingRecoveryJournal.TryReadAsync(
                     recoveryRoot,
@@ -8372,11 +10413,604 @@ internal static class Program
                     CommittedOutputPath: null,
                     SegmentPaths.Count: 1
                 },
-                "A committed marker accepted an output whose durable length no longer matched.");
+                "A committed marker accepted a same-length output whose durable identity no longer matched.");
             Assert.Equal(
                 segmentPath,
                 lengthMismatchSnapshot?.SegmentPaths.Single(),
                 "An output-length mismatch discarded the recoverable source identity.");
+            await File.WriteAllBytesAsync(plannedOutputPath, committedBytes)
+                .ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(plannedOutputPath, committedLastWriteUtc);
+            Assert.True(
+                RecordingRecoveryJournal.HasMatchingOutputIdentity(
+                    plannedOutputPath,
+                    committedLength,
+                    committedFingerprint),
+                "Restoring the exact committed output did not restore its durable identity.");
+            Directory.Delete(sessionDirectory, recursive: true);
+            var cleanedSourceSnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    journalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                Path.GetFullPath(plannedOutputPath),
+                cleanedSourceSnapshot?.CommittedOutputPath,
+                "A valid committed output became a recovery ghost after its source directory was cleaned.");
+
+            var unsafeSessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-170500-56565656565656565656565656565656");
+            Directory.CreateDirectory(unsafeSessionDirectory);
+            var unsafeSegmentPath = Path.Combine(
+                unsafeSessionDirectory,
+                "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(unsafeSegmentPath, [2, 4, 6, 8])
+                .ConfigureAwait(false);
+            string unsafeJournalPath;
+            string unsafeSessionId;
+            await using (var unsafeJournal =
+                         await RecordingRecoveryJournal.CreateAsync(
+                                 recoveryRoot,
+                                 unsafeSessionDirectory,
+                                 sourceBufferRoot,
+                                 framesPerSecond: 60,
+                                 hasAudio: false,
+                                 CancellationToken.None)
+                             .ConfigureAwait(false))
+            {
+                unsafeJournalPath = unsafeJournal.JournalPath;
+                unsafeSessionId = unsafeJournal.SessionId;
+                Assert.True(
+                    unsafeJournal.RecordCompleted(
+                        unsafeSegmentPath,
+                        new FileInfo(unsafeSegmentPath).Length,
+                        segmentNumber: 0),
+                    "The unsafe-output fixture could not record its recoverable source.");
+                await unsafeJournal.CloseAsync(detached: true).ConfigureAwait(false);
+            }
+
+            var unsafeOutputPath = Path.Combine(
+                unsafeSessionDirectory,
+                "looks-committed.mp4");
+            await File.WriteAllBytesAsync(unsafeOutputPath, [7, 7, 7, 7, 7])
+                .ConfigureAwait(false);
+            var unsafeOutputLength = new FileInfo(unsafeOutputPath).Length;
+            var unsafeOutputFingerprint =
+                RecordingRecoveryJournal.ComputeOutputFingerprint(
+                    unsafeOutputPath);
+            await RecordingRecoveryJournal.MarkCommittingAsync(
+                    recoveryRoot,
+                    unsafeJournalPath,
+                    unsafeSessionId,
+                    unsafeOutputPath,
+                    unsafeOutputLength,
+                    unsafeOutputFingerprint,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            await RecordingRecoveryJournal.MarkCommittedAsync(
+                    recoveryRoot,
+                    unsafeJournalPath,
+                    unsafeSessionId,
+                    unsafeOutputPath,
+                    unsafeOutputLength,
+                    unsafeOutputFingerprint,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            var unsafeOutputSnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    unsafeJournalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.True(
+                unsafeOutputSnapshot is
+                {
+                    CommittedOutputPath: null,
+                    SegmentPaths.Count: 1
+                },
+                "An output path inside Recorder's cleanup tree could authorize deletion of its own committed file.");
+
+            RecordingRecoveryJournal.TryDeleteJournal(unsafeJournalPath);
+            DeleteTestDirectory(unsafeSessionDirectory);
+            File.Delete(plannedOutputPath);
+            await using (var terminalCleanupService = new ReplayBufferService(
+                             new FfmpegSetupService(
+                                 Path.Combine(testDirectory, "TerminalCleanupTools")),
+                             serviceBufferRoot,
+                             () => Task.CompletedTask))
+            {
+                Assert.True(
+                    !await terminalCleanupService.TryLoadPendingRecordingAsync(
+                            Path.Combine(testDirectory, "CurrentClips"),
+                            CancellationToken.None)
+                        .ConfigureAwait(false) &&
+                    !terminalCleanupService.HasPendingRecording,
+                    "A committed session whose output was later removed resurrected as an offline recovery ghost.");
+            }
+            Assert.True(
+                !File.Exists(journalPath),
+                "Startup did not retire a terminal journal after its already-cleaned source disappeared.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderRecoveryJournalLegacyTerminalAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                Path.Combine(testDirectory, "Clips"));
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-171000-88888888888888888888888888888888");
+            Directory.CreateDirectory(sessionDirectory);
+            var segmentPath = Path.Combine(
+                sessionDirectory,
+                "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(segmentPath, [1, 2, 3, 4])
+                .ConfigureAwait(false);
+
+            string journalPath;
+            string sessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                journalPath = journal.JournalPath;
+                sessionId = journal.SessionId;
+                Assert.True(
+                    journal.RecordCompleted(
+                        segmentPath,
+                        new FileInfo(segmentPath).Length,
+                        segmentNumber: 0),
+                    "The legacy-terminal fixture could not record its source segment.");
+                Assert.True(
+                    await journal.CloseAsync(detached: true).ConfigureAwait(false),
+                    "The legacy-terminal fixture could not close its journal.");
+            }
+
+            var outputDirectory = Path.Combine(testDirectory, "Exports");
+            Directory.CreateDirectory(outputDirectory);
+            var outputPath = Path.Combine(outputDirectory, "legacy-output.mp4");
+            await File.WriteAllBytesAsync(outputPath, [9, 8, 7, 6, 5])
+                .ConfigureAwait(false);
+            var legacyHeader = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                kind = "session",
+                sessionId,
+                sessionDirectory,
+                bufferRoot = sourceBufferRoot,
+                framesPerSecond = 60,
+                hasAudio = false
+            });
+            var legacyAdd = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                kind = "add",
+                sessionId,
+                segmentPath,
+                segmentLength = new FileInfo(segmentPath).Length,
+                segmentNumber = 0
+            });
+            var legacyDetached = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                kind = "detached",
+                sessionId
+            });
+            var legacyCommitting = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                kind = "committing",
+                sessionId,
+                finalOutputPath = outputPath
+            });
+            var legacyCommitted = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                kind = "committed",
+                sessionId,
+                finalOutputPath = outputPath,
+                finalOutputLength = new FileInfo(outputPath).Length
+            });
+            await File.WriteAllTextAsync(
+                    journalPath,
+                    legacyHeader + Environment.NewLine +
+                    legacyAdd + Environment.NewLine +
+                    legacyDetached + Environment.NewLine +
+                    legacyCommitting + Environment.NewLine +
+                    legacyCommitted + Environment.NewLine)
+                .ConfigureAwait(false);
+
+            var snapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    journalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.Equal(
+                Path.GetFullPath(outputPath),
+                snapshot?.CommittedOutputPath,
+                "The upgraded reader rejected a schema-v1 path/length terminal written by an older ClipForge build.");
+            Assert.True(
+                snapshot is { SegmentPaths.Count: 0, SegmentBytes: 0 },
+                "A recognized legacy commit incorrectly kept the source pending.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderRecoveryJournalSchemaStrictnessAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                Path.Combine(testDirectory, "Clips"));
+            var sessionDirectory = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-172000-89898989898989898989898989898989");
+            Directory.CreateDirectory(sessionDirectory);
+
+            string journalPath;
+            string sessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             sessionDirectory,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds:
+                                 FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                journalPath = journal.JournalPath;
+                sessionId = journal.SessionId;
+                await journal.CloseAsync(detached: true).ConfigureAwait(false);
+            }
+
+            var validHeader = JsonSerializer.Serialize(new
+            {
+                version = 2,
+                kind = "session",
+                sessionId,
+                sessionDirectory,
+                bufferRoot = sourceBufferRoot,
+                framesPerSecond = 60,
+                hasAudio = false,
+                segmentDurationSeconds =
+                    FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds
+            });
+            var missingDurationHeader = JsonSerializer.Serialize(new
+            {
+                version = 2,
+                kind = "session",
+                sessionId,
+                sessionDirectory,
+                bufferRoot = sourceBufferRoot,
+                framesPerSecond = 60,
+                hasAudio = false
+            });
+            var outputDirectory = Path.Combine(testDirectory, "Exports");
+            Directory.CreateDirectory(outputDirectory);
+            var outputPath = Path.Combine(outputDirectory, "output.mp4");
+            await File.WriteAllBytesAsync(outputPath, [1, 2, 3, 4])
+                .ConfigureAwait(false);
+
+            async Task AssertRejectedAsync(string contents, string message)
+            {
+                await File.WriteAllTextAsync(
+                        journalPath,
+                        contents + Environment.NewLine)
+                    .ConfigureAwait(false);
+                Assert.True(
+                    await RecordingRecoveryJournal.TryReadAsync(
+                            recoveryRoot,
+                            journalPath,
+                            CancellationToken.None)
+                        .ConfigureAwait(false) is null,
+                    message);
+
+                var terminalAppendRejected = false;
+                try
+                {
+                    await RecordingRecoveryJournal.MarkDiscardedAsync(
+                            recoveryRoot,
+                            journalPath,
+                            sessionId,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (InvalidDataException)
+                {
+                    terminalAppendRejected = true;
+                }
+
+                Assert.True(
+                    terminalAppendRejected,
+                    message + " Terminal append accepted the same malformed journal.");
+            }
+
+            await AssertRejectedAsync(
+                    missingDurationHeader,
+                    "A schema-v2 journal silently inherited the legacy two-second segment duration.")
+                .ConfigureAwait(false);
+            await AssertRejectedAsync(
+                    validHeader + Environment.NewLine +
+                    JsonSerializer.Serialize(new
+                    {
+                        version = 2,
+                        kind = "committing",
+                        sessionId,
+                        finalOutputPath = outputPath
+                    }),
+                    "A schema-v2 committing record downgraded to path-only legacy identity.")
+                .ConfigureAwait(false);
+            await AssertRejectedAsync(
+                    validHeader + Environment.NewLine +
+                    JsonSerializer.Serialize(new
+                    {
+                        version = 2,
+                        kind = "committed",
+                        sessionId,
+                        finalOutputPath = outputPath,
+                        finalOutputLength = new FileInfo(outputPath).Length
+                    }),
+                    "A schema-v2 committed record downgraded to length-only legacy identity.")
+                .ConfigureAwait(false);
+
+            var exactSaveDirectory = Path.Combine(testDirectory, "ExactClips");
+            var exactRoot = RecordingStoragePolicy.GetWorkingRoot(exactSaveDirectory);
+            var exactSession = Path.Combine(
+                exactRoot,
+                "session-20260804-172100-90909090909090909090909090909090");
+            Directory.CreateDirectory(exactSession);
+            var exactSegment = Path.Combine(exactSession, "segment-000000000.mkv");
+            await File.WriteAllBytesAsync(exactSegment, [5, 6, 7, 8])
+                .ConfigureAwait(false);
+            await File.WriteAllTextAsync(
+                    Path.Combine(exactSession, ".clipforge-recording-recovery.json"),
+                    JsonSerializer.Serialize(new
+                    {
+                        Version = 2,
+                        SessionDirectory = exactSession,
+                        SegmentPaths = (string[]?)null,
+                        SegmentBytes = new FileInfo(exactSegment).Length,
+                        FramesPerSecond = 60,
+                        HasAudio = false,
+                        SegmentRanges = new[]
+                        {
+                            new { FirstSegmentNumber = 0, LastSegmentNumber = 0 }
+                        }
+                    }))
+                .ConfigureAwait(false);
+            await using var service = new ReplayBufferService(
+                new FfmpegSetupService(Path.Combine(testDirectory, "ExactTools")),
+                Path.Combine(testDirectory, "ExactReplayBuffer"),
+                () => Task.CompletedTask);
+            Assert.True(
+                !await service.TryLoadPendingRecordingAsync(
+                        exactSaveDirectory,
+                        CancellationToken.None)
+                    .ConfigureAwait(false),
+                "A schema-v2 exact state silently inherited the legacy two-second duration.");
+        }
+        finally
+        {
+            DeleteTestDirectory(testDirectory);
+        }
+    }
+
+    private static async Task TestRecorderRecoveryJournalSchemaAwareTailAsync()
+    {
+        var testDirectory = CreateTestDirectory();
+        try
+        {
+            var serviceBufferRoot = Path.Combine(testDirectory, "ReplayBuffer");
+            var recoveryRoot = RecordingRecoveryJournal.GetRecoveryRoot(
+                serviceBufferRoot);
+            var sourceBufferRoot = RecordingStoragePolicy.GetWorkingRoot(
+                Path.Combine(testDirectory, "Clips"));
+
+            async Task<string[]> CreateSegmentsAsync(string sessionDirectory)
+            {
+                Directory.CreateDirectory(sessionDirectory);
+                var paths = Enumerable.Range(0, 20)
+                    .Select(index => Path.Combine(
+                        sessionDirectory,
+                        $"segment-{index:D9}.mkv"))
+                    .ToArray();
+                for (var index = 0; index < paths.Length; index++)
+                {
+                    await File.WriteAllBytesAsync(
+                            paths[index],
+                            [(byte)(index + 1), 0xA5])
+                        .ConfigureAwait(false);
+                }
+
+                return paths;
+            }
+
+            var currentSession = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-173000-91919191919191919191919191919191");
+            var currentSegments = await CreateSegmentsAsync(currentSession)
+                .ConfigureAwait(false);
+            string currentJournalPath;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             currentSession,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds: 10,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                currentJournalPath = journal.JournalPath;
+                for (var index = 0; index < currentSegments.Length; index++)
+                {
+                    Assert.True(
+                        journal.RecordCompleted(
+                            currentSegments[index],
+                            new FileInfo(currentSegments[index]).Length,
+                            index),
+                        "The current crash-tail fixture rejected a segment.");
+                }
+
+                await journal.CloseAsync(detached: false).ConfigureAwait(false);
+            }
+
+            var currentSnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    currentJournalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.SequenceEqual(
+                currentSegments.Take(14).ToArray(),
+                currentSnapshot?.SegmentPaths ?? [],
+                "A 10-second schema-v2 crash tail did not discard exactly six conservative checkpoints.");
+
+            var currentPhysicalSession = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-173050-93939393939393939393939393939393");
+            var currentPhysicalSegments = await CreateSegmentsAsync(
+                    currentPhysicalSession)
+                .ConfigureAwait(false);
+            string currentPhysicalJournalPath;
+            string currentPhysicalSessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             currentPhysicalSession,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             segmentDurationSeconds: 10,
+                             liveRecordingPath: null,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                currentPhysicalJournalPath = journal.JournalPath;
+                currentPhysicalSessionId = journal.SessionId;
+                await journal.CloseAsync(detached: false).ConfigureAwait(false);
+            }
+
+            await File.WriteAllTextAsync(
+                    currentPhysicalJournalPath,
+                    JsonSerializer.Serialize(new
+                    {
+                        version = 2,
+                        kind = "session",
+                        sessionId = currentPhysicalSessionId,
+                        sessionDirectory = currentPhysicalSession,
+                        bufferRoot = sourceBufferRoot,
+                        framesPerSecond = 60,
+                        hasAudio = false,
+                        segmentDurationSeconds = 10
+                    }) + Environment.NewLine)
+                .ConfigureAwait(false);
+            var currentPhysicalSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        currentPhysicalJournalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.SequenceEqual(
+                currentPhysicalSegments.Take(14).ToArray(),
+                currentPhysicalSnapshot?.SegmentPaths ?? [],
+                "A header-only schema-v2 physical fallback discarded trusted segment zero.");
+
+            var legacySession = Path.Combine(
+                sourceBufferRoot,
+                "session-20260804-173100-92929292929292929292929292929292");
+            var legacySegments = await CreateSegmentsAsync(legacySession)
+                .ConfigureAwait(false);
+            string legacyJournalPath;
+            string legacySessionId;
+            await using (var journal = await RecordingRecoveryJournal.CreateAsync(
+                             recoveryRoot,
+                             legacySession,
+                             sourceBufferRoot,
+                             framesPerSecond: 60,
+                             hasAudio: false,
+                             CancellationToken.None)
+                         .ConfigureAwait(false))
+            {
+                legacyJournalPath = journal.JournalPath;
+                legacySessionId = journal.SessionId;
+                await journal.CloseAsync(detached: false).ConfigureAwait(false);
+            }
+
+            var legacyLines = new List<string>
+            {
+                JsonSerializer.Serialize(new
+                {
+                    version = 1,
+                    kind = "session",
+                    sessionId = legacySessionId,
+                    sessionDirectory = legacySession,
+                    bufferRoot = sourceBufferRoot,
+                    framesPerSecond = 60,
+                    hasAudio = false
+                })
+            };
+            await File.WriteAllLinesAsync(legacyJournalPath, legacyLines)
+                .ConfigureAwait(false);
+            var legacyPhysicalSnapshot =
+                await RecordingRecoveryJournal.TryReadAsync(
+                        recoveryRoot,
+                        legacyJournalPath,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            Assert.SequenceEqual(
+                legacySegments.Skip(1).Take(4).ToArray(),
+                legacyPhysicalSnapshot?.SegmentPaths ?? [],
+                "A header-only legacy physical fallback trusted segment zero.");
+
+            for (var index = 0; index < legacySegments.Length; index++)
+            {
+                legacyLines.Add(JsonSerializer.Serialize(new
+                {
+                    version = 1,
+                    kind = "add",
+                    sessionId = legacySessionId,
+                    segmentPath = legacySegments[index],
+                    segmentLength = new FileInfo(legacySegments[index]).Length,
+                    segmentNumber = index
+                }));
+            }
+            await File.WriteAllLinesAsync(legacyJournalPath, legacyLines)
+                .ConfigureAwait(false);
+
+            var legacySnapshot = await RecordingRecoveryJournal.TryReadAsync(
+                    recoveryRoot,
+                    legacyJournalPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.SequenceEqual(
+                legacySegments.Take(5).ToArray(),
+                legacySnapshot?.SegmentPaths ?? [],
+                "A legacy two-second crash tail did not retain its original 15-checkpoint safety window.");
         }
         finally
         {
@@ -8546,7 +11180,13 @@ internal static class Program
             }
 
             File.Delete(segmentPaths[1]);
-            var expectedRemainingPaths = new[] { segmentPaths[0], segmentPaths[2] };
+            var changedSegmentBytes =
+                (await File.ReadAllBytesAsync(segmentPaths[2]).ConfigureAwait(false))
+                .Append((byte)0xFF)
+                .ToArray();
+            await File.WriteAllBytesAsync(segmentPaths[2], changedSegmentBytes)
+                .ConfigureAwait(false);
+            var expectedRemainingPaths = new[] { segmentPaths[0] };
             var expectedRemainingBytes = expectedRemainingPaths
                 .Sum(path => new FileInfo(path).Length);
             var partialSnapshot = await RecordingRecoveryJournal.TryReadAsync(
@@ -8559,9 +11199,9 @@ internal static class Program
                 {
                     SourceAvailable: true,
                     Detached: true,
-                    MissingSegmentCount: 1
+                    MissingSegmentCount: 2
                 },
-                "One missing segment incorrectly made the online marker-bound session look offline.");
+                "Missing or length-changed segments were not excluded independently.");
             Assert.SequenceEqual(
                 expectedRemainingPaths,
                 partialSnapshot?.SegmentPaths ?? [],
@@ -8593,12 +11233,12 @@ internal static class Program
                 "Replay recovery did not publish the remaining trusted segment bytes.");
             Assert.True(
                 recoveredState?.Message?.Contains(
-                    "without 1 missing segment",
+                    "without 2 missing segment",
                     StringComparison.OrdinalIgnoreCase) == true &&
                 recoveredState?.Message?.Contains(
                     "source drive is unavailable",
                     StringComparison.OrdinalIgnoreCase) == false,
-                "Partial segment recovery surfaced an offline-drive error instead of the bounded missing-segment warning.");
+                "Partial/changed segment recovery surfaced an offline-drive error instead of the bounded missing-segment warning.");
         }
         finally
         {
@@ -10560,6 +13200,79 @@ internal static class Program
                 3,
                 runner.Invocations.Count,
                 "Changing a clip's metadata must invalidate only that clip's cached probe result.");
+
+            var olderCacheIdentity =
+                ClipLibraryCacheIdentity.FromClip(second.Single(clip =>
+                    clip.FullPath.Equals(
+                        olderClip,
+                        StringComparison.OrdinalIgnoreCase))) ??
+                throw new InvalidOperationException(
+                    "The validated older clip has no cache identity.");
+            var partialMerge = ClipLibraryService.MergeWithCurrentValidatedCache(
+                clipsDirectory,
+                [afterChange[0]],
+                second,
+                count: 2,
+                unattemptedCandidates:
+                    new HashSet<ClipLibraryCacheIdentity>
+                    {
+                        olderCacheIdentity
+                    });
+            Assert.Equal(
+                2,
+                partialMerge.Count,
+                "A bounded partial probe refresh discarded an unchanged identity-validated card.");
+            Assert.True(
+                partialMerge.Any(clip => clip.FullPath.Equals(
+                    olderClip,
+                    StringComparison.OrdinalIgnoreCase)),
+                "The partial refresh did not retain the unchanged older clip.");
+
+            var stalePresentation = second[0] with
+            {
+                Duration = TimeSpan.FromSeconds(999),
+                ThumbnailPath = Path.Combine(testDirectory, "stale.jpg")
+            };
+            var changedWithoutPresentation = afterChange[0] with
+            {
+                Duration = null,
+                ThumbnailPath = null
+            };
+            var changedMerge = ClipLibraryService.MergeWithCurrentValidatedCache(
+                clipsDirectory,
+                [changedWithoutPresentation],
+                [stalePresentation],
+                count: 1);
+            Assert.True(
+                changedMerge[0].Duration is null &&
+                changedMerge[0].ThumbnailPath is null,
+                "An in-place modified clip inherited stale duration or thumbnail metadata from its previous identity snapshot.");
+
+            var unchangedFresh = second[1] with { ThumbnailPath = null };
+            var unchangedWithDeletedThumbnail = second[1] with
+            {
+                ThumbnailPath = Path.Combine(testDirectory, "deleted-thumbnail.jpg")
+            };
+            var missingThumbnailMerge =
+                ClipLibraryService.MergeWithCurrentValidatedCache(
+                    clipsDirectory,
+                    [unchangedFresh],
+                    [unchangedWithDeletedThumbnail],
+                    count: 1);
+            Assert.True(
+                missingThumbnailMerge[0].ThumbnailPath is null,
+                "A missing/corrupt cached JPEG survived a fresh CachedOnly validation and suppressed thumbnail regeneration.");
+
+            File.Delete(olderClip);
+            var afterDeletion = ClipLibraryService.MergeWithCurrentValidatedCache(
+                clipsDirectory,
+                [afterChange[0]],
+                second,
+                count: 2);
+            Assert.Equal(
+                1,
+                afterDeletion.Count,
+                "A deleted cached clip survived identity revalidation during a partial refresh.");
         }
         finally
         {

@@ -1,26 +1,39 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Security;
 using System.Text;
 using System.Text.Json;
 using ClipForge.Capture;
 using ClipForge.Models;
+using Microsoft.Win32.SafeHandles;
 
 namespace ClipForge.Services;
 
 /// <summary>
-/// Owns FFmpeg's continuous segment process, prunes its disk-backed ring, and
-/// remuxes a frozen segment snapshot into a user-facing MP4 clip.
+/// Owns FFmpeg's continuous capture process, prunes the disk-backed replay ring,
+/// and maintains Recorder's directly publishable MP4 plus recovery segments.
 /// </summary>
 public sealed class ReplayBufferService : IAsyncDisposable
 {
     private const int MaximumDiagnosticLines = 60;
     private const int MaximumDiagnosticLineCharacters = 1000;
+    private const uint FileReadAttributes = 0x00000080;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileNameNormalized = 0;
+    private const int MaximumFinalPathCharacters = 32_768;
     private const string RecordingRecoveryStateFileName =
         ".clipforge-recording-recovery.json";
     private const string RecordingRecoveryConcatFileName =
         ".clipforge-recording-recovery.ffconcat";
+    private const string LiveRecordingFileName =
+        ".clipforge-live-recording.mp4";
     private const long MaximumRecordingRecoveryStateBytes = 32L * 1024 * 1024;
     private const int MaximumLegacyCleanupDirectories = 2;
     private const int MaximumLegacyDirectoryCandidates = 64;
@@ -60,7 +73,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
         "[objective-gdi-starvation] ";
     // Windows Graphics Capture frame pools can lose delivery cadence after a
     // long, uninterrupted desktop session while FFmpeg itself remains alive.
-    // Renew only the capture process at a bounded age; the disk ring survives.
+    // Instant Replay renews at this bounded age. Recorder keeps its healthy
+    // process so one direct MP4 remains publishable, while the cadence/hang
+    // watchdog still performs an evidence-driven recovery when needed.
     internal static readonly TimeSpan CaptureProcessMaximumAge = TimeSpan.FromMinutes(30);
 
     private readonly FfmpegSetupService _ffmpegSetupService;
@@ -76,6 +91,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private readonly object _diagnosticGate = new();
     private readonly object _discontinuousRefreshGate = new();
     private readonly object _captureRecoveryRetryGate = new();
+    private readonly object _recordingCleanupGate = new();
     private readonly HashSet<string> _protectedSegments = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _diagnosticLines = new();
     private readonly ConcurrentQueue<CaptureProgressEnvelope> _captureProgressSamples = new();
@@ -102,6 +118,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private string? _lastCaptureCleanupFailure;
     private string? _segmentDirectory;
     private string? _activeBufferRoot;
+    private string? _liveRecordingPath;
     private TimeSpan _retention = TimeSpan.FromMinutes(2);
     private ReplayStateSnapshot _state = new(
         ReplayState.Stopped,
@@ -120,17 +137,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private string? _activeFfmpegPath;
     private CaptureSessionPlan? _lastCapturePlan;
     private CaptureProgressSample? _latestCaptureProgress;
+    private CaptureProgressSample? _lastStoppedCaptureProgress;
     private CaptureStarvationWatchdog? _captureStarvationWatchdog;
     private long _bufferBytes;
     private long _reportedDroppedAudioBlocks;
     private int _nextSegmentNumber;
     private int _activeCaptureGeneration;
+    private int _activeCaptureGenerationStartSegmentNumber = -1;
     private int _completedTrustedRecordingSegments;
     private int _recordingTailInvalidatedGeneration = -1;
     private int _recordingTailInvalidatedThroughSegmentNumber = -1;
     private int _quarantinedGenerationHeadSegmentNumber = -1;
     private int _exportBlockedCaptureGeneration = -1;
     private CancellationTokenSource? _activeSaveInvalidation;
+    private int _activeReplaySaveStorageSafetyCancellation;
+    private string? _activeReplaySaveDirectory;
+    private long _activeReplaySaveIdentity;
+    private long _replaySaveIdentitySequence;
     private int _activeSaveCaptureGeneration = -1;
     private int _untrustedDeleteCursorSegmentNumber = -1;
     private int _trustedDeleteCursorSegmentNumber = -1;
@@ -153,12 +176,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private int _disposeStarted;
     private int _disposed;
     private int _captureSessionIdentity;
+    private int _liveRecordingFastPathEligible;
+    private int _lastCaptureStopWasGraceful;
     private long _discontinuousRefreshRequestedEpoch;
     private long _discontinuousRefreshCompletedEpoch;
     private int _discontinuousRefreshSessionIdentity;
     private string _discontinuousRefreshDiagnostic = string.Empty;
     private int _discontinuousRefreshContinuationScheduled;
     private Task _discontinuousRefreshContinuationTask = Task.CompletedTask;
+    private Task _recordingCleanupTask = Task.CompletedTask;
 
     public ReplayBufferService(
         FfmpegSetupService? ffmpegSetupService = null,
@@ -272,16 +298,87 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     public CaptureSessionMode ActiveSessionMode => _sessionMode;
 
+    internal int ActiveSessionIdentity =>
+        Volatile.Read(ref _captureSessionIdentity);
+
+    internal string ActiveBufferRoot =>
+        Volatile.Read(ref _activeBufferRoot) ?? _bufferRoot;
+
+    internal string? ActiveReplaySaveDirectory =>
+        Volatile.Read(ref _activeReplaySaveDirectory);
+
+    internal long ActiveReplaySaveIdentity =>
+        Volatile.Read(ref _activeReplaySaveIdentity);
+
+    internal string ResolveReplayBufferRoot(string saveDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(saveDirectory);
+        try
+        {
+            var savePath = Path.GetFullPath(saveDirectory);
+            if (!savePath.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                var root = Path.GetPathRoot(savePath);
+                if (!string.IsNullOrWhiteSpace(root) &&
+                    new DriveInfo(root).DriveType == DriveType.Fixed)
+                {
+                    using var process = Process.GetCurrentProcess();
+                    var preferredRoot = Path.Combine(
+                        savePath,
+                        ".clipforge-replay-buffer",
+                        $"WindowsSession-{process.SessionId}");
+                    if (IsSafeBufferRootPath(preferredRoot))
+                    {
+                        return preferredRoot;
+                    }
+                }
+            }
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            // Network/removable/unavailable destinations keep the isolated
+            // LocalAppData fallback. The caller still checks that volume.
+        }
+
+        return _bufferRoot;
+    }
+
     public bool HasPendingRecording =>
         Volatile.Read(ref _pendingDetachedRecordingBuffer) is not null;
 
     public bool PendingRecordingHasSafeSegments =>
-        Volatile.Read(ref _pendingDetachedRecordingBuffer) is
-            { SegmentPaths.Count: > 0 };
+        HasSafeRecordingSource(
+            Volatile.Read(ref _pendingDetachedRecordingBuffer));
 
     public bool CanDiscardIncompleteRecording =>
         Volatile.Read(ref _pendingDetachedRecordingBuffer) is
-            { SourceAvailable: true, SegmentPaths.Count: 0 };
+        { SourceAvailable: true } pending &&
+        !HasSafeRecordingSource(pending);
+
+    private static bool HasSafeRecordingSource(
+        DetachedRecordingBuffer? pending) =>
+        pending is not null &&
+        HasUsableRecordingSourceMetadata(
+            pending.SegmentPaths.Count,
+            pending.LiveRecordingPath,
+            pending.LiveRecordingExpectedDuration,
+            pending.LiveRecordingFastPathEligible,
+            pending.LiveRecordingRecoveryPath);
+
+    internal static bool HasUsableRecordingSourceMetadata(
+        int segmentCount,
+        string? liveRecordingPath,
+        TimeSpan? liveRecordingExpectedDuration,
+        bool liveRecordingFastPathEligible,
+        string? liveRecordingRecoveryPath) =>
+        segmentCount > 0 ||
+        liveRecordingFastPathEligible &&
+        liveRecordingExpectedDuration is { } expectedDuration &&
+        expectedDuration > TimeSpan.Zero &&
+        !string.IsNullOrWhiteSpace(liveRecordingPath) ||
+        !string.IsNullOrWhiteSpace(liveRecordingRecoveryPath);
 
     public bool HasUnfinishedRecording =>
         HasPendingRecording ||
@@ -289,6 +386,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     public string? PendingRecordingDirectory =>
         Volatile.Read(ref _pendingDetachedRecordingBuffer)?.SessionDirectory;
+
+    internal long RecordingRecoverySegmentBytes
+    {
+        get
+        {
+            lock (_fileGate)
+            {
+                return Math.Max(0, _bufferBytes);
+            }
+        }
+    }
 
     internal async Task<bool> UpdateActiveDisplayForRefreshAsync(
         DisplayOption display,
@@ -352,9 +460,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     internal static bool ShouldScheduleCaptureRefresh(
         DesktopCaptureBackend captureBackend,
-        TimeSpan processUptime) =>
+        TimeSpan processUptime,
+        CaptureSessionMode sessionMode = CaptureSessionMode.InstantReplay,
+        bool recordingFastPathEligible = true) =>
         captureBackend == DesktopCaptureBackend.WindowsGraphicsCapture &&
-        processUptime >= CaptureProcessMaximumAge;
+        processUptime >= CaptureProcessMaximumAge &&
+        (sessionMode == CaptureSessionMode.InstantReplay ||
+         sessionMode == CaptureSessionMode.Recording &&
+         !recordingFastPathEligible);
 
     public int? CaptureProcessId
     {
@@ -531,10 +644,20 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     CaptureSessionMode.Recording
                     ? RecordingStoragePolicy.GetWorkingRoot(
                         configuration.SaveDirectory)
-                    : _bufferRoot;
+                    : ResolveReplayBufferRoot(configuration.SaveDirectory);
                 EnsureSafeBufferRoot(sessionBufferRoot);
                 Directory.CreateDirectory(sessionBufferRoot);
                 EnsureSafeBufferRoot(sessionBufferRoot);
+                if (configuration.SessionMode == CaptureSessionMode.InstantReplay &&
+                    !sessionBufferRoot.Equals(
+                        _bufferRoot,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // Single-instance ownership is already established. Any
+                    // session-* directories left on the selected clip drive are
+                    // crash residue from an earlier process.
+                    CleanupStaleBuffers(sessionBufferRoot, cancellationToken);
+                }
                 _activeBufferRoot = sessionBufferRoot;
                 _segmentDirectory = Path.Combine(
                     sessionBufferRoot,
@@ -557,6 +680,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     ResetSegmentIndexLocked();
                     BeginCaptureGenerationLocked(firstSegmentNumber: 0);
                 }
+
+                var directRecordingBasePath = configuration.SessionMode ==
+                    CaptureSessionMode.Recording
+                    ? Path.Combine(_segmentDirectory, LiveRecordingFileName)
+                    : null;
+                _liveRecordingPath = directRecordingBasePath;
+                Volatile.Write(
+                    ref _liveRecordingFastPathEligible,
+                    _liveRecordingPath is null ? 0 : 1);
 
                 _sessionCancellation = new CancellationTokenSource();
                 _reportedDroppedAudioBlocks = 0;
@@ -652,6 +784,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
                                 configuration.FramesPerSecond,
                                 configuration.CaptureSystemAudio ||
                                 configuration.CaptureMicrophone,
+                                segmentDurationSeconds:
+                                    FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                                // Permanent fMP4 remains demuxable up to its
+                                // last completed fragment after a hard kill. The
+                                // journal may therefore offer it for bounded
+                                // repair, while completed MKVs remain the
+                                // authoritative fallback if validation fails.
+                                liveRecordingPath: _liveRecordingPath,
                                 cancellationToken)
                             .ConfigureAwait(false);
                 }
@@ -662,7 +802,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     _audioPipes.Select(pipe => pipe.Specification).ToArray(),
                     capabilitySelection.Strategy,
                     _segmentDirectory,
-                    performanceProfile: selectedPerformanceProfile);
+                    performanceProfile: selectedPerformanceProfile,
+                    directRecordingPath: directRecordingBasePath);
 
                 var captureProcess = CreateProcess(
                     ffmpegPath,
@@ -928,8 +1069,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 }
 
                 foreach (var journalPath in
-                         RecordingRecoveryJournal.EnumerateCandidatePaths(
-                             _recordingRecoveryRoot))
+                         RecordingRecoveryJournal.EnumerateCandidatePathPages(
+                                 _recordingRecoveryRoot)
+                             .SelectMany(static page => page))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var recovery = await RecordingRecoveryJournal.TryReadAsync(
@@ -942,12 +1084,45 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         continue;
                     }
 
+                    recovery = await ResolveRecoveryLocatorFamilyAsync(
+                            recovery,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (recovery is null)
+                    {
+                        continue;
+                    }
+
+                    if (recovery.Superseded)
+                    {
+                        // Supersession is the durable authority. Physical
+                        // removal is only garbage collection and may be retried
+                        // after a sharing violation without reviving a capture.
+                        RecordingRecoveryJournal.TryDeleteJournal(
+                            recovery.JournalPath);
+                        continue;
+                    }
+
+                    if (await TrySupersedeStaleRecoveryLocatorAsync(recovery)
+                            .ConfigureAwait(false))
+                    {
+                        continue;
+                    }
+
                     if (recovery.Discarded)
                     {
                         if (recovery.SourceAvailable &&
                             TryDeleteBufferDirectory(
                                 recovery.SessionDirectory,
                                 recovery.BufferRoot))
+                        {
+                            RecordingRecoveryJournal.TryDeleteJournal(
+                                recovery.JournalPath);
+                        }
+                        else if (!recovery.SourceAvailable &&
+                                 RecordingRecoveryJournal.CanRetireMissingSession(
+                                     recovery.BufferRoot,
+                                     recovery.SessionDirectory))
                         {
                             RecordingRecoveryJournal.TryDeleteJournal(
                                 recovery.JournalPath);
@@ -970,7 +1145,69 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             RecordingRecoveryJournal.TryDeleteJournal(
                                 recovery.JournalPath);
                         }
+                        else if (!recovery.SourceAvailable &&
+                                 RecordingRecoveryJournal.CanRetireMissingSession(
+                                     recovery.BufferRoot,
+                                     recovery.SessionDirectory))
+                        {
+                            // The committed output has a durable identity and
+                            // the regular source root is online, so a missing
+                            // session is already-cleaned state rather than an
+                            // offline drive. Retire the tombstone so it cannot
+                            // crowd older real recoveries out of the scan.
+                            RecordingRecoveryJournal.TryDeleteJournal(
+                                recovery.JournalPath);
+                        }
 
+                        continue;
+                    }
+
+                    if (recovery.CommitTerminalRecorded &&
+                        !recovery.SourceAvailable &&
+                        RecordingRecoveryJournal.CanRetireMissingSession(
+                            recovery.BufferRoot,
+                            recovery.SessionDirectory))
+                    {
+                        // The output may have been moved or deleted after an
+                        // already-committed session was cleaned. The terminal
+                        // record still proves that the missing source must not
+                        // be resurrected as an offline pending recording.
+                        RecordingRecoveryJournal.TryDeleteJournal(
+                            recovery.JournalPath);
+                        continue;
+                    }
+
+                    if (!recovery.SourceAvailable &&
+                        RecordingRecoveryJournal.CanRetireMissingSession(
+                            recovery.BufferRoot,
+                            recovery.SessionDirectory))
+                    {
+                        // The regular source root is online and the exact
+                        // session directory is gone. This is stale cleanup
+                        // residue, not an offline drive that the user can
+                        // reconnect, so it must not become an undiscardable
+                        // pending Recorder gate.
+                        RecordingRecoveryJournal.TryDeleteJournal(
+                            recovery.JournalPath);
+                        continue;
+                    }
+
+                    if (!recovery.SourceAvailable &&
+                        RecordingRecoveryJournal.TryGetSessionMarkerId(
+                            recovery.SessionDirectory,
+                            out var currentMarkerSessionId) &&
+                        !string.Equals(
+                            currentMarkerSessionId,
+                            recovery.SessionId,
+                            StringComparison.Ordinal))
+                    {
+                        // The deterministic locator name is derived from the
+                        // session path. A later, independently authenticated
+                        // session can legitimately reuse that path after an old
+                        // source was removed. Do not let the stale locator mask
+                        // the current folder's exact recovery state.
+                        EnqueueDiagnostic(
+                            "Recorder skipped a stale central locator because the live session directory has a different recovery identity.");
                         continue;
                     }
 
@@ -995,7 +1232,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         recovery.SessionId,
                         recovery.SourceAvailable,
                         recovery.MissingSegmentCount,
-                        recovery.Detached);
+                        recovery.Detached,
+                        LiveRecordingRecoveryPath:
+                            recovery.LiveRecordingRecoveryPath,
+                        SegmentTimelineDuration:
+                            recovery.SegmentTimelineDuration,
+                        SegmentDurationSeconds:
+                            recovery.SegmentDurationSeconds);
                     PublishRecoveredRecording(detached);
                     return true;
                 }
@@ -1043,16 +1286,119 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         }
 
                         var recovered = detached;
-                        try
+                        var legacyCentralJournalPath =
+                            RecordingRecoveryJournal.GetJournalPath(
+                                _recordingRecoveryRoot,
+                                detached.SessionDirectory);
+                        RecordingRecoveryJournalSnapshot? existingCentralRecovery;
+                        if (RecordingRecoveryJournal.TryGetSessionMarkerId(
+                                detached.SessionDirectory,
+                                out var exactMarkerSessionId) &&
+                            exactMarkerSessionId is not null)
                         {
-                            recovered = await CreateCentralRecoveryLocatorAsync(
-                                    detached,
+                            var family = await RecordingRecoveryJournal
+                                .TryReadJournalFamilyAsync(
+                                    _recordingRecoveryRoot,
+                                    detached.SessionDirectory,
+                                    exactMarkerSessionId,
                                     cancellationToken)
                                 .ConfigureAwait(false);
+                            existingCentralRecovery = family.Count == 0
+                                ? null
+                                : await ResolveRecoveryLocatorFamilyAsync(
+                                        family[0],
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            existingCentralRecovery =
+                                await RecordingRecoveryJournal.TryReadAsync(
+                                        _recordingRecoveryRoot,
+                                        legacyCentralJournalPath,
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                        }
+                        var existingCentralPathMatchesDetached =
+                            existingCentralRecovery is not null &&
+                            HasMatchingRecoveryPathIdentity(
+                                existingCentralRecovery,
+                                detached);
+                        var existingCentralMatchesDetached =
+                            existingCentralPathMatchesDetached &&
+                            RecordingRecoveryJournal.TryGetSessionMarkerId(
+                                detached.SessionDirectory,
+                                out var detachedMarkerSessionId) &&
+                            string.Equals(
+                                detachedMarkerSessionId,
+                                existingCentralRecovery?.SessionId,
+                                StringComparison.Ordinal);
+                        if (existingCentralRecovery is not null &&
+                            !existingCentralMatchesDetached)
+                        {
+                            _ = await TrySupersedeStaleRecoveryLocatorAsync(
+                                    existingCentralRecovery)
+                                .ConfigureAwait(false);
+                            EnqueueDiagnostic(
+                                "Recorder found a central-locator path or session-marker collision and refused to attach or replace the other session's journal.");
+                        }
+                        var missingCommittedSourceCanBeRetired =
+                            existingCentralMatchesDetached &&
+                            existingCentralRecovery is
+                            {
+                                CommitTerminalRecorded: true,
+                                SourceAvailable: false
+                            } &&
+                            RecordingRecoveryJournal.CanRetireMissingSession(
+                                existingCentralRecovery.BufferRoot,
+                                existingCentralRecovery.SessionDirectory);
+                        if (existingCentralMatchesDetached &&
+                            (existingCentralRecovery is { Discarded: true } ||
+                             !string.IsNullOrWhiteSpace(
+                                 existingCentralRecovery?.CommittedOutputPath) ||
+                             missingCommittedSourceCanBeRetired))
+                        {
+                            var terminalRecovery = existingCentralRecovery!;
+                            // A valid terminal locator always outranks a stale
+                            // exact-state file, including when the locator was
+                            // outside the bounded newest-candidate scan.
+                            if (terminalRecovery.SourceAvailable &&
+                                TryDeleteBufferDirectory(
+                                    terminalRecovery.SessionDirectory,
+                                    terminalRecovery.BufferRoot))
+                            {
+                                RecordingRecoveryJournal.TryDeleteJournal(
+                                    terminalRecovery.JournalPath);
+                            }
+                            else if (missingCommittedSourceCanBeRetired)
+                            {
+                                RecordingRecoveryJournal.TryDeleteJournal(
+                                    terminalRecovery.JournalPath);
+                            }
+
+                            continue;
+                        }
+
+                        try
+                        {
+                            recovered = existingCentralMatchesDetached
+                                ? detached with
+                                {
+                                    RecoveryJournalPath =
+                                        existingCentralRecovery!.JournalPath,
+                                    RecoverySessionId =
+                                        existingCentralRecovery.SessionId,
+                                    RecoveryWasDetached = true
+                                }
+                                : await CreateCentralRecoveryLocatorAsync(
+                                        detached,
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
                         }
                         catch (Exception exception) when (
                             exception is IOException or UnauthorizedAccessException or
-                                ArgumentException or NotSupportedException or SecurityException)
+                                ArgumentException or NotSupportedException or SecurityException or
+                                InvalidOperationException)
                         {
                             // The exact recovery state remains authoritative even
                             // if the optional central-locator migration cannot be
@@ -1093,16 +1439,112 @@ public sealed class ReplayBufferService : IAsyncDisposable
         Volatile.Write(ref _pendingDetachedRecordingBuffer, detached);
         _sessionMode = CaptureSessionMode.Recording;
         _retention = RecordingStoragePolicy.NoReplayRetention;
+        var liveRecoveryBytes = string.IsNullOrWhiteSpace(
+                detached.LiveRecordingRecoveryPath)
+            ? 0
+            : GetFileLengthSafely(detached.LiveRecordingRecoveryPath);
+        var recoveredBytes = detached.SegmentBytes >
+            long.MaxValue - liveRecoveryBytes
+                ? long.MaxValue
+                : detached.SegmentBytes + liveRecoveryBytes;
         Publish(new ReplayStateSnapshot(
             ReplayState.Faulted,
             TimeSpan.Zero,
             RecordingStoragePolicy.NoReplayRetention,
-            detached.SegmentBytes,
+            recoveredBytes,
             detached.SourceAvailable
-                ? detached.MissingSegmentCount > 0
+                ? detached.SegmentPaths.Count == 0 &&
+                  !string.IsNullOrWhiteSpace(
+                      detached.LiveRecordingRecoveryPath)
+                    ? "A Recorder session was recovered from its interrupted live output. Select Retry save to repair and preserve it."
+                    : detached.MissingSegmentCount > 0
                     ? $"A stopped Recorder session was recovered without {detached.MissingSegmentCount} missing segment(s). Select Retry save to preserve the remaining video."
                     : "A stopped Recorder session is waiting to be saved. Select Retry save."
                 : "A Recorder session is preserved, but its source drive is unavailable. Reconnect the drive and select Retry save."));
+    }
+
+    private async Task<RecordingRecoveryJournalSnapshot?>
+        ResolveRecoveryLocatorFamilyAsync(
+            RecordingRecoveryJournalSnapshot recovery,
+            CancellationToken cancellationToken)
+    {
+        var family = await RecordingRecoveryJournal.TryReadJournalFamilyAsync(
+                _recordingRecoveryRoot,
+                recovery.SessionDirectory,
+                recovery.SessionId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (family.Count == 0)
+        {
+            return recovery;
+        }
+
+        var liveFamily = family
+            .Where(candidate => !candidate.Superseded)
+            .ToArray();
+        if (liveFamily.Length == 0)
+        {
+            foreach (var superseded in family)
+            {
+                RecordingRecoveryJournal.TryDeleteJournal(
+                    superseded.JournalPath);
+            }
+
+            return null;
+        }
+
+        // All repair suffixes belong to the authenticated marker identity. A
+        // durable user/commit terminal therefore outranks an older or newer
+        // actionable duplicate; otherwise retain the newest live member.
+        var authoritative = liveFamily.FirstOrDefault(candidate =>
+                                !string.IsNullOrWhiteSpace(
+                                    candidate.CommittedOutputPath)) ??
+                            liveFamily.FirstOrDefault(candidate =>
+                                candidate.Discarded) ??
+                            liveFamily[0];
+        foreach (var duplicate in family)
+        {
+            if (string.Equals(
+                    duplicate.JournalPath,
+                    authoritative.JournalPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (duplicate.Superseded)
+            {
+                RecordingRecoveryJournal.TryDeleteJournal(
+                    duplicate.JournalPath);
+                continue;
+            }
+
+            try
+            {
+                await RecordingRecoveryJournal.MarkSupersededAsync(
+                        _recordingRecoveryRoot,
+                        duplicate.JournalPath,
+                        duplicate.SessionId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                RecordingRecoveryJournal.TryDeleteJournal(
+                    duplicate.JournalPath);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or
+                    InvalidDataException or InvalidOperationException or
+                    ArgumentException or NotSupportedException or SecurityException)
+            {
+                // The family is still resolved as a unit for this scan. A later
+                // launch retries the durable supersession before any duplicate
+                // can be surfaced on its own.
+                EnqueueDiagnostic(
+                    "Recorder could not retire a duplicate recovery locator: " +
+                    exception.GetBaseException().Message);
+            }
+        }
+
+        return authoritative;
     }
 
     private static async Task<DetachedRecordingBuffer?> TryLoadExactRecordingRecoveryAsync(
@@ -1131,17 +1573,34 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var json = await File.ReadAllTextAsync(statePath, cancellationToken)
                 .ConfigureAwait(false);
             var state = JsonSerializer.Deserialize<RecordingRecoveryState>(json);
+            if (recovery.LiveOutputInvalidated && state is not null)
+            {
+                state = state with
+                {
+                    LiveRecordingPrefixPath = null,
+                    LiveRecordingPath = null,
+                    LiveRecordingExpectedDurationSeconds = null,
+                    LiveRecordingFastPathEligible = false,
+                    LiveRecordingNeedsCfrNormalization = false,
+                    LiveRecordingRecoveryPath = null
+                };
+            }
             return TryCreateDetachedRecordingBuffer(
                 recovery.BufferRoot,
                 recovery.SessionDirectory,
                 state,
                 out var detached)
+                && detached.SegmentDurationSeconds ==
+                    recovery.SegmentDurationSeconds
                 ? detached with
                 {
                     RecoveryJournalPath = recovery.JournalPath,
                     RecoverySessionId = recovery.SessionId,
                     SourceAvailable = true,
-                    RecoveryWasDetached = true
+                    RecoveryWasDetached = true,
+                    LiveRecordingRecoveryPath =
+                        detached.LiveRecordingRecoveryPath ??
+                        recovery.LiveRecordingRecoveryPath
                 }
                 : null;
         }
@@ -1157,29 +1616,176 @@ public sealed class ReplayBufferService : IAsyncDisposable
         DetachedRecordingBuffer detached,
         CancellationToken cancellationToken)
     {
-        var journal = await RecordingRecoveryJournal.CreateAsync(
-                _recordingRecoveryRoot,
-                detached.SessionDirectory,
-                detached.BufferRoot,
-                detached.FramesPerSecond,
-                detached.HasAudio,
-                cancellationToken)
-            .ConfigureAwait(false);
-        var locatorClosed = await journal.CloseAsync(detached: true)
-            .ConfigureAwait(false);
-        if (!locatorClosed || journal.WriterFailure is not null)
+        var hasExistingMarker = RecordingRecoveryJournal.TryGetSessionMarkerId(
+            detached.SessionDirectory,
+            out _);
+        var journal = hasExistingMarker
+            ? await RecordingRecoveryJournal.RepairAsync(
+                    _recordingRecoveryRoot,
+                    detached.SessionDirectory,
+                    detached.BufferRoot,
+                    detached.FramesPerSecond,
+                    detached.HasAudio,
+                    detached.SegmentDurationSeconds,
+                    detached.LiveRecordingPath ??
+                    detached.LiveRecordingRecoveryPath,
+                    cancellationToken)
+                .ConfigureAwait(false)
+            : await RecordingRecoveryJournal.CreateAsync(
+                    _recordingRecoveryRoot,
+                    detached.SessionDirectory,
+                    detached.BufferRoot,
+                    detached.FramesPerSecond,
+                    detached.HasAudio,
+                    detached.SegmentDurationSeconds,
+                    detached.LiveRecordingPath ??
+                    detached.LiveRecordingRecoveryPath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        var locatorCompleted = false;
+        try
         {
-            throw new IOException(
-                "ClipForge could not create the central Recorder recovery locator.",
-                journal.WriterFailure);
+            foreach (var segmentPath in detached.SegmentPaths)
+            {
+                var segmentLength = GetFileLengthSafely(segmentPath);
+                if (!TryParseSegmentNumber(
+                        Path.GetFileName(segmentPath),
+                        out var segmentNumber) ||
+                    segmentLength <= 0 ||
+                    !journal.RecordCompleted(
+                        segmentPath,
+                        segmentLength,
+                        segmentNumber))
+                {
+                    throw new IOException(
+                        "ClipForge could not index the complete migrated Recorder session.");
+                }
+            }
+
+            var locatorClosed = await journal.CloseAsync(
+                    detached: true,
+                    segmentTimelineDuration: detached.SegmentTimelineDuration)
+                .ConfigureAwait(false);
+            if (!locatorClosed || journal.WriterFailure is not null)
+            {
+                throw new IOException(
+                    "ClipForge could not create the central Recorder recovery locator.",
+                    journal.WriterFailure);
+            }
+
+            if (journal.RequiresAtomicPublish)
+            {
+                await journal.PublishRepairAsync(
+                        _recordingRecoveryRoot,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            locatorCompleted = true;
+            return detached with
+            {
+                RecoveryJournalPath = journal.JournalPath,
+                RecoverySessionId = journal.SessionId,
+                RecoveryWasDetached = true
+            };
+        }
+        finally
+        {
+            try
+            {
+                await journal.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or
+                    InvalidOperationException or ObjectDisposedException)
+            {
+                if (locatorCompleted)
+                {
+                    EnqueueDiagnostic(
+                        $"Recorder created its recovery locator, but handle cleanup reported: " +
+                        exception.GetBaseException().Message);
+                }
+            }
+
+            if (!locatorCompleted)
+            {
+                journal.AbandonUnpublishedJournal();
+                if (journal.OwnsSessionMarker)
+                {
+                    RecordingRecoveryJournal.TryDeleteOwnedSessionMarker(
+                        journal.SessionDirectory,
+                        journal.SessionId);
+                }
+            }
+        }
+    }
+
+    private static bool HasMatchingRecoveryPathIdentity(
+        RecordingRecoveryJournalSnapshot recovery,
+        DetachedRecordingBuffer detached)
+    {
+        try
+        {
+            return string.Equals(
+                       Path.TrimEndingDirectorySeparator(
+                           Path.GetFullPath(recovery.BufferRoot)),
+                       Path.TrimEndingDirectorySeparator(
+                           Path.GetFullPath(detached.BufferRoot)),
+                       StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(
+                       Path.TrimEndingDirectorySeparator(
+                           Path.GetFullPath(recovery.SessionDirectory)),
+                       Path.TrimEndingDirectorySeparator(
+                           Path.GetFullPath(detached.SessionDirectory)),
+                       StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<bool> TrySupersedeStaleRecoveryLocatorAsync(
+        RecordingRecoveryJournalSnapshot recovery)
+    {
+        if (recovery.SourceAvailable ||
+            !RecordingRecoveryJournal.TryGetSessionMarkerId(
+                recovery.SessionDirectory,
+                out var currentMarkerSessionId) ||
+            string.Equals(
+                currentMarkerSessionId,
+                recovery.SessionId,
+                StringComparison.Ordinal))
+        {
+            return false;
         }
 
-        return detached with
+        try
         {
-            RecoveryJournalPath = journal.JournalPath,
-            RecoverySessionId = journal.SessionId,
-            RecoveryWasDetached = true
-        };
+            await RecordingRecoveryJournal.MarkSupersededAsync(
+                    _recordingRecoveryRoot,
+                    recovery.JournalPath,
+                    recovery.SessionId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            RecordingRecoveryJournal.TryDeleteJournal(recovery.JournalPath);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                InvalidDataException or InvalidOperationException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            // The current marker still proves that this locator cannot own the
+            // path. Keep ignoring it now and retry the durable tombstone on a
+            // later scan rather than attaching it to the replacement session.
+            EnqueueDiagnostic(
+                $"Recorder could not durably retire a stale recovery locator: " +
+                exception.GetBaseException().Message);
+        }
+
+        return true;
     }
 
     private static IReadOnlyList<DirectoryInfo> EnumerateRecordingRecoveryDirectories(
@@ -1245,9 +1851,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         detached = null!;
         if (recovery is null ||
-            recovery.Version != 1 ||
+            recovery.Version is not (1 or 2 or 3) ||
+            recovery.SegmentBytes < 0 ||
             recovery.FramesPerSecond is < 1 or > 240 ||
-            recovery.SegmentPaths is not { Count: > 0 and <= 1_000_000 })
+            !TryResolveRecoveryStateSegmentDuration(
+                recovery,
+                out var segmentDurationSeconds))
         {
             return false;
         }
@@ -1262,14 +1871,44 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return false;
         }
 
+        if (recovery.Version == 3 &&
+            (!Guid.TryParseExact(recovery.RecoverySessionId, "N", out _) ||
+             !RecordingRecoveryJournal.TryGetSessionMarkerId(
+                 sessionDirectory,
+                 out var markerSessionId) ||
+             !string.Equals(
+                 markerSessionId,
+                 recovery.RecoverySessionId,
+                 StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
         var sessionPrefix = sessionDirectory.TrimEnd(
             Path.DirectorySeparatorChar,
             Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var paths = new List<string>(recovery.SegmentPaths.Count);
+        if (!TryBuildRecoverySegmentCandidates(
+                recovery,
+                sessionDirectory,
+                out var candidates))
+        {
+            return false;
+        }
+
+        if (recovery.Version == 3 &&
+            (recovery.SegmentLengths is not { } exactSegmentLengths ||
+             exactSegmentLengths.Count != candidates.Count ||
+             exactSegmentLengths.Any(length => length <= 0)))
+        {
+            return false;
+        }
+
+        var paths = new List<string>(candidates.Count);
         long bytes = 0;
         var missingSegmentCount = 0;
-        foreach (var candidate in recovery.SegmentPaths)
+        for (var candidateIndex = 0; candidateIndex < candidates.Count; candidateIndex++)
         {
+            var candidate = candidates[candidateIndex];
             if (string.IsNullOrWhiteSpace(candidate))
             {
                 return false;
@@ -1283,6 +1922,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
             if (!File.Exists(path))
             {
+                if (recovery.Version == 3)
+                {
+                    return false;
+                }
+
                 missingSegmentCount++;
                 continue;
             }
@@ -1292,8 +1936,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
                   (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
                 info.Length <= 0)
             {
+                if (recovery.Version == 3)
+                {
+                    return false;
+                }
+
                 missingSegmentCount++;
                 continue;
+            }
+
+            if (recovery.Version == 3 &&
+                info.Length != recovery.SegmentLengths![candidateIndex])
+            {
+                return false;
             }
 
             if (bytes > long.MaxValue - info.Length)
@@ -1305,6 +1960,77 @@ public sealed class ReplayBufferService : IAsyncDisposable
             paths.Add(path);
         }
 
+        if (recovery.Version is 2 or 3 &&
+            (missingSegmentCount > 0 || bytes != recovery.SegmentBytes))
+        {
+            // Version 2 is written atomically after Recorder stops. If its
+            // compact segment set no longer has the exact persisted aggregate,
+            // prefer the per-segment lengths in the central journal instead of
+            // reintroducing a truncated/replaced file through exact-state
+            // precedence. Schema-v1 files remain best-effort compatible.
+            return false;
+        }
+
+
+        TimeSpan? segmentTimelineDuration = null;
+        if (recovery.SegmentTimelineDurationSeconds is { } timelineSeconds)
+        {
+            var minimumTimelineSeconds = paths.Count == 0
+                ? 0d
+                : (long)(paths.Count - 1) * segmentDurationSeconds +
+                  1d / recovery.FramesPerSecond;
+            var maximumTimelineSeconds =
+                (long)paths.Count * segmentDurationSeconds;
+            if (!double.IsFinite(timelineSeconds) ||
+                paths.Count == 0 ||
+                timelineSeconds < minimumTimelineSeconds ||
+                timelineSeconds > maximumTimelineSeconds)
+            {
+                return false;
+            }
+
+            segmentTimelineDuration = TimeSpan.FromSeconds(timelineSeconds);
+        }
+        else if (recovery.Version == 3 && paths.Count > 0)
+        {
+            return false;
+        }
+
+        var liveOutputInvalidated =
+            RecordingRecoveryJournal.HasLiveOutputInvalidationMarker(
+                sessionDirectory);
+        string? liveRecordingPrefixPath = null;
+        string? liveRecordingPath = null;
+        TimeSpan? liveRecordingExpectedDuration = null;
+        if (!liveOutputInvalidated)
+        {
+            _ = TryResolveLiveRecordingPrefixOutput(
+                sessionDirectory,
+                recovery.LiveRecordingPrefixPath,
+                out liveRecordingPrefixPath);
+            _ = TryResolveLiveRecordingOutput(
+                sessionDirectory,
+                recovery.LiveRecordingPath,
+                recovery.LiveRecordingExpectedDurationSeconds,
+                recovery.LiveRecordingFastPathEligible,
+                out liveRecordingPath,
+                out liveRecordingExpectedDuration);
+        }
+        var liveRecordingRecoveryPath =
+            !liveOutputInvalidated &&
+            TryResolveInterruptedLiveRecordingOutput(
+                sessionDirectory,
+                recovery.LiveRecordingRecoveryPath,
+                out var resolvedRecoveryPath)
+                ? resolvedRecoveryPath
+                : null;
+        if (paths.Count == 0 &&
+            liveRecordingPath is null &&
+            liveRecordingRecoveryPath is null)
+        {
+            return false;
+        }
+
         detached = new DetachedRecordingBuffer(
             sessionDirectory,
             root,
@@ -1313,8 +2039,446 @@ public sealed class ReplayBufferService : IAsyncDisposable
             recovery.FramesPerSecond,
             recovery.HasAudio,
             MissingSegmentCount: missingSegmentCount,
-            RecoveryWasDetached: true);
+            RecoveryWasDetached: true,
+            SegmentTimelineDuration: segmentTimelineDuration,
+            LiveRecordingPrefixPath: liveRecordingPrefixPath,
+            LiveRecordingPath: liveRecordingPath,
+            LiveRecordingExpectedDuration: liveRecordingExpectedDuration,
+            LiveRecordingFastPathEligible: liveRecordingPath is not null,
+            LiveRecordingNeedsCfrNormalization:
+                recovery.LiveRecordingNeedsCfrNormalization &&
+                liveRecordingPath is not null,
+            LiveRecordingRecoveryPath: liveRecordingRecoveryPath,
+            SegmentDurationSeconds: segmentDurationSeconds);
         return true;
+    }
+
+    private static bool TryResolveRecoveryStateSegmentDuration(
+        RecordingRecoveryState recovery,
+        out int segmentDurationSeconds)
+    {
+        segmentDurationSeconds = recovery.Version == 1
+            ? recovery.SegmentDurationSeconds ?? FfmpegArgumentBuilder.SegmentSeconds
+            : recovery.SegmentDurationSeconds.GetValueOrDefault();
+        return segmentDurationSeconds is >= 1 and <= 300 &&
+               (recovery.Version == 1 ||
+                recovery.SegmentDurationSeconds is not null);
+    }
+
+    private static bool TryBuildRecoverySegmentCandidates(
+        RecordingRecoveryState recovery,
+        string sessionDirectory,
+        out IReadOnlyList<string> candidates)
+    {
+        const int maximumSegments = 1_000_000;
+        candidates = [];
+        if (recovery.Version == 1)
+        {
+            if (recovery.SegmentPaths is not { Count: <= maximumSegments } paths ||
+                recovery.SegmentRanges is { Count: > 0 })
+            {
+                return false;
+            }
+
+            candidates = paths;
+            return true;
+        }
+
+        if (recovery.SegmentPaths is { Count: > 0 } ||
+            recovery.SegmentRanges is not { Count: <= maximumSegments } ranges)
+        {
+            return false;
+        }
+
+        var expanded = new List<string>();
+        var previousLast = -1;
+        foreach (var range in ranges)
+        {
+            if (range.FirstSegmentNumber < 0 ||
+                range.LastSegmentNumber < range.FirstSegmentNumber ||
+                range.LastSegmentNumber > 999_999_999 ||
+                range.FirstSegmentNumber <= previousLast)
+            {
+                return false;
+            }
+
+            var rangeCount = (long)range.LastSegmentNumber -
+                range.FirstSegmentNumber + 1;
+            if (rangeCount > maximumSegments - expanded.Count)
+            {
+                return false;
+            }
+
+            for (var segmentNumber = range.FirstSegmentNumber;
+                 segmentNumber <= range.LastSegmentNumber;
+                 segmentNumber++)
+            {
+                expanded.Add(Path.Combine(
+                    sessionDirectory,
+                    $"segment-{segmentNumber:D9}.mkv"));
+            }
+
+            previousLast = range.LastSegmentNumber;
+        }
+
+        candidates = expanded;
+        return true;
+    }
+
+    private static bool TryResolveLiveRecordingOutput(
+        string sessionDirectory,
+        string? candidatePath,
+        double? expectedDurationSeconds,
+        bool eligible,
+        out string? liveRecordingPath,
+        out TimeSpan? expectedDuration)
+    {
+        liveRecordingPath = null;
+        expectedDuration = null;
+        if (!eligible ||
+            string.IsNullOrWhiteSpace(candidatePath) ||
+            expectedDurationSeconds is not { } seconds ||
+            !double.IsFinite(seconds) ||
+            seconds <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedSession = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(sessionDirectory));
+            var sessionParent = Path.GetDirectoryName(normalizedSession);
+            var sessionInfo = new DirectoryInfo(normalizedSession);
+            if (string.IsNullOrWhiteSpace(sessionParent) ||
+                !sessionInfo.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    sessionParent,
+                    sessionInfo.FullName,
+                    sessionInfo.Attributes))
+            {
+                return false;
+            }
+
+            var normalizedCandidate = Path.GetFullPath(candidatePath);
+            var expectedPath = Path.Combine(
+                normalizedSession,
+                LiveRecordingFileName);
+            var legacyPartOnePath =
+                FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                    expectedPath,
+                    partNumber: 1);
+            if (!normalizedCandidate.Equals(
+                    expectedPath,
+                    StringComparison.OrdinalIgnoreCase) &&
+                !normalizedCandidate.Equals(
+                    legacyPartOnePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var info = new FileInfo(normalizedCandidate);
+            if (!info.Exists ||
+                info.Length <= 0 ||
+                (info.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            liveRecordingPath = info.FullName;
+            expectedDuration = TimeSpan.FromSeconds(seconds);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException or
+                OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryResolveLiveRecordingPrefixOutput(
+        string sessionDirectory,
+        string? candidatePath,
+        out string? liveRecordingPrefixPath)
+    {
+        liveRecordingPrefixPath = null;
+        if (string.IsNullOrWhiteSpace(candidatePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedSession = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(sessionDirectory));
+            var sessionParent = Path.GetDirectoryName(normalizedSession);
+            var sessionInfo = new DirectoryInfo(normalizedSession);
+            if (string.IsNullOrWhiteSpace(sessionParent) ||
+                !sessionInfo.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    sessionParent,
+                    sessionInfo.FullName,
+                    sessionInfo.Attributes))
+            {
+                return false;
+            }
+
+            var normalizedCandidate = Path.GetFullPath(candidatePath);
+            var expectedPath = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                Path.Combine(normalizedSession, LiveRecordingFileName),
+                partNumber: 0);
+            if (!normalizedCandidate.Equals(
+                    expectedPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var info = new FileInfo(normalizedCandidate);
+            if (!info.Exists ||
+                info.Length <= 0 ||
+                (info.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            liveRecordingPrefixPath = info.FullName;
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsDefinitelyMissingOrUnsafeRecordingComponent(
+        string? candidatePath)
+    {
+        if (string.IsNullOrWhiteSpace(candidatePath))
+        {
+            return true;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(candidatePath);
+            if ((attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return true;
+            }
+
+            return new FileInfo(candidatePath).Length <= 0;
+        }
+        catch (Exception exception) when (
+            exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            // Locks and temporary access failures must remain retryable.
+            return false;
+        }
+    }
+
+    internal static bool TryResolveGracefulShortRecordingPrefixOutput(
+        string sessionDirectory,
+        string liveRecordingPartOnePath,
+        long stoppedOutputTimeMicroseconds,
+        int framesPerSecond,
+        out string? liveRecordingPrefixPath)
+    {
+        liveRecordingPrefixPath = null;
+        if (stoppedOutputTimeMicroseconds <= 0 ||
+            framesPerSecond is < 1 or > 240)
+        {
+            return false;
+        }
+
+        // Part 0 is the two-second WGC startup quarantine. If a user stops
+        // shortly after that split, publishing part 1 alone could turn a
+        // 2.1-second recording into a 0.1-second file. Keep both tiny parts so
+        // finalization can stream-copy them into one exact short recording.
+        var maximumMergedDurationMicroseconds = checked(
+            2L * FfmpegArgumentBuilder.SegmentSeconds * 1_000_000L +
+            2L * ((1_000_000L + framesPerSecond - 1) / framesPerSecond));
+        if (stoppedOutputTimeMicroseconds > maximumMergedDurationMicroseconds ||
+            !TryResolveLiveRecordingPrefixOutput(
+                sessionDirectory,
+                FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                    Path.Combine(sessionDirectory, LiveRecordingFileName),
+                    partNumber: 0),
+                out liveRecordingPrefixPath))
+        {
+            liveRecordingPrefixPath = null;
+            return false;
+        }
+
+        return TryResolveLiveRecordingOutput(
+            sessionDirectory,
+            liveRecordingPartOnePath,
+            stoppedOutputTimeMicroseconds / 1_000_000d,
+            eligible: true,
+            out _,
+            out _);
+    }
+
+    internal static bool TryPromoteGracefulShortRecordingOutput(
+        string sessionDirectory,
+        string liveRecordingPartOnePath,
+        long stoppedOutputTimeMicroseconds,
+        int framesPerSecond)
+    {
+        if (stoppedOutputTimeMicroseconds <= 0 ||
+            framesPerSecond is < 1 or > 240)
+        {
+            return false;
+        }
+
+        var maximumShortDurationMicroseconds = checked(
+            FfmpegArgumentBuilder.SegmentSeconds * 1_000_000L +
+            2L * ((1_000_000L + framesPerSecond - 1) / framesPerSecond));
+        if (stoppedOutputTimeMicroseconds > maximumShortDurationMicroseconds)
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedSession = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(sessionDirectory));
+            var sessionParent = Path.GetDirectoryName(normalizedSession);
+            var sessionInfo = new DirectoryInfo(normalizedSession);
+            if (string.IsNullOrWhiteSpace(sessionParent) ||
+                !sessionInfo.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    sessionParent,
+                    sessionInfo.FullName,
+                    sessionInfo.Attributes))
+            {
+                return false;
+            }
+
+            var directRecordingBasePath = Path.Combine(
+                normalizedSession,
+                LiveRecordingFileName);
+            var expectedPartOnePath =
+                FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                    directRecordingBasePath,
+                    partNumber: 1);
+            var normalizedPartOnePath = Path.GetFullPath(
+                liveRecordingPartOnePath);
+            if (!string.Equals(
+                    normalizedPartOnePath,
+                    expectedPartOnePath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                File.Exists(normalizedPartOnePath) ||
+                Directory.Exists(normalizedPartOnePath))
+            {
+                return false;
+            }
+
+            var partZeroPath = FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                directRecordingBasePath,
+                partNumber: 0);
+            var partZeroInfo = new FileInfo(partZeroPath);
+            if (!partZeroInfo.Exists ||
+                partZeroInfo.Length <= 0 ||
+                (partZeroInfo.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            File.Move(partZeroInfo.FullName, normalizedPartOnePath);
+            var promotedInfo = new FileInfo(normalizedPartOnePath);
+            return promotedInfo.Exists &&
+                   promotedInfo.Length == partZeroInfo.Length &&
+                   (promotedInfo.Attributes &
+                    (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException or
+                OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryResolveInterruptedLiveRecordingOutput(
+        string sessionDirectory,
+        string? candidatePath,
+        out string? liveRecordingPath)
+    {
+        liveRecordingPath = null;
+        if (string.IsNullOrWhiteSpace(candidatePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedSession = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(sessionDirectory));
+            var sessionParent = Path.GetDirectoryName(normalizedSession);
+            var sessionInfo = new DirectoryInfo(normalizedSession);
+            if (string.IsNullOrWhiteSpace(sessionParent) ||
+                !sessionInfo.Exists ||
+                !IsSafeBufferDirectoryPath(
+                    sessionParent,
+                    sessionInfo.FullName,
+                    sessionInfo.Attributes))
+            {
+                return false;
+            }
+
+            var normalizedCandidate = Path.GetFullPath(candidatePath);
+            var expectedPath = Path.Combine(
+                normalizedSession,
+                RecordingRecoveryJournal.LiveRecordingRecoveryFileName);
+            var legacyExpectedPath =
+                FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                    Path.Combine(normalizedSession, LiveRecordingFileName),
+                    partNumber: 1);
+            if (!normalizedCandidate.Equals(
+                    expectedPath,
+                    StringComparison.OrdinalIgnoreCase) &&
+                !normalizedCandidate.Equals(
+                    legacyExpectedPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var info = new FileInfo(normalizedCandidate);
+            if (!info.Exists ||
+                info.Length <= 0 ||
+                (info.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            liveRecordingPath = info.FullName;
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -1488,6 +2652,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     var boundaryWait = Stopwatch.GetElapsedTime(boundaryWaitStarted);
                     var replacementStarted = Stopwatch.GetTimestamp();
 
+                    if (configuration.SessionMode == CaptureSessionMode.Recording &&
+                        Volatile.Read(ref _saveOperationPending) != 0)
+                    {
+                        // StopAndSave captured its click-time boundary before it
+                        // waited for this maintenance owner. Yield the gates
+                        // without renewing or extending Recorder past that
+                        // request.
+                        RefreshBufferState();
+                        return false;
+                    }
+
                     if (ShouldDeferDegradedCapturePromotion(
                             promotesDegradedCapture,
                             reachedSegmentBoundary))
@@ -1533,6 +2708,34 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             "The replay buffer path changed during renewal. ClipForge refused to follow or delete it.");
                     }
 
+                    var recorderStopWonRegistration = false;
+                    if (configuration.SessionMode == CaptureSessionMode.Recording)
+                    {
+                        lock (_fileGate)
+                        {
+                            recorderStopWonRegistration =
+                                Volatile.Read(ref _saveOperationPending) != 0;
+                            if (!recorderStopWonRegistration)
+                            {
+                                // This exchange and StopAndSave's intent/process
+                                // registration share _fileGate. Whichever owns
+                                // it first establishes the authoritative side
+                                // of the race without a check-then-act window.
+                                InvalidateLiveRecordingFastPath(
+                                    "The capture process was renewed; trusted recovery segments remain authoritative.");
+                            }
+                        }
+                    }
+
+                    if (recorderStopWonRegistration)
+                    {
+                        // StopAndSave captured and signaled the exact process.
+                        // Yield lifecycle ownership without replacing its
+                        // continuous direct output.
+                        RefreshBufferState();
+                        return false;
+                    }
+
                     Volatile.Write(ref _isStopping, 1);
                     var oldProcessExited = await StopCaptureResourcesForRefreshAsync(
                             terminateAtCompletedBoundary: reachedSegmentBoundary)
@@ -1546,6 +2749,24 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             (string.IsNullOrWhiteSpace(cleanupDetail)
                                 ? string.Empty
                                 : $" {cleanupDetail}"));
+                    }
+
+                    if (configuration.SessionMode == CaptureSessionMode.Recording &&
+                        Volatile.Read(ref _saveOperationPending) != 0)
+                    {
+                        // The Stop request raced the final pre-refresh check and
+                        // closed the old process. Never launch a post-click
+                        // replacement generation; StopCore will transfer the
+                        // already-closed recovery state as soon as this gate is
+                        // released.
+                        Volatile.Write(ref _isRunning, 0);
+                        return false;
+                    }
+
+                    if (configuration.SessionMode == CaptureSessionMode.Recording)
+                    {
+                        TryDeleteDirectRecordingArtifacts(_segmentDirectory);
+                        _liveRecordingPath = null;
                     }
 
                     int segmentStartNumber;
@@ -1570,6 +2791,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                     await EnsureRecordingRecoveryCheckpointAsync(cancellationToken)
                         .ConfigureAwait(false);
+
+                    if (configuration.SessionMode == CaptureSessionMode.Recording &&
+                        Volatile.Read(ref _saveOperationPending) != 0)
+                    {
+                        // The old process is already closed and no replacement
+                        // resources exist yet. Leave the stopped segment state
+                        // for StopCore instead of extending capture after click.
+                        Volatile.Write(ref _isRunning, 0);
+                        return false;
+                    }
 
                     cancellationToken.ThrowIfCancellationRequested();
                     _sessionCancellation = new CancellationTokenSource();
@@ -1597,30 +2828,56 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         redirectStandardInput: true,
                         redirectStandardOutput: true);
                     var replacementStartedProcess = false;
-                    try
+                    var recorderStopPreventedReplacement = false;
+                    lock (_fileGate)
                     {
-                        if (!replacement.Start())
+                        recorderStopPreventedReplacement =
+                            configuration.SessionMode ==
+                                CaptureSessionMode.Recording &&
+                            Volatile.Read(ref _saveOperationPending) != 0;
+                        if (!recorderStopPreventedReplacement)
                         {
-                            throw new InvalidOperationException(
-                                "Windows could not renew the capture engine.");
+                            try
+                            {
+                                if (!replacement.Start())
+                                {
+                                    throw new InvalidOperationException(
+                                        "Windows could not renew the capture engine.");
+                                }
+
+                                replacementStartedProcess = true;
+                                _captureProcessJob =
+                                    CaptureProcessJob.Attach(replacement);
+                                _captureProcess = replacement;
+                            }
+                            catch
+                            {
+                                replacementCaptureLaunchFailed =
+                                    replacementStartedProcess &&
+                                    HasProcessExitedSafely(replacement);
+                                TryKill(replacement);
+                                _captureProcessJob?.Dispose();
+                                _captureProcessJob = null;
+                                replacement.Dispose();
+                                throw;
+                            }
                         }
-
-                        replacementStartedProcess = true;
-                        _captureProcessJob = CaptureProcessJob.Attach(replacement);
                     }
-                    catch
+
+                    if (recorderStopPreventedReplacement)
                     {
-                        replacementCaptureLaunchFailed =
-                            replacementStartedProcess &&
-                            HasProcessExitedSafely(replacement);
-                        TryKill(replacement);
-                        _captureProcessJob?.Dispose();
-                        _captureProcessJob = null;
                         replacement.Dispose();
-                        throw;
+                        await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                            .ConfigureAwait(false);
+                        return false;
                     }
 
-                    _captureProcess = replacement;
+                    if (await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                            .ConfigureAwait(false))
+                    {
+                        return false;
+                    }
+
                     if (!ProcessTuning.TryApplyCapturePriority(
                             replacement,
                             replacementStrategy,
@@ -1638,14 +2895,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         configuration.Display);
                     if (_audioPipes.Count > 0)
                     {
-                        var connectionTasks = _audioPipes
+                        var connectionTask = Task.WhenAll(_audioPipes
                             .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
-                            .ToArray();
+                            .ToArray());
                         try
                         {
-                            await Task.WhenAll(connectionTasks)
-                                .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                                .ConfigureAwait(false);
+                            if (!await WaitForRefreshStageUnlessRecorderStopAsync(
+                                    connectionTask,
+                                    TimeSpan.FromSeconds(15),
+                                    configuration,
+                                    cancellationToken)
+                                .ConfigureAwait(false))
+                            {
+                                await AbortRecorderRefreshForPendingSaveAsync(
+                                        configuration)
+                                    .ConfigureAwait(false);
+                                return false;
+                            }
                         }
                         catch when (
                             !cancellationToken.IsCancellationRequested &&
@@ -1656,7 +2922,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         }
                     }
 
-                    await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                    if (!await WaitForRefreshStageUnlessRecorderStopAsync(
+                            Task.Delay(500, cancellationToken),
+                            TimeSpan.FromSeconds(1),
+                            configuration,
+                            cancellationToken)
+                        .ConfigureAwait(false))
+                    {
+                        await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                            .ConfigureAwait(false);
+                        return false;
+                    }
                     if (replacement.HasExited)
                     {
                         replacementCaptureLaunchFailed = true;
@@ -1673,12 +2949,37 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             "Windows did not allow ClipForge to finalize the renewed capture priority policy.");
                     }
 
-                    InvalidateCaptureRecoveryRetry();
-                    Volatile.Write(ref _isStopping, 0);
-                    Volatile.Write(ref _isRunning, 1);
-                    _activeCaptureStrategy = replacementStrategy;
-                    _activeCapturePerformanceProfile = replacementPerformanceProfile;
-                    _activeEncoderDescription = replacementStrategy.Description;
+                    var recorderStopPreventedReplacementCommit = false;
+                    lock (_fileGate)
+                    {
+                        recorderStopPreventedReplacementCommit =
+                            configuration.SessionMode ==
+                                CaptureSessionMode.Recording &&
+                            Volatile.Read(ref _saveOperationPending) != 0;
+                        if (!recorderStopPreventedReplacementCommit)
+                        {
+                            // Commit the replacement's running state under the
+                            // same lock used by StopAndSave's boundary/process
+                            // registration. Stop can therefore never capture a
+                            // half-registered replacement generation.
+                            InvalidateCaptureRecoveryRetry();
+                            _activeCaptureStrategy = replacementStrategy;
+                            _activeCapturePerformanceProfile =
+                                replacementPerformanceProfile;
+                            _activeEncoderDescription =
+                                replacementStrategy.Description;
+                            Volatile.Write(ref _isStopping, 0);
+                            Volatile.Write(ref _isRunning, 1);
+                        }
+                    }
+
+                    if (recorderStopPreventedReplacementCommit)
+                    {
+                        await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                            .ConfigureAwait(false);
+                        return false;
+                    }
+
                     Volatile.Write(
                         ref _lastCapturePlan,
                         new CaptureSessionPlan(
@@ -2010,7 +3311,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             if (_sessionMode == CaptureSessionMode.Recording)
             {
                 RefreshSegmentIndexLocked();
-                newlyBlocked = InvalidateRecordingTailOnceLocked(maximumSegments: 12);
+                newlyBlocked = InvalidateRecordingTailOnceLocked(
+                    GetRecordingInvalidationSegmentCount());
             }
             else
             {
@@ -2034,6 +3336,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         {
             // Commit revalidates under _fileGate, so a save that completed
             // between the snapshot and cancellation still cannot publish.
+        }
+
+        if (_sessionMode == CaptureSessionMode.Recording)
+        {
+            InvalidateLiveRecordingFastPath(
+                $"A display/graphics transition invalidated the current recording tail: {diagnostic}");
         }
 
         RefreshBufferState();
@@ -2062,6 +3370,51 @@ public sealed class ReplayBufferService : IAsyncDisposable
             .ConfigureAwait(false);
     }
 
+    internal bool CancelActiveReplaySaveForStorageSafety(
+        int expectedSessionIdentity,
+        long expectedReplaySaveIdentity,
+        string? expectedSaveDirectory = null)
+    {
+        CancellationTokenSource? activeSave = null;
+        lock (_fileGate)
+        {
+            if (_sessionMode != CaptureSessionMode.InstantReplay ||
+                Volatile.Read(ref _captureSessionIdentity) !=
+                    expectedSessionIdentity ||
+                expectedReplaySaveIdentity <= 0 ||
+                Volatile.Read(ref _activeReplaySaveIdentity) !=
+                    expectedReplaySaveIdentity ||
+                Volatile.Read(ref _isSaving) == 0 ||
+                _activeSaveInvalidation is null ||
+                expectedSaveDirectory is not null &&
+                !string.Equals(
+                    expectedSaveDirectory,
+                    _activeReplaySaveDirectory,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            Volatile.Write(
+                ref _activeReplaySaveStorageSafetyCancellation,
+                1);
+            activeSave = _activeSaveInvalidation;
+        }
+
+        try
+        {
+            // Save owns _saveGate. Cancel it before a safety Stop waits on that
+            // gate, otherwise a low-space export could run for its full timeout
+            // while both its partial file and protected ring continue growing.
+            activeSave.Cancel();
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
     public async Task<string> SaveClipAsync(
         TimeSpan requestedDuration,
         string saveDirectory,
@@ -2074,11 +3427,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
             throw new InvalidOperationException(
                 "Stop and save the Recorder session instead of saving an Instant Replay clip.");
         }
-        if (requestedDuration <= TimeSpan.Zero || requestedDuration > TimeSpan.FromHours(1))
+        if (requestedDuration <= TimeSpan.Zero ||
+            requestedDuration > TimeSpan.FromHours(1) ||
+            requestedDuration.Ticks %
+                TimeSpan.FromSeconds(FfmpegArgumentBuilder.SegmentSeconds).Ticks != 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(requestedDuration),
-                "Clip length must be between one second and one hour.");
+                "Clip length must be a whole two-second segment between two seconds and one hour.");
         }
 
         if (Interlocked.CompareExchange(ref _saveOperationPending, 1, 0) != 0)
@@ -2096,6 +3452,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var selectedFirstSegmentNumber = -1;
         var selectedLastSegmentNumber = -1;
         var selectedGeneration = -1;
+        long selectedSegmentBytes = 0;
         CancellationTokenSource? saveCancellation = null;
 
         try
@@ -2142,6 +3499,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         selectedEntries[^1].SegmentNumber;
                     selectedGeneration =
                         selectedEntries[^1].GenerationId;
+                    foreach (var entry in selectedEntries)
+                    {
+                        selectedSegmentBytes = selectedSegmentBytes >
+                            long.MaxValue - entry.Length
+                                ? long.MaxValue
+                                : selectedSegmentBytes + entry.Length;
+                    }
                 }
 
                 foreach (var path in selectedSegments)
@@ -2151,6 +3515,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
                 _activeSaveCaptureGeneration = selectedGeneration;
                 _activeSaveInvalidation = saveCancellation;
+                Volatile.Write(
+                    ref _activeReplaySaveIdentity,
+                    Interlocked.Increment(ref _replaySaveIdentitySequence));
+                Volatile.Write(
+                    ref _activeReplaySaveDirectory,
+                    Path.GetFullPath(saveDirectory));
+                Volatile.Write(
+                    ref _activeReplaySaveStorageSafetyCancellation,
+                    0);
                 actualDuration = TimeSpan.FromSeconds(Math.Min(
                     requestedDuration.TotalSeconds,
                     selectedCount * FfmpegArgumentBuilder.SegmentSeconds));
@@ -2180,6 +3553,49 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var ffprobePath = _ffmpegSetupService.FindProbeExecutable()
                 ?? throw new InvalidOperationException("The clip validator is no longer available.");
             Directory.CreateDirectory(saveDirectory);
+            var replayBufferRoot = ActiveBufferRoot;
+            var sharesBufferVolume = ArePathsOnSameVolume(
+                saveDirectory,
+                replayBufferRoot);
+            var estimatedRollingOverlapBytes = _activeConfiguration is
+            { } activeConfiguration
+                    ? StorageEstimator.EstimateBufferBytes(
+                        activeConfiguration.Display,
+                        activeConfiguration.Resolution,
+                        activeConfiguration.FramesPerSecond,
+                        actualDuration,
+                        activeConfiguration.CaptureSystemAudio ||
+                        activeConfiguration.CaptureMicrophone)
+                    : 0;
+            var rollingOverlapBytes = Math.Max(
+                selectedSegmentBytes,
+                estimatedRollingOverlapBytes);
+            var availableSaveBytes = TryGetAvailableFreeSpace(saveDirectory);
+            var availableBufferBytes = sharesBufferVolume
+                ? availableSaveBytes
+                : TryGetAvailableFreeSpace(replayBufferRoot);
+            var requiredSaveBytes = RecordingStoragePolicy
+                .GetRequiredReplaySaveFreeBytes(
+                    selectedSegmentBytes,
+                    rollingOverlapBytes,
+                    sharesBufferVolume);
+            var requiredBufferBytes = RecordingStoragePolicy
+                .GetRequiredReplaySaveBufferFreeBytes(
+                    rollingOverlapBytes);
+            if (availableSaveBytes is null ||
+                availableSaveBytes.Value <= requiredSaveBytes ||
+                availableBufferBytes is null ||
+                availableBufferBytes.Value <= requiredBufferBytes)
+            {
+                throw new IOException(
+                    $"Saving this replay needs about " +
+                    (sharesBufferVolume
+                        ? $"{StorageEstimator.FormatBytes(requiredSaveBytes)} free on the shared replay/save drive. "
+                        : $"{StorageEstimator.FormatBytes(requiredSaveBytes)} free on the selected drive and " +
+                          $"{StorageEstimator.FormatBytes(requiredBufferBytes)} free on the replay-buffer drive. ") +
+                    "The rolling buffer is still running, so you can free space and try again.");
+            }
+
             var finalPath = GetUniqueClipPath(saveDirectory);
             partialPath = Path.Combine(
                 saveDirectory,
@@ -2259,10 +3675,19 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            var reportedException =
+            var canceledForStorageSafety =
                 exception is OperationCanceledException &&
                 !cancellationToken.IsCancellationRequested &&
-                IsExportGenerationBlocked(selectedGeneration)
+                Volatile.Read(
+                    ref _activeReplaySaveStorageSafetyCancellation) != 0;
+            var reportedException = canceledForStorageSafety
+                ? new IOException(
+                    "ClipForge canceled this replay export before its drive ran out of safe space. " +
+                    "No incomplete clip was kept.",
+                    exception)
+                : exception is OperationCanceledException &&
+                  !cancellationToken.IsCancellationRequested &&
+                  IsExportGenerationBlocked(selectedGeneration)
                     ? new InvalidDataException(
                         "ClipForge stopped this save because capture pacing became unstable. " +
                         "Wait for the replay buffer to refill, then clip again.",
@@ -2296,6 +3721,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 {
                     _activeSaveInvalidation = null;
                     _activeSaveCaptureGeneration = -1;
+                    Volatile.Write(ref _activeReplaySaveIdentity, 0);
+                    Volatile.Write(ref _activeReplaySaveDirectory, null);
+                    Volatile.Write(
+                        ref _activeReplaySaveStorageSafetyCancellation,
+                        0);
                 }
 
                 foreach (var path in selectedSegments)
@@ -2323,16 +3753,33 @@ public sealed class ReplayBufferService : IAsyncDisposable
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(saveDirectory);
-        if (Interlocked.CompareExchange(ref _saveOperationPending, 1, 0) != 0)
+        RecordingStopBoundary? recordingStopBoundary;
+        RecordingStopRequest? recordingStopRequest;
+        lock (_fileGate)
         {
-            throw new InvalidOperationException(
-                "A capture export is already running. ClipForge ignored the duplicate request.");
+            if (Interlocked.CompareExchange(ref _saveOperationPending, 1, 0) != 0)
+            {
+                throw new InvalidOperationException(
+                    "A capture export is already running. ClipForge ignored the duplicate request.");
+            }
+
+            // This lock is the Recorder stop/refresh registration handshake.
+            // A refresh either commits to invalidating/replacing the current
+            // process first, or this Stop intent captures and signals the exact
+            // registered process before refresh can proceed.
+            recordingStopBoundary = CaptureRecordingStopBoundary();
+            recordingStopRequest = BeginRecordingStopRequest(
+                recordingStopBoundary);
         }
 
+        var gateCancellationToken = recordingStopBoundary is null
+            ? cancellationToken
+            : CancellationToken.None;
         var enteredSaveGate = false;
         var enteredLifecycleGate = false;
         DetachedRecordingBuffer? detachedBuffer = null;
         string? manifestPath = null;
+        string? shortRecordingManifestPath = null;
         string? partialPath = null;
         var finalizationAccepted = false;
         var recordingCommitted = false;
@@ -2340,13 +3787,27 @@ public sealed class ReplayBufferService : IAsyncDisposable
         try
         {
             await SwitchToThreadPool();
-            await _saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _saveGate.WaitAsync(gateCancellationToken).ConfigureAwait(false);
             enteredSaveGate = true;
-            await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _lifecycleGate.WaitAsync(gateCancellationToken).ConfigureAwait(false);
             enteredLifecycleGate = true;
             var hasActiveRecording =
                 _sessionMode == CaptureSessionMode.Recording &&
                 !string.IsNullOrWhiteSpace(_segmentDirectory);
+            var exactProcessExitedForRequestedStop =
+                recordingStopRequest is not null &&
+                recordingStopRequest.SessionIdentity ==
+                    Volatile.Read(ref _captureSessionIdentity) &&
+                ReferenceEquals(
+                    recordingStopRequest.CaptureProcess,
+                    _captureProcess);
+            if (hasActiveRecording &&
+                (_captureProcess is null || HasProcessExitedSafely(_captureProcess)) &&
+                !exactProcessExitedForRequestedStop)
+            {
+                InvalidateLiveRecordingFastPath(
+                    "The capture process was no longer running when Recorder finalization began.");
+            }
             detachedBuffer = _pendingDetachedRecordingBuffer;
             if (!hasActiveRecording &&
                 detachedBuffer is { SourceAvailable: false })
@@ -2376,22 +3837,16 @@ public sealed class ReplayBufferService : IAsyncDisposable
             RecordCaptureRuntimeEvent(
                 "recording_finalize_started",
                 _captureProcess,
-                detail: "Waiting for a completed segment boundary before the final stream-copy export.");
-
-            if (hasActiveRecording && _captureProcess is { } captureProcess)
-            {
-                _ = await WaitForNextCaptureSegmentBoundaryAsync(
-                        captureProcess,
-                        CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
+                detail: "Closing Recorder at the requested Stop moment before using its live MP4 or completed recovery segments.");
 
             if (hasActiveRecording)
             {
                 detachedBuffer = await StopCoreAsync(
                         deleteBuffer: false,
                         publishStopped: false,
-                        detachRecordingBuffer: true)
+                        detachRecordingBuffer: true,
+                        recordingStopBoundary: recordingStopBoundary,
+                        recordingStopRequest: recordingStopRequest)
                     .ConfigureAwait(false);
                 if (detachedBuffer is not null)
                 {
@@ -2404,7 +3859,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             _lifecycleGate.Release();
             enteredLifecycleGate = false;
 
-            if (detachedBuffer is null || detachedBuffer.SegmentPaths.Count == 0)
+            if (detachedBuffer is null ||
+                !HasSafeRecordingSource(detachedBuffer))
             {
                 if (detachedBuffer is not null)
                 {
@@ -2426,62 +3882,635 @@ public sealed class ReplayBufferService : IAsyncDisposable
             // Persist the exact trusted ordering before any operation that can
             // fail (capacity check, engine lookup, remux, validation). It is a
             // directly reusable concat manifest and survives failed retries.
+            if (!IsSafeRecordingSaveDestination(
+                    saveDirectory,
+                    detachedBuffer.BufferRoot,
+                    detachedBuffer.SessionDirectory))
+            {
+                throw new InvalidOperationException(
+                    "Choose a regular folder outside ClipForge's Recorder working directory. " +
+                    "The recoverable session was preserved and was not used as its own save destination.");
+            }
+
             manifestPath = await PersistRecordingRecoveryStateAsync(
                     detachedBuffer,
                     cancellationToken)
                 .ConfigureAwait(false);
 
             Directory.CreateDirectory(saveDirectory);
-            var availableFreeBytes = TryGetAvailableFreeSpace(saveDirectory);
-            var requiredFreeBytes = RecordingStoragePolicy
-                .GetRequiredFinalizationFreeBytes(detachedBuffer.SegmentBytes);
-            if (availableFreeBytes is null || availableFreeBytes < requiredFreeBytes)
-            {
-                throw new IOException(
-                    $"Recorder stopped safely, but the drive needs about " +
-                    $"{StorageEstimator.FormatBytes(requiredFreeBytes)} free to create the final MP4. " +
-                    $"The recoverable session is preserved at {detachedBuffer.SessionDirectory}.");
-            }
-
             var finalPath = GetUniqueClipPath(saveDirectory);
-            partialPath = Path.Combine(
-                saveDirectory,
-                $".{Path.GetFileNameWithoutExtension(finalPath)}-{Guid.NewGuid():N}.recording.partial.mp4");
-
-            var duration = TimeSpan.FromSeconds(
-                (long)detachedBuffer.SegmentPaths.Count *
-                FfmpegArgumentBuilder.SegmentSeconds);
-            var ffmpegPath = _ffmpegSetupService.FindExecutable()
-                ?? throw new InvalidOperationException(
-                    "The capture engine is no longer available. The recording session was preserved.");
+            var segmentDuration = detachedBuffer.SegmentTimelineDuration ??
+                TimeSpan.FromSeconds(
+                    (long)detachedBuffer.SegmentPaths.Count *
+                    detachedBuffer.SegmentDurationSeconds);
             var ffprobePath = _ffmpegSetupService.FindProbeExecutable()
                 ?? throw new InvalidOperationException(
                     "The clip validator is no longer available. The recording session was preserved.");
-            var arguments = FfmpegArgumentBuilder.BuildRecordingConcatArguments(
-                manifestPath,
-                partialPath);
-            await RunRecordingExportProcessAsync(
-                    ffmpegPath,
-                    arguments,
-                    partialPath,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (!File.Exists(partialPath) || new FileInfo(partialPath).Length == 0)
+            string? liveRecordingPath = null;
+            string? liveRecordingPrefixPath = null;
+            TimeSpan? liveRecordingDuration = null;
+            string? liveRecordingFingerprint = null;
+            string? copiedLiveRecordingFingerprint = null;
+            string? liveRecordingPrefixFingerprint = null;
+            TimeSpan? recoveredLiveRecordingDuration = null;
+            var expectsShortRecordingPair = !string.IsNullOrWhiteSpace(
+                detachedBuffer.LiveRecordingPrefixPath);
+            var expectsShortRecordingNormalization =
+                detachedBuffer.LiveRecordingNeedsCfrNormalization;
+            var resolvedShortRecordingPrefix =
+                expectsShortRecordingPair &&
+                TryResolveLiveRecordingPrefixOutput(
+                    detachedBuffer.SessionDirectory,
+                    detachedBuffer.LiveRecordingPrefixPath,
+                    out var resolvedLiveRecordingPrefixPath)
+                    ? resolvedLiveRecordingPrefixPath
+                    : null;
+            if (TryResolveLiveRecordingOutput(
+                    detachedBuffer.SessionDirectory,
+                    detachedBuffer.LiveRecordingPath,
+                    detachedBuffer.LiveRecordingExpectedDuration?.TotalSeconds,
+                    detachedBuffer.LiveRecordingFastPathEligible,
+                    out var resolvedLiveRecordingPath,
+                    out var resolvedLiveRecordingDuration) &&
+                resolvedLiveRecordingPath is not null &&
+                resolvedLiveRecordingDuration is not null)
             {
-                throw new InvalidDataException(
-                    "The capture engine produced an empty recording. The source session was preserved.");
+                if (expectsShortRecordingNormalization &&
+                    (!expectsShortRecordingPair ||
+                     resolvedShortRecordingPrefix is not null))
+                {
+                    liveRecordingPrefixPath = resolvedShortRecordingPrefix;
+                    liveRecordingPath = resolvedLiveRecordingPath;
+                    liveRecordingDuration = resolvedLiveRecordingDuration;
+                    liveRecordingPrefixFingerprint =
+                        resolvedShortRecordingPrefix is null
+                            ? null
+                            :
+                        RecordingRecoveryJournal.ComputeOutputFingerprint(
+                            resolvedShortRecordingPrefix);
+                    liveRecordingFingerprint =
+                        RecordingRecoveryJournal.ComputeOutputFingerprint(
+                            resolvedLiveRecordingPath);
+                }
+                else if (!expectsShortRecordingNormalization &&
+                         !expectsShortRecordingPair)
+                {
+                    try
+                    {
+                        RecordCaptureRuntimeEvent(
+                            "recording_live_output_validation_started",
+                            detail: string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"bytes={GetFileLengthSafely(resolvedLiveRecordingPath)}; " +
+                                $"expectedSeconds={resolvedLiveRecordingDuration.Value.TotalSeconds:0.###}."),
+                            includeResourceSnapshots: false);
+                        await ValidateExportAsync(
+                                ffprobePath,
+                                resolvedLiveRecordingPath,
+                                resolvedLiveRecordingDuration.Value,
+                                detachedBuffer.FramesPerSecond,
+                                detachedBuffer.HasAudio,
+                                cancellationToken,
+                                TimeSpan.FromMinutes(2),
+                                durationToleranceOverride:
+                                    TimeSpan.FromSeconds(
+                                        FfmpegArgumentBuilder.SegmentSeconds / 2d +
+                                        0.25))
+                            .ConfigureAwait(false);
+                        liveRecordingPath = resolvedLiveRecordingPath;
+                        liveRecordingDuration = resolvedLiveRecordingDuration;
+                        liveRecordingFingerprint =
+                            RecordingRecoveryJournal.ComputeOutputFingerprint(
+                                resolvedLiveRecordingPath);
+                    }
+                    catch (MediaTimelineValidationException exception)
+                    {
+                        EnqueueDiagnostic(
+                            $"Recorder live output was rejected; using the recoverable segments instead: " +
+                            exception.GetBaseException().Message);
+                        RecordCaptureRuntimeEvent(
+                            "recording_live_output_rejected",
+                            detail: exception.GetBaseException().Message,
+                            includeResourceSnapshots: false);
+                        if (detachedBuffer.SegmentPaths.Count == 0 &&
+                            string.IsNullOrWhiteSpace(
+                                detachedBuffer.LiveRecordingRecoveryPath))
+                        {
+                            var hasRecoveryJournal =
+                                !string.IsNullOrWhiteSpace(
+                                    detachedBuffer.RecoveryJournalPath);
+                            var hasRecoveryIdentity =
+                                !string.IsNullOrWhiteSpace(
+                                    detachedBuffer.RecoverySessionId);
+                            if (hasRecoveryJournal != hasRecoveryIdentity ||
+                                hasRecoveryJournal &&
+                                !RecordingRecoveryJournal
+                                    .TryPersistLiveOutputInvalidationMarker(
+                                        detachedBuffer.SessionDirectory,
+                                        detachedBuffer.RecoverySessionId!))
+                            {
+                                throw new IOException(
+                                    "Recorder could not durably quarantine the rejected live output. " +
+                                    "The source was preserved for another retry.",
+                                    exception);
+                            }
+
+                            detachedBuffer = detachedBuffer with
+                            {
+                                LiveRecordingExpectedDuration = null,
+                                LiveRecordingFastPathEligible = false,
+                                LiveRecordingNeedsCfrNormalization = false
+                            };
+                            Volatile.Write(
+                                ref _pendingDetachedRecordingBuffer,
+                                detachedBuffer);
+                            manifestPath = await PersistRecordingRecoveryStateAsync(
+                                    detachedBuffer,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                            throw new InvalidDataException(
+                                "Recorder's only live output failed media validation. " +
+                                "It was preserved, but contains no verified safe video; " +
+                                "use Discard incomplete if you no longer need it.",
+                                exception);
+                        }
+                    }
+                    catch (Exception exception) when (
+                        exception is IOException or TimeoutException &&
+                        detachedBuffer.SegmentPaths.Count > 0)
+                    {
+                        // A non-zero/timeout ffprobe result can be transient (for
+                        // example an antivirus lock), so it must remain retryable
+                        // when the live MP4 is the only source. With verified MKV
+                        // checkpoints available, however, do not let an optional
+                        // direct-output probe strand an otherwise saveable session.
+                        EnqueueDiagnostic(
+                            $"Recorder could not read its optional live output; using recovery segments instead: " +
+                            exception.GetBaseException().Message);
+                        RecordCaptureRuntimeEvent(
+                            "recording_live_output_probe_failed",
+                            detail: exception.GetBaseException().Message,
+                            includeResourceSnapshots: false);
+                    }
+                }
             }
 
-            await ValidateExportAsync(
-                    ffprobePath,
-                    partialPath,
-                    duration,
-                    detachedBuffer.FramesPerSecond,
-                    detachedBuffer.HasAudio,
-                    cancellationToken,
-                    TimeSpan.FromMinutes(2))
-                .ConfigureAwait(false);
+            if (expectsShortRecordingNormalization &&
+                liveRecordingPath is null &&
+                (IsDefinitelyMissingOrUnsafeRecordingComponent(
+                     detachedBuffer.LiveRecordingPath) ||
+                 expectsShortRecordingPair &&
+                 IsDefinitelyMissingOrUnsafeRecordingComponent(
+                     detachedBuffer.LiveRecordingPrefixPath)))
+            {
+                // A legacy short recording needs every declared MP4 component.
+                // A component that is definitely gone cannot become valid on a
+                // retry; durably invalidate that direct path so same-process and
+                // startup recovery agree, and let verified MKVs take over.
+                (detachedBuffer, manifestPath) =
+                    await QuarantineDetachedLiveRecordingOutputAsync(
+                            detachedBuffer,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                expectsShortRecordingPair = false;
+                expectsShortRecordingNormalization = false;
+                if (detachedBuffer.SegmentPaths.Count == 0)
+                {
+                    throw new InvalidDataException(
+                        "Recorder's incomplete short MP4 is missing a required component. " +
+                        "No verified recovery segment is available; the remaining source was " +
+                        "preserved and can now be discarded if it is no longer needed.");
+                }
+            }
+
+            var usedShortRecordingOutput =
+                expectsShortRecordingNormalization &&
+                liveRecordingPath is not null &&
+                (!expectsShortRecordingPair ||
+                 liveRecordingPrefixPath is not null);
+            var usedLiveRecordingOutput =
+                liveRecordingPath is not null &&
+                !usedShortRecordingOutput;
+            var usedLiveRecordingAtomicMove =
+                usedLiveRecordingOutput &&
+                ArePathsOnSameVolume(liveRecordingPath!, finalPath);
+            var shortRecordingOutputCreated = false;
+            var recoveredInterruptedLiveOutput = false;
+            if (!usedLiveRecordingAtomicMove)
+            {
+                var interruptedLiveBytes =
+                    TryResolveInterruptedLiveRecordingOutput(
+                        detachedBuffer.SessionDirectory,
+                        detachedBuffer.LiveRecordingRecoveryPath,
+                        out var interruptedLiveRecordingPath) &&
+                    interruptedLiveRecordingPath is not null
+                        ? GetFileLengthSafely(interruptedLiveRecordingPath)
+                        : 0;
+                var directRecordingBytes = liveRecordingPath is null
+                    ? 0
+                    : GetFileLengthSafely(liveRecordingPath);
+                if (liveRecordingPrefixPath is not null)
+                {
+                    var prefixBytes = GetFileLengthSafely(
+                        liveRecordingPrefixPath);
+                    directRecordingBytes = directRecordingBytes >
+                        long.MaxValue - prefixBytes
+                            ? long.MaxValue
+                            : directRecordingBytes + prefixBytes;
+                }
+                var finalizationSourceBytes = Math.Max(
+                    Math.Max(
+                        detachedBuffer.SegmentBytes,
+                        interruptedLiveBytes),
+                    directRecordingBytes);
+                var availableFreeBytes = TryGetAvailableFreeSpace(saveDirectory);
+                var requiredFreeBytes = RecordingStoragePolicy
+                    .GetRequiredFinalizationFreeBytes(finalizationSourceBytes);
+                if (availableFreeBytes is null || availableFreeBytes < requiredFreeBytes)
+                {
+                    throw new IOException(
+                        $"Recorder stopped safely, but the drive needs about " +
+                        $"{StorageEstimator.FormatBytes(requiredFreeBytes)} free to create the final MP4. " +
+                        $"The recoverable session is preserved at {detachedBuffer.SessionDirectory}.");
+                }
+
+                partialPath = Path.Combine(
+                    saveDirectory,
+                    $".{Path.GetFileNameWithoutExtension(finalPath)}-{Guid.NewGuid():N}.recording.partial.mp4");
+                if (usedShortRecordingOutput)
+                {
+                    try
+                    {
+                        var ffmpegPath = _ffmpegSetupService.FindExecutable()
+                            ?? throw new InvalidOperationException(
+                                "The capture engine is no longer available. The recording session was preserved.");
+                        if (liveRecordingPrefixPath is not null)
+                        {
+                            await ValidateExportAsync(
+                                    ffprobePath,
+                                    liveRecordingPrefixPath,
+                                    TimeSpan.FromSeconds(
+                                        FfmpegArgumentBuilder.SegmentSeconds),
+                                    detachedBuffer.FramesPerSecond,
+                                    detachedBuffer.HasAudio,
+                                    cancellationToken,
+                                    TimeSpan.FromMinutes(2),
+                                    durationToleranceOverride:
+                                        TimeSpan.FromSeconds(0.35))
+                                .ConfigureAwait(false);
+                        }
+
+                        var minimumFrameDuration = TimeSpan.FromSeconds(
+                            1d / detachedBuffer.FramesPerSecond);
+                        var expectedRemainderDuration =
+                            liveRecordingPrefixPath is null
+                                ? liveRecordingDuration!.Value
+                                : liveRecordingDuration!.Value -
+                                  TimeSpan.FromSeconds(
+                                      FfmpegArgumentBuilder.SegmentSeconds);
+                        if (expectedRemainderDuration < minimumFrameDuration)
+                        {
+                            expectedRemainderDuration = minimumFrameDuration;
+                        }
+                        await ValidateExportAsync(
+                                ffprobePath,
+                                liveRecordingPath!,
+                                expectedRemainderDuration,
+                                detachedBuffer.FramesPerSecond,
+                                detachedBuffer.HasAudio,
+                                cancellationToken,
+                                TimeSpan.FromMinutes(2),
+                                durationToleranceOverride:
+                                    TimeSpan.FromSeconds(0.35))
+                            .ConfigureAwait(false);
+                        shortRecordingManifestPath = Path.Combine(
+                            detachedBuffer.SessionDirectory,
+                            $".clipforge-short-recording-{Guid.NewGuid():N}.ffconcat");
+                        await File.WriteAllLinesAsync(
+                                shortRecordingManifestPath,
+                                liveRecordingPrefixPath is null
+                                    ? BuildSingleRecordingConcatManifestLines(
+                                        liveRecordingPath!)
+                                    : BuildShortRecordingConcatManifestLines(
+                                        liveRecordingPrefixPath,
+                                        liveRecordingPath!),
+                                new UTF8Encoding(
+                                    encoderShouldEmitUTF8Identifier: false),
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        RecordCaptureRuntimeEvent(
+                            "recording_short_parts_merge_started",
+                            detail: string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"expectedSeconds={liveRecordingDuration!.Value.TotalSeconds:0.###}."),
+                            includeResourceSnapshots: false);
+                        var arguments =
+                            FfmpegArgumentBuilder.BuildShortRecordingConcatArguments(
+                                shortRecordingManifestPath,
+                                partialPath,
+                                detachedBuffer.FramesPerSecond,
+                                detachedBuffer.HasAudio);
+                        await RunRecordingExportProcessAsync(
+                                ffmpegPath,
+                                arguments,
+                                partialPath,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        await ValidateExportAsync(
+                                ffprobePath,
+                                partialPath,
+                                liveRecordingDuration.Value,
+                                detachedBuffer.FramesPerSecond,
+                                detachedBuffer.HasAudio,
+                                cancellationToken,
+                                TimeSpan.FromMinutes(2),
+                                durationToleranceOverride: TimeSpan.FromSeconds(0.5))
+                            .ConfigureAwait(false);
+                        shortRecordingOutputCreated = true;
+                    }
+                    catch (MediaTimelineValidationException exception)
+                    {
+                        EnqueueDiagnostic(
+                            $"Recorder's short direct output was rejected: " +
+                            exception.GetBaseException().Message);
+                        RecordCaptureRuntimeEvent(
+                            "recording_short_parts_merge_rejected",
+                            detail: exception.GetBaseException().Message,
+                            includeResourceSnapshots: false);
+                        TryDeleteFile(partialPath);
+                        if (detachedBuffer.SegmentPaths.Count == 0 &&
+                            string.IsNullOrWhiteSpace(
+                                detachedBuffer.LiveRecordingRecoveryPath))
+                        {
+                            var hasRecoveryJournal =
+                                !string.IsNullOrWhiteSpace(
+                                    detachedBuffer.RecoveryJournalPath);
+                            var hasRecoveryIdentity =
+                                !string.IsNullOrWhiteSpace(
+                                    detachedBuffer.RecoverySessionId);
+                            if (hasRecoveryJournal != hasRecoveryIdentity ||
+                                hasRecoveryJournal &&
+                                !RecordingRecoveryJournal
+                                    .TryPersistLiveOutputInvalidationMarker(
+                                        detachedBuffer.SessionDirectory,
+                                        detachedBuffer.RecoverySessionId!))
+                            {
+                                throw new IOException(
+                                    "Recorder could not durably quarantine the rejected short output. " +
+                                    "Both source parts were preserved for another retry.",
+                                    exception);
+                            }
+
+                            detachedBuffer = detachedBuffer with
+                            {
+                                LiveRecordingPrefixPath = null,
+                                LiveRecordingExpectedDuration = null,
+                                LiveRecordingFastPathEligible = false,
+                                LiveRecordingNeedsCfrNormalization = false
+                            };
+                            Volatile.Write(
+                                ref _pendingDetachedRecordingBuffer,
+                                detachedBuffer);
+                            manifestPath = await PersistRecordingRecoveryStateAsync(
+                                    detachedBuffer,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                            throw new InvalidDataException(
+                                "Recorder's short direct output failed media validation. " +
+                                "Both source parts were preserved; use Discard incomplete " +
+                                "if you no longer need them.",
+                                exception);
+                        }
+
+                        usedShortRecordingOutput = false;
+                        liveRecordingPrefixPath = null;
+                        liveRecordingPath = null;
+                        liveRecordingDuration = null;
+                    }
+                    catch (RecordingAssemblyException exception) when (
+                        detachedBuffer.SegmentPaths.Count > 0)
+                    {
+                        // Both source MP4s passed independent media validation,
+                        // so a non-zero concat exit may be destination pressure,
+                        // antivirus interference, or another transient. Fall
+                        // back to durable MKVs when available, but never
+                        // quarantine valid only-copy source media.
+                        EnqueueDiagnostic(
+                            $"Recorder could not assemble its validated short direct output; " +
+                            $"using recovery segments instead: " +
+                            exception.GetBaseException().Message);
+                        TryDeleteFile(partialPath);
+                        usedShortRecordingOutput = false;
+                        liveRecordingPrefixPath = null;
+                        liveRecordingPath = null;
+                        liveRecordingDuration = null;
+                    }
+                }
+
+                if (!shortRecordingOutputCreated && usedLiveRecordingOutput)
+                {
+                    copiedLiveRecordingFingerprint = await CopyRecordingOutputAsync(
+                            liveRecordingPath!,
+                            partialPath,
+                            cancellationToken,
+                            expectedSourceFingerprint: liveRecordingFingerprint)
+                        .ConfigureAwait(false);
+                }
+                else if (!shortRecordingOutputCreated)
+                {
+                    var ffmpegPath = _ffmpegSetupService.FindExecutable()
+                        ?? throw new InvalidOperationException(
+                            "The capture engine is no longer available. The recording session was preserved.");
+
+                    if (interruptedLiveRecordingPath is not null)
+                    {
+                        try
+                        {
+                            if (!TryResolveInterruptedLiveRecordingOutput(
+                                    detachedBuffer.SessionDirectory,
+                                    interruptedLiveRecordingPath,
+                                    out var revalidatedInterruptedPath) ||
+                                revalidatedInterruptedPath is null)
+                            {
+                                throw new SecurityException(
+                                    "Recorder's interrupted live output changed before repair.");
+                            }
+
+                            RecordCaptureRuntimeEvent(
+                                "recording_live_output_repair_started",
+                                detail: string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"bytes={GetFileLengthSafely(revalidatedInterruptedPath)}."),
+                                includeResourceSnapshots: false);
+                            var recoveryArguments =
+                                FfmpegArgumentBuilder.BuildRecordingRecoveryArguments(
+                                    revalidatedInterruptedPath,
+                                    partialPath);
+                            await RunRecordingExportProcessAsync(
+                                    ffmpegPath,
+                                    recoveryArguments,
+                                    partialPath,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                            recoveredLiveRecordingDuration =
+                                await ValidateRecoveredExportAsync(
+                                        ffprobePath,
+                                        partialPath,
+                                        segmentDuration,
+                                        detachedBuffer.FramesPerSecond,
+                                        detachedBuffer.HasAudio,
+                                        cancellationToken,
+                                        TimeSpan.FromMinutes(2))
+                                    .ConfigureAwait(false);
+                            recoveredInterruptedLiveOutput = true;
+                        }
+                        catch (Exception exception) when (
+                            exception is not OperationCanceledException &&
+                            detachedBuffer.SegmentPaths.Count > 0)
+                        {
+                            EnqueueDiagnostic(
+                                $"Recorder's interrupted live output could not be repaired; using recovery segments instead: " +
+                                exception.GetBaseException().Message);
+                            RecordCaptureRuntimeEvent(
+                                "recording_live_output_repair_failed",
+                                detail: exception.GetBaseException().Message,
+                                includeResourceSnapshots: false);
+                            TryDeleteFile(partialPath);
+                        }
+                    }
+
+                    if (!recoveredInterruptedLiveOutput)
+                    {
+                        if (detachedBuffer.SegmentPaths.Count == 0)
+                        {
+                            throw new InvalidDataException(
+                                "Recorder's interrupted live output could not be repaired. " +
+                                "The source file was preserved for another retry.");
+                        }
+
+                        var arguments = FfmpegArgumentBuilder.BuildRecordingConcatArguments(
+                            manifestPath,
+                            partialPath,
+                            segmentDuration);
+                        await RunRecordingExportProcessAsync(
+                                ffmpegPath,
+                                arguments,
+                                partialPath,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                }
+
+                if (!File.Exists(partialPath) || new FileInfo(partialPath).Length == 0)
+                {
+                    throw new InvalidDataException(
+                        "The capture engine produced an empty recording. The source session was preserved.");
+                }
+
+                if (!usedLiveRecordingOutput &&
+                    !usedShortRecordingOutput &&
+                    !recoveredInterruptedLiveOutput)
+                {
+                    await ValidateExportAsync(
+                            ffprobePath,
+                            partialPath,
+                            segmentDuration,
+                            detachedBuffer.FramesPerSecond,
+                            detachedBuffer.HasAudio,
+                            cancellationToken,
+                            TimeSpan.FromMinutes(2))
+                        .ConfigureAwait(false);
+                }
+            }
+
+            if (usedShortRecordingOutput &&
+                (liveRecordingPrefixPath is not null &&
+                 (!TryResolveLiveRecordingPrefixOutput(
+                      detachedBuffer.SessionDirectory,
+                      liveRecordingPrefixPath,
+                      out var revalidatedLiveRecordingPrefixPath) ||
+                  !string.Equals(
+                      liveRecordingPrefixPath,
+                      revalidatedLiveRecordingPrefixPath,
+                      StringComparison.OrdinalIgnoreCase) ||
+                  !string.Equals(
+                      liveRecordingPrefixFingerprint,
+                      RecordingRecoveryJournal.ComputeOutputFingerprint(
+                          liveRecordingPrefixPath),
+                      StringComparison.Ordinal)) ||
+                 !TryResolveLiveRecordingOutput(
+                     detachedBuffer.SessionDirectory,
+                     liveRecordingPath,
+                     liveRecordingDuration?.TotalSeconds,
+                     eligible: true,
+                     out var revalidatedShortLiveRecordingPath,
+                     out _) ||
+                 !string.Equals(
+                     liveRecordingPath,
+                     revalidatedShortLiveRecordingPath,
+                     StringComparison.OrdinalIgnoreCase) ||
+                 !string.Equals(
+                     liveRecordingFingerprint,
+                     RecordingRecoveryJournal.ComputeOutputFingerprint(
+                         liveRecordingPath!),
+                     StringComparison.Ordinal)))
+            {
+                throw new IOException(
+                    "Recorder's short recording parts changed during finalization. " +
+                    "The recovery session was preserved and no changed source was committed.");
+            }
+
+            if (usedLiveRecordingOutput &&
+                (!TryResolveLiveRecordingOutput(
+                     detachedBuffer.SessionDirectory,
+                     liveRecordingPath,
+                     liveRecordingDuration?.TotalSeconds,
+                     eligible: true,
+                     out var revalidatedLiveRecordingPath,
+                     out _) ||
+                 !string.Equals(
+                     liveRecordingPath,
+                     revalidatedLiveRecordingPath,
+                     StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new SecurityException(
+                    "Recorder's live MP4 path changed after validation. The recovery segments were preserved.");
+            }
+
+            var commitSourcePath = usedLiveRecordingAtomicMove
+                ? liveRecordingPath!
+                : partialPath!;
+            var commitSourceInfo = new FileInfo(commitSourcePath);
+            var finalOutputLength = commitSourceInfo.Length;
+            if (finalOutputLength <= 0 ||
+                (commitSourceInfo.Attributes &
+                 (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                throw new InvalidDataException(
+                    "Recorder's validated output changed before commit. The recovery segments were preserved.");
+            }
+
+            var finalOutputFingerprint =
+                RecordingRecoveryJournal.ComputeOutputFingerprint(
+                    commitSourcePath);
+            if (usedLiveRecordingOutput &&
+                (!string.Equals(
+                     RecordingRecoveryJournal.ComputeOutputFingerprint(
+                         liveRecordingPath!),
+                     liveRecordingFingerprint,
+                     StringComparison.Ordinal) ||
+                 !string.Equals(
+                     finalOutputFingerprint,
+                     usedLiveRecordingAtomicMove
+                         ? liveRecordingFingerprint
+                         : copiedLiveRecordingFingerprint,
+                     StringComparison.Ordinal)))
+            {
+                throw new IOException(
+                    "Recorder's live output changed after media validation. " +
+                    "The recovery session was preserved and the changed file was not committed.");
+            }
+
             if (!string.IsNullOrWhiteSpace(detachedBuffer.RecoveryJournalPath) &&
                 !string.IsNullOrWhiteSpace(detachedBuffer.RecoverySessionId))
             {
@@ -2490,48 +4519,135 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         detachedBuffer.RecoveryJournalPath,
                         detachedBuffer.RecoverySessionId,
                         finalPath,
+                        finalOutputLength,
+                        finalOutputFingerprint,
                         cancellationToken)
                     .ConfigureAwait(false);
             }
 
-            File.Move(partialPath, finalPath);
-            partialPath = null;
-            var finalOutputLength = new FileInfo(finalPath).Length;
+            if (usedLiveRecordingAtomicMove)
+            {
+                File.Move(liveRecordingPath!, finalPath);
+            }
+            else
+            {
+                File.Move(partialPath!, finalPath);
+                partialPath = null;
+            }
+
+            try
+            {
+                var committedOutputInfo = new FileInfo(finalPath);
+                if (!committedOutputInfo.Exists ||
+                    committedOutputInfo.Length != finalOutputLength ||
+                    (committedOutputInfo.Attributes &
+                     (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    !string.Equals(
+                        RecordingRecoveryJournal.ComputeOutputFingerprint(finalPath),
+                        finalOutputFingerprint,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException(
+                        "Recorder's final output changed during its atomic commit.");
+                }
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or
+                    InvalidDataException or ArgumentException or
+                    NotSupportedException or SecurityException)
+            {
+                if (usedLiveRecordingAtomicMove &&
+                    liveRecordingPath is not null &&
+                    File.Exists(finalPath) &&
+                    !File.Exists(liveRecordingPath))
+                {
+                    try
+                    {
+                        // Restore the source name when possible so a commit-time
+                        // mutation cannot leave an unverified file in the library
+                        // or silently discard the user's only live recording.
+                        File.Move(finalPath, liveRecordingPath);
+                    }
+                    catch (Exception rollbackException) when (
+                        rollbackException is IOException or UnauthorizedAccessException or
+                            ArgumentException or NotSupportedException or SecurityException)
+                    {
+                        EnqueueDiagnostic(
+                            $"Recorder could not restore its changed live output after a failed commit check: " +
+                            rollbackException.GetBaseException().Message);
+                    }
+                }
+                else
+                {
+                    TryDeleteFile(finalPath);
+                }
+
+                throw new InvalidDataException(
+                    "Recorder's final output could not be proven identical after its atomic commit. " +
+                    "The recovery session was preserved.",
+                    exception);
+            }
+
+            if (usedLiveRecordingAtomicMove)
+            {
+                liveRecordingPath = null;
+            }
+
             if (!string.IsNullOrWhiteSpace(detachedBuffer.RecoveryJournalPath) &&
                 !string.IsNullOrWhiteSpace(detachedBuffer.RecoverySessionId))
             {
-                await RecordingRecoveryJournal.MarkCommittedAsync(
-                        _recordingRecoveryRoot,
-                        detachedBuffer.RecoveryJournalPath,
-                        detachedBuffer.RecoverySessionId,
-                        finalPath,
-                        finalOutputLength,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                try
+                {
+                    // The output move is the irreversible commit point. User
+                    // cancellation after that point must not turn a successful
+                    // save into a false failure or leave an ambiguous journal.
+                    await RecordingRecoveryJournal.MarkCommittedAsync(
+                            _recordingRecoveryRoot,
+                            detachedBuffer.RecoveryJournalPath,
+                            detachedBuffer.RecoverySessionId,
+                            finalPath,
+                            finalOutputLength,
+                            finalOutputFingerprint,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (
+                    exception is IOException or UnauthorizedAccessException or
+                        ArgumentException or NotSupportedException or SecurityException or
+                        InvalidOperationException)
+                {
+                    // The durable committing record contains the exact length
+                    // and sampled fingerprint. Startup can therefore recognize
+                    // this already-moved output without creating a duplicate.
+                    EnqueueDiagnostic(
+                        $"Recorder saved successfully, but its final recovery marker could not be appended: " +
+                        exception.GetBaseException().Message);
+                }
             }
 
             _lastSavedPath = finalPath;
             recordingCommitted = true;
             Volatile.Write(ref _pendingDetachedRecordingBuffer, null);
-            TryDeleteFile(Path.Combine(
-                detachedBuffer.SessionDirectory,
-                RecordingRecoveryStateFileName));
-            TryDeleteFile(manifestPath);
             manifestPath = null;
-            if (TryDeleteBufferDirectory(
-                    detachedBuffer.SessionDirectory,
-                    detachedBuffer.BufferRoot))
-            {
-                RecordingRecoveryJournal.TryDeleteJournal(
-                    detachedBuffer.RecoveryJournalPath);
-            }
+            QueueCommittedRecordingCleanup(
+                detachedBuffer,
+                finalPath,
+                finalOutputLength,
+                finalOutputFingerprint);
+            var savedDuration = liveRecordingDuration ??
+                recoveredLiveRecordingDuration ??
+                segmentDuration;
             RecordCaptureRuntimeEvent(
                 "recording_finalize_completed",
                 detail: string.Create(
                     CultureInfo.InvariantCulture,
                     $"elapsedMs={Stopwatch.GetElapsedTime(finalizationStartedAt).TotalMilliseconds:0}; " +
-                    $"segments={detachedBuffer.SegmentPaths.Count}; " +
-                    $"durationSeconds={duration.TotalSeconds:0}."),
+                     $"segments={detachedBuffer.SegmentPaths.Count}; " +
+                     $"durationSeconds={savedDuration.TotalSeconds:0}; " +
+                     $"liveOutputUsed={usedLiveRecordingOutput}; " +
+                     $"shortOutputNormalized={usedShortRecordingOutput}; " +
+                     $"liveOutputAtomicMove={usedLiveRecordingAtomicMove}; " +
+                     $"recoveredLiveOutput={recoveredInterruptedLiveOutput}."),
                 includeResourceSnapshots: false);
             Publish(new ReplayStateSnapshot(
                 ReplayState.Stopped,
@@ -2579,6 +4695,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 TryDeleteFile(manifestPath);
             }
 
+            TryDeleteFile(shortRecordingManifestPath);
             TryDeleteFile(partialPath);
             Volatile.Write(ref _isSaving, 0);
             Volatile.Write(ref _saveOperationPending, 0);
@@ -2587,6 +4704,43 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 _saveGate.Release();
             }
         }
+    }
+
+    private async Task<(DetachedRecordingBuffer Buffer, string ManifestPath)>
+        QuarantineDetachedLiveRecordingOutputAsync(
+            DetachedRecordingBuffer detachedBuffer,
+            CancellationToken cancellationToken)
+    {
+        var hasRecoveryJournal = !string.IsNullOrWhiteSpace(
+            detachedBuffer.RecoveryJournalPath);
+        var hasRecoveryIdentity = !string.IsNullOrWhiteSpace(
+            detachedBuffer.RecoverySessionId);
+        if (hasRecoveryJournal != hasRecoveryIdentity ||
+            hasRecoveryJournal &&
+            !RecordingRecoveryJournal.TryPersistLiveOutputInvalidationMarker(
+                detachedBuffer.SessionDirectory,
+                detachedBuffer.RecoverySessionId!))
+        {
+            throw new IOException(
+                "Recorder could not durably quarantine its rejected live output. " +
+                "The source was preserved for another retry.");
+        }
+
+        var quarantined = detachedBuffer with
+        {
+            LiveRecordingPrefixPath = null,
+            LiveRecordingPath = null,
+            LiveRecordingExpectedDuration = null,
+            LiveRecordingFastPathEligible = false,
+            LiveRecordingNeedsCfrNormalization = false,
+            LiveRecordingRecoveryPath = null
+        };
+        Volatile.Write(ref _pendingDetachedRecordingBuffer, quarantined);
+        var manifestPath = await PersistRecordingRecoveryStateAsync(
+                quarantined,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return (quarantined, manifestPath);
     }
 
     public async Task DiscardIncompleteRecordingAsync(
@@ -2615,7 +4769,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         "Reconnect the original recording drive before discarding this session.");
                 }
 
-                if (pending.SegmentPaths.Count > 0)
+                if (HasSafeRecordingSource(pending))
                 {
                     throw new InvalidOperationException(
                         "This Recorder session contains safe video and cannot be discarded as incomplete.");
@@ -2716,7 +4870,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
             HasAudio = recovery.HasAudio,
             SourceAvailable = true,
             MissingSegmentCount = recovery.MissingSegmentCount,
-            RecoveryWasDetached = recovery.Detached
+            RecoveryWasDetached = recovery.Detached,
+            SegmentTimelineDuration = recovery.SegmentTimelineDuration,
+            LiveRecordingRecoveryPath =
+                recovery.LiveRecordingRecoveryPath,
+            SegmentDurationSeconds = recovery.SegmentDurationSeconds
         };
     }
 
@@ -2857,12 +5015,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
     private async Task<bool> StopCaptureResourcesForRefreshAsync(
         bool terminateAtCompletedBoundary = false,
-        TimeSpan? gracefulStopTimeout = null)
+        TimeSpan? gracefulStopTimeout = null,
+        RecordingStopRequest? recordingStopRequest = null)
     {
         Volatile.Write(ref _lastCaptureCleanupFailure, null);
+        Volatile.Write(ref _lastCaptureStopWasGraceful, 0);
+        Volatile.Write(ref _lastStoppedCaptureProgress, null);
         var process = _captureProcess;
         var processJob = _captureProcessJob;
+        var earlyStopSignal =
+            recordingStopRequest is not null &&
+            ReferenceEquals(recordingStopRequest.CaptureProcess, process)
+                ? recordingStopRequest.SignalTask
+                : null;
         var processExited = process is null;
+        var processClosedGracefully = process is null;
         try
         {
             if (process is not null)
@@ -2877,16 +5044,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     // roughly 0.2 seconds. StopProcessGracefullyAsync still kills
                     // the process after the bound, and CaptureProcessJob disposal
                     // remains the final containment guarantee.
-                    await StopProcessGracefullyAsync(
+                    processClosedGracefully = await StopProcessGracefullyAsync(
                             process,
-                            CaptureRefreshGracefulStopTimeout)
+                            CaptureRefreshGracefulStopTimeout,
+                            earlyStopSignal)
                         .ConfigureAwait(false);
                 }
                 else
                 {
-                    await StopProcessGracefullyAsync(
+                    processClosedGracefully = await StopProcessGracefullyAsync(
                             process,
-                            gracefulStopTimeout ?? CaptureRefreshGracefulStopTimeout)
+                            gracefulStopTimeout ?? CaptureRefreshGracefulStopTimeout,
+                            earlyStopSignal)
                         .ConfigureAwait(false);
                 }
             }
@@ -3002,6 +5171,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
             return false;
         }
 
+        Volatile.Write(
+            ref _lastCaptureStopWasGraceful,
+            processClosedGracefully ? 1 : 0);
+
         _audioPipes.Clear();
 
         try
@@ -3028,9 +5201,82 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _monitorTask = null;
         _diagnosticTask = null;
         _captureProgressTask = null;
+        Volatile.Write(
+            ref _lastStoppedCaptureProgress,
+            Volatile.Read(ref _latestCaptureProgress));
         ResetCaptureProgress();
         _captureStarvationWatchdog = null;
         return true;
+    }
+
+    private async Task<bool> AbortRecorderRefreshForPendingSaveAsync(
+        CaptureConfiguration configuration)
+    {
+        if (configuration.SessionMode != CaptureSessionMode.Recording ||
+            Volatile.Read(ref _saveOperationPending) == 0)
+        {
+            return false;
+        }
+
+        // Refresh owns the lifecycle/save gates here. Finish any process or
+        // pipe resources it registered after the Stop intent, then hand the
+        // unchanged session directory to StopCore for durable detachment.
+        Volatile.Write(ref _isStopping, 1);
+        _ = await StopCaptureResourcesForRefreshAsync().ConfigureAwait(false);
+        Volatile.Write(ref _isRunning, 0);
+        return true;
+    }
+
+    private async Task<bool> WaitForRefreshStageUnlessRecorderStopAsync(
+        Task stage,
+        TimeSpan timeout,
+        CaptureConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stage);
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        if (configuration.SessionMode != CaptureSessionMode.Recording)
+        {
+            await stage.WaitAsync(timeout, cancellationToken)
+                .ConfigureAwait(false);
+            return true;
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _saveOperationPending) != 0)
+            {
+                return false;
+            }
+
+            if (stage.IsCompleted)
+            {
+                await stage.ConfigureAwait(false);
+                return true;
+            }
+
+            var elapsed = Stopwatch.GetElapsedTime(started);
+            if (elapsed >= timeout)
+            {
+                throw new TimeoutException(
+                    "The capture refresh stage exceeded its bounded timeout.");
+            }
+
+            var remaining = timeout - elapsed;
+            var pollDelay = remaining < TimeSpan.FromMilliseconds(50)
+                ? remaining
+                : TimeSpan.FromMilliseconds(50);
+            await Task.WhenAny(
+                    stage,
+                    Task.Delay(pollDelay, cancellationToken))
+                .ConfigureAwait(false);
+        }
     }
 
     private async Task<bool> TryRestoreDegradedCaptureAfterPromotionFailureAsync(
@@ -3088,6 +5334,15 @@ public sealed class ReplayBufferService : IAsyncDisposable
             await EnsureRecordingRecoveryCheckpointAsync(cancellationToken)
                 .ConfigureAwait(false);
 
+            if (configuration.SessionMode == CaptureSessionMode.Recording &&
+                Volatile.Read(ref _saveOperationPending) != 0)
+            {
+                // StopAndSave already owns the stopped generation. Do not
+                // rebuild the degraded process after the user clicked Stop.
+                Volatile.Write(ref _isRunning, 0);
+                return true;
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             _sessionCancellation = new CancellationTokenSource();
             _reportedDroppedAudioBlocks = 0;
@@ -3112,14 +5367,50 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 arguments,
                 redirectStandardInput: true,
                 redirectStandardOutput: true);
-            if (!restoredProcess.Start())
+            var recorderStopPreventedRestore = false;
+            lock (_fileGate)
             {
-                throw new InvalidOperationException(
-                    "Windows could not restore the previous GDI capture path.");
+                recorderStopPreventedRestore =
+                    configuration.SessionMode == CaptureSessionMode.Recording &&
+                    Volatile.Read(ref _saveOperationPending) != 0;
+                if (!recorderStopPreventedRestore)
+                {
+                    try
+                    {
+                        if (!restoredProcess.Start())
+                        {
+                            throw new InvalidOperationException(
+                                "Windows could not restore the previous GDI capture path.");
+                        }
+
+                        _captureProcessJob = CaptureProcessJob.Attach(restoredProcess);
+                        _captureProcess = restoredProcess;
+                    }
+                    catch
+                    {
+                        TryKill(restoredProcess);
+                        _captureProcessJob?.Dispose();
+                        _captureProcessJob = null;
+                        throw;
+                    }
+                }
             }
 
-            _captureProcessJob = CaptureProcessJob.Attach(restoredProcess);
-            _captureProcess = restoredProcess;
+            if (recorderStopPreventedRestore)
+            {
+                restoredProcess.Dispose();
+                restoredProcess = null;
+                await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                    .ConfigureAwait(false);
+                return true;
+            }
+
+            if (await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                    .ConfigureAwait(false))
+            {
+                return true;
+            }
+
             _ = ProcessTuning.TryApplyCapturePriority(
                 restoredProcess,
                 degradedStrategy,
@@ -3132,15 +5423,34 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 configuration.Display);
             if (_audioPipes.Count > 0)
             {
-                var connectionTasks = _audioPipes
+                var connectionTask = Task.WhenAll(_audioPipes
                     .Select(pipe => pipe.ConnectAndStartAsync(_sessionCancellation.Token))
-                    .ToArray();
-                await Task.WhenAll(connectionTasks)
-                    .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                    .ConfigureAwait(false);
+                    .ToArray());
+                if (!await WaitForRefreshStageUnlessRecorderStopAsync(
+                        connectionTask,
+                        TimeSpan.FromSeconds(15),
+                        configuration,
+                        cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                        .ConfigureAwait(false);
+                    return true;
+                }
             }
 
-            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+            if (!await WaitForRefreshStageUnlessRecorderStopAsync(
+                    Task.Delay(500, cancellationToken),
+                    TimeSpan.FromSeconds(1),
+                    configuration,
+                    cancellationToken)
+                .ConfigureAwait(false))
+            {
+                await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                    .ConfigureAwait(false);
+                return true;
+            }
+
             if (restoredProcess.HasExited)
             {
                 throw new InvalidOperationException(BuildCaptureFailureMessage());
@@ -3151,11 +5461,29 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 degradedStrategy,
                 CaptureGeometry.ResolveOutputSize(configuration).RequiresScaling,
                 performanceProfile);
-            _activeCaptureStrategy = degradedStrategy;
-            _activeCapturePerformanceProfile = performanceProfile;
-            _activeEncoderDescription = degradedStrategy.Description;
-            Volatile.Write(ref _isStopping, 0);
-            Volatile.Write(ref _isRunning, 1);
+            var recorderStopPreventedRestoreCommit = false;
+            lock (_fileGate)
+            {
+                recorderStopPreventedRestoreCommit =
+                    configuration.SessionMode == CaptureSessionMode.Recording &&
+                    Volatile.Read(ref _saveOperationPending) != 0;
+                if (!recorderStopPreventedRestoreCommit)
+                {
+                    _activeCaptureStrategy = degradedStrategy;
+                    _activeCapturePerformanceProfile = performanceProfile;
+                    _activeEncoderDescription = degradedStrategy.Description;
+                    Volatile.Write(ref _isStopping, 0);
+                    Volatile.Write(ref _isRunning, 1);
+                }
+            }
+
+            if (recorderStopPreventedRestoreCommit)
+            {
+                await AbortRecorderRefreshForPendingSaveAsync(configuration)
+                    .ConfigureAwait(false);
+                return true;
+            }
+
             Volatile.Write(
                 ref _lastCapturePlan,
                 new CaptureSessionPlan(
@@ -3247,6 +5575,104 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
+    private RecordingStopBoundary? CaptureRecordingStopBoundary()
+    {
+        if (_sessionMode != CaptureSessionMode.Recording ||
+            !IsRunning ||
+            string.IsNullOrWhiteSpace(_segmentDirectory))
+        {
+            return null;
+        }
+
+        lock (_fileGate)
+        {
+            if (_sessionMode != CaptureSessionMode.Recording ||
+                !IsRunning ||
+                string.IsNullOrWhiteSpace(_segmentDirectory))
+            {
+                return null;
+            }
+
+            RefreshSegmentIndexLocked();
+            var completedCount = Math.Max(0, _segments.Count - 1);
+            var closedSegments = _segments
+                .Take(completedCount)
+                .Where(segment =>
+                    segment.IsTrusted &&
+                    segment.IsCountedForRecording &&
+                    segment.GenerationId != _exportBlockedCaptureGeneration &&
+                    segment.Length > 0)
+                .ToDictionary(
+                    segment => segment.Path,
+                    segment => segment.Length,
+                    StringComparer.OrdinalIgnoreCase);
+            BufferedSegment? openSegment = _segments.Count == 0
+                ? null
+                : _segments[^1];
+            return new RecordingStopBoundary(
+                Volatile.Read(ref _captureSessionIdentity),
+                Path.GetFullPath(_segmentDirectory),
+                closedSegments,
+                openSegment?.Path,
+                openSegment?.Length ?? 0,
+                openSegment?.SegmentNumber ?? -1,
+                openSegment?.GenerationId ?? -1,
+                _activeCaptureGenerationStartSegmentNumber,
+                Volatile.Read(ref _latestCaptureProgress),
+                _captureProcess);
+        }
+    }
+
+    private RecordingStopRequest? BeginRecordingStopRequest(
+        RecordingStopBoundary? boundary)
+    {
+        if (boundary?.CaptureProcess is not { } process ||
+            boundary.SessionIdentity != Volatile.Read(ref _captureSessionIdentity) ||
+            !ReferenceEquals(process, _captureProcess) ||
+            HasProcessExitedSafely(process))
+        {
+            return null;
+        }
+
+        // Stop is an irreversible user action. Signal the exact process before
+        // waiting for maintenance/lifecycle ownership so a busy refresh cannot
+        // extend a manual recording by seconds or minutes after the click.
+        Volatile.Write(ref _isStopping, 1);
+        return new RecordingStopRequest(
+            boundary.SessionIdentity,
+            process,
+            SignalProcessGracefulStopAsync(process));
+    }
+
+    private static async Task<bool> SignalProcessGracefulStopAsync(
+        Process process)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                return process.ExitCode == 0;
+            }
+
+            using var signalTimeout =
+                new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            await process.StandardInput.WriteLineAsync("q")
+                .WaitAsync(signalTimeout.Token)
+                .ConfigureAwait(false);
+            await process.StandardInput.FlushAsync(signalTimeout.Token)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or InvalidOperationException or
+                ObjectDisposedException or OperationCanceledException or
+                System.ComponentModel.Win32Exception)
+        {
+            // StopCore retries the signal while it owns the lifecycle gate.
+            return false;
+        }
+    }
+
     private async Task<bool> WaitForNextCaptureSegmentBoundaryAsync(
         Process process,
         CancellationToken cancellationToken)
@@ -3259,11 +5685,17 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(CaptureBoundaryWaitTimeout);
+        timeout.CancelAfter(GetCaptureBoundaryWaitTimeout(_sessionMode));
         try
         {
             while (true)
             {
+                if (_sessionMode == CaptureSessionMode.Recording &&
+                    Volatile.Read(ref _saveOperationPending) != 0)
+                {
+                    return false;
+                }
+
                 await Task.Delay(TimeSpan.FromMilliseconds(50), timeout.Token)
                     .ConfigureAwait(false);
                 try
@@ -3290,12 +5722,20 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            // Segment creation should occur every two seconds. A bounded timeout
-            // prevents rotation from stalling if an already degraded WGC source
-            // has stopped advancing entirely.
+            // The Recorder recovery stream rotates every ten seconds while
+            // Instant Replay rotates every two. A mode-aware bound gives a
+            // healthy graph one full interval to reach a safe boundary without
+            // waiting forever on an already stalled source.
             return false;
         }
     }
+
+    internal static TimeSpan GetCaptureBoundaryWaitTimeout(
+        CaptureSessionMode sessionMode) =>
+        sessionMode == CaptureSessionMode.Recording
+            ? TimeSpan.FromSeconds(
+                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds + 1)
+            : CaptureBoundaryWaitTimeout;
 
     private void DiscardNewestCaptureTailLocked()
     {
@@ -3323,9 +5763,29 @@ public sealed class ReplayBufferService : IAsyncDisposable
     private async Task<DetachedRecordingBuffer?> StopCoreAsync(
         bool deleteBuffer,
         bool publishStopped,
-        bool detachRecordingBuffer = false)
+        bool detachRecordingBuffer = false,
+        RecordingStopBoundary? recordingStopBoundary = null,
+        RecordingStopRequest? recordingStopRequest = null)
     {
         var stoppedConfiguration = _activeConfiguration;
+        var stoppedCaptureProgress = Volatile.Read(ref _latestCaptureProgress);
+        var stoppedLiveRecordingPath = _liveRecordingPath;
+        var usesRequestedEarlyStop =
+            recordingStopRequest is not null &&
+            recordingStopRequest.SessionIdentity ==
+                Volatile.Read(ref _captureSessionIdentity) &&
+            ReferenceEquals(recordingStopRequest.CaptureProcess, _captureProcess);
+        var ownedRunningCaptureProcess =
+            _captureProcess is { } processAtStop &&
+            !HasProcessExitedSafely(processAtStop);
+        if (Volatile.Read(ref _liveRecordingFastPathEligible) != 0 &&
+            (_captureProcess is null || HasProcessExitedSafely(_captureProcess)) &&
+            !usesRequestedEarlyStop)
+        {
+            InvalidateLiveRecordingFastPath(
+                "The capture process exited before Recorder could close the live MP4 cleanly.");
+        }
+
         Volatile.Write(ref _isStopping, 1);
         InvalidateCaptureRecoveryRetry();
         if (_degradedCaptureReprobeCoordinator.IsActive &&
@@ -3366,7 +5826,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         var processExited = await StopCaptureResourcesForRefreshAsync(
-                gracefulStopTimeout: TimeSpan.FromSeconds(5))
+                gracefulStopTimeout: TimeSpan.FromSeconds(5),
+                recordingStopRequest: usesRequestedEarlyStop
+                    ? recordingStopRequest
+                    : null)
             .ConfigureAwait(false);
         if (!processExited)
         {
@@ -3381,9 +5844,60 @@ public sealed class ReplayBufferService : IAsyncDisposable
             throw new InvalidOperationException(message);
         }
 
+        stoppedCaptureProgress =
+            Volatile.Read(ref _lastStoppedCaptureProgress) ??
+            stoppedCaptureProgress;
+
+        var stoppedLiveRecordingFastPathEligible =
+            Volatile.Read(ref _liveRecordingFastPathEligible) != 0;
+        if (stoppedLiveRecordingFastPathEligible &&
+            Volatile.Read(ref _lastCaptureStopWasGraceful) == 0)
+        {
+            InvalidateLiveRecordingFastPath(
+                "Recorder had to terminate the capture process before its live MP4 trailer was confirmed.");
+            stoppedLiveRecordingFastPathEligible = false;
+        }
+
         var oldSegmentDirectory = _segmentDirectory;
         var oldBufferRoot = _activeBufferRoot ?? _bufferRoot;
         var recordingRecoveryJournal = _recordingRecoveryJournal;
+        var matchesRequestedStopBoundary =
+            recordingStopBoundary is not null &&
+            !string.IsNullOrWhiteSpace(oldSegmentDirectory) &&
+            recordingStopBoundary.SessionIdentity ==
+                Volatile.Read(ref _captureSessionIdentity) &&
+            string.Equals(
+                recordingStopBoundary.SessionDirectory,
+                Path.GetFullPath(oldSegmentDirectory),
+                StringComparison.OrdinalIgnoreCase);
+        var requestedStopProgress = matchesRequestedStopBoundary
+            ? recordingStopBoundary!.CaptureProgress ?? stoppedCaptureProgress
+            : stoppedCaptureProgress;
+        var promotedGracefulShortRecording =
+            stoppedLiveRecordingFastPathEligible &&
+            Volatile.Read(ref _lastCaptureStopWasGraceful) != 0 &&
+            requestedStopProgress is not null &&
+            !string.IsNullOrWhiteSpace(oldSegmentDirectory) &&
+            !string.IsNullOrWhiteSpace(stoppedLiveRecordingPath) &&
+            TryPromoteGracefulShortRecordingOutput(
+                oldSegmentDirectory,
+                stoppedLiveRecordingPath,
+                requestedStopProgress.OutputTimeMicroseconds,
+                stoppedConfiguration?.FramesPerSecond ?? 0);
+        string? gracefulShortRecordingPrefixPath = null;
+        var mergesGracefulShortRecordingParts =
+            !promotedGracefulShortRecording &&
+            stoppedLiveRecordingFastPathEligible &&
+            Volatile.Read(ref _lastCaptureStopWasGraceful) != 0 &&
+            requestedStopProgress is not null &&
+            !string.IsNullOrWhiteSpace(oldSegmentDirectory) &&
+            !string.IsNullOrWhiteSpace(stoppedLiveRecordingPath) &&
+            TryResolveGracefulShortRecordingPrefixOutput(
+                oldSegmentDirectory,
+                stoppedLiveRecordingPath,
+                requestedStopProgress.OutputTimeMicroseconds,
+                stoppedConfiguration?.FramesPerSecond ?? 0,
+                out gracefulShortRecordingPrefixPath);
         DetachedRecordingBuffer? detachedBuffer = null;
         if (detachRecordingBuffer &&
             _sessionMode == CaptureSessionMode.Recording &&
@@ -3393,23 +5907,192 @@ public sealed class ReplayBufferService : IAsyncDisposable
             lock (_fileGate)
             {
                 RefreshSegmentIndexLocked();
-                // The process was stopped immediately after a completed boundary.
-                // Its newest file is the short tail opened for the next segment;
-                // exclude it from a fixed two-second concat timeline.
-                var completedCount = Math.Max(0, _segments.Count - 1);
-                var selectedSegmentEntries = _segments
-                    .Take(completedCount)
+                // Files followed by another numbered segment are known-complete
+                // ten-second checkpoints. The exact file that was open when a
+                // confirmed graceful Stop began is also closed safely, but is a
+                // variable-length tail, sealed in the journal and exact state
+                // with its measured duration before either can be committed.
+                var completedSegmentEntries = _segments
                     .Where(segment =>
                         segment.IsTrusted &&
                         segment.IsCountedForRecording &&
                         segment.GenerationId != _exportBlockedCaptureGeneration &&
                         segment.Length > 0)
                     .ToArray();
+                var selectedSegmentEntries = (recordingStopBoundary is null
+                        ? completedSegmentEntries
+                        : matchesRequestedStopBoundary
+                            ? completedSegmentEntries
+                                .Where(segment =>
+                                    recordingStopBoundary.ClosedSegments.TryGetValue(
+                                        segment.Path,
+                                        out var stoppedLength) &&
+                                    stoppedLength == segment.Length)
+                                .ToArray()
+                            : [])
+                    .ToList();
+
+                BufferedSegment? gracefulTail = null;
+                var gracefulStopOwnsTail =
+                    Volatile.Read(ref _lastCaptureStopWasGraceful) != 0 &&
+                    (usesRequestedEarlyStop || ownedRunningCaptureProcess);
+                var tailGenerationStartNumber = -1;
+                if (gracefulStopOwnsTail && matchesRequestedStopBoundary &&
+                    recordingStopBoundary is
+                    {
+                        OpenSegmentPath: { Length: > 0 } openPath,
+                        OpenSegmentNumber: >= 0,
+                        OpenSegmentGenerationId: >= 0
+                    })
+                {
+                    gracefulTail = _segments.FirstOrDefault(segment =>
+                        segment.SegmentNumber ==
+                            recordingStopBoundary.OpenSegmentNumber &&
+                        segment.GenerationId ==
+                            recordingStopBoundary.OpenSegmentGenerationId &&
+                        string.Equals(
+                            segment.Path,
+                            openPath,
+                            StringComparison.OrdinalIgnoreCase) &&
+                        segment.Length >= recordingStopBoundary.OpenSegmentLength);
+                    tailGenerationStartNumber =
+                        recordingStopBoundary.OpenSegmentGenerationStartNumber;
+                }
+                else if (gracefulStopOwnsTail && recordingStopBoundary is null &&
+                         _segments.Count > 0)
+                {
+                    gracefulTail = _segments[^1];
+                    tailGenerationStartNumber =
+                        _activeCaptureGenerationStartSegmentNumber;
+                }
+
+                TimeSpan? gracefulTailDuration = null;
+                if (gracefulTail is { } tail &&
+                    tail.IsTrusted &&
+                    tail.GenerationId != _exportBlockedCaptureGeneration &&
+                    tail.Length > 0 &&
+                    tailGenerationStartNumber >= 0 &&
+                    tail.SegmentNumber >= tailGenerationStartNumber)
+                {
+                    gracefulTailDuration =
+                        ResolveGracefulRecordingTailDuration(
+                            (recordingStopBoundary is not null
+                                ? requestedStopProgress
+                                : stoppedCaptureProgress)
+                            ?.OutputTimeMicroseconds ?? 0,
+                            tail.SegmentNumber,
+                            tailGenerationStartNumber,
+                            FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds,
+                            stoppedConfiguration.FramesPerSecond);
+                    if (gracefulTailDuration is not null &&
+                        selectedSegmentEntries.All(segment =>
+                            !string.Equals(
+                                segment.Path,
+                                tail.Path,
+                                StringComparison.OrdinalIgnoreCase)))
+                    {
+                        selectedSegmentEntries.Add(tail);
+                        selectedSegmentEntries.Sort(static (left, right) =>
+                            left.SegmentNumber.CompareTo(right.SegmentNumber));
+                        // The segment monitor checkpoints only files followed
+                        // by another numbered segment. A confirmed graceful
+                        // Stop makes the still-open tail equally trustworthy,
+                        // so publish that final add before the detached record.
+                        // Otherwise short recordings (and every partial final
+                        // ten-second interval) exist only in the exact state
+                        // file and the central journal rejects its duration.
+                        if (!tail.IsCountedForRecording &&
+                            recordingRecoveryJournal is { } journal &&
+                            !journal.RecordCompleted(
+                                tail.Path,
+                                tail.Length,
+                                tail.SegmentNumber))
+                        {
+                            EnqueueDiagnostic(
+                                "Recorder recovery could not queue its gracefully closed final segment checkpoint.");
+                        }
+                    }
+                }
+
+                if (recordingStopBoundary is not null)
+                {
+                    var selectedPaths = selectedSegmentEntries
+                        .Select(segment => segment.Path)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    foreach (var excluded in completedSegmentEntries.Where(
+                                 segment => !selectedPaths.Contains(segment.Path)))
+                    {
+                        if (recordingRecoveryJournal is not null &&
+                            !recordingRecoveryJournal.RecordUntrusted(
+                                excluded.Path,
+                                excluded.SegmentNumber))
+                        {
+                            EnqueueDiagnostic(
+                                "Recorder could not durably exclude a recovery segment completed after Stop was requested.");
+                        }
+                    }
+                }
                 var selectedSegments = selectedSegmentEntries
                     .Select(segment => segment.Path)
                     .ToArray();
                 var selectedBytes = selectedSegmentEntries
                     .Sum(segment => segment.Length);
+                TimeSpan? segmentTimelineDuration = selectedSegmentEntries.Count == 0
+                    ? null
+                    : gracefulTailDuration is { } partialTailDuration &&
+                      gracefulTail is { } selectedTail &&
+                      string.Equals(
+                          selectedSegmentEntries[^1].Path,
+                          selectedTail.Path,
+                          StringComparison.OrdinalIgnoreCase)
+                        ? TimeSpan.FromSeconds(
+                            checked((long)selectedSegmentEntries.Count - 1) *
+                            FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds) +
+                          partialTailDuration
+                        : TimeSpan.FromSeconds(
+                            checked((long)selectedSegmentEntries.Count) *
+                            FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds);
+                var liveRecordingIncludesSessionStart =
+                    IsCanonicalContinuousLiveRecordingPath(
+                        oldSegmentDirectory,
+                        stoppedLiveRecordingPath);
+                var recordedAfterWarmupMicroseconds =
+                    requestedStopProgress is null
+                        ? 0
+                        : liveRecordingIncludesSessionStart ||
+                          promotedGracefulShortRecording ||
+                          mergesGracefulShortRecordingParts
+                            ? requestedStopProgress.OutputTimeMicroseconds
+                            : Math.Max(
+                                0,
+                                requestedStopProgress.OutputTimeMicroseconds -
+                                FfmpegArgumentBuilder.SegmentSeconds * 1_000_000L);
+                TimeSpan? liveRecordingExpectedDuration =
+                    stoppedLiveRecordingFastPathEligible &&
+                    !string.IsNullOrWhiteSpace(stoppedLiveRecordingPath) &&
+                    recordedAfterWarmupMicroseconds > 0
+                        ? TimeSpan.FromSeconds(
+                            recordedAfterWarmupMicroseconds / 1_000_000d)
+                        : selectedSegmentEntries.Count > 0 &&
+                          stoppedLiveRecordingFastPathEligible &&
+                          !string.IsNullOrWhiteSpace(stoppedLiveRecordingPath)
+                            ? TimeSpan.FromSeconds(
+                                checked((long)selectedSegmentEntries.Count) *
+                                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds)
+                            : null;
+                string? resolvedStoppedLiveRecordingPath = null;
+                TimeSpan? resolvedStoppedLiveRecordingDuration = null;
+                if (liveRecordingExpectedDuration is { } expectedDuration)
+                {
+                    _ = TryResolveLiveRecordingOutput(
+                        oldSegmentDirectory,
+                        stoppedLiveRecordingPath,
+                        expectedDuration.TotalSeconds,
+                        stoppedLiveRecordingFastPathEligible,
+                        out resolvedStoppedLiveRecordingPath,
+                        out resolvedStoppedLiveRecordingDuration);
+                }
+
                 detachedBuffer = new DetachedRecordingBuffer(
                     oldSegmentDirectory,
                     oldBufferRoot,
@@ -3420,14 +6103,56 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     stoppedConfiguration.CaptureMicrophone,
                     recordingRecoveryJournal?.JournalPath,
                     recordingRecoveryJournal?.SessionId,
-                    SourceAvailable: true);
+                    SourceAvailable: true,
+                    SegmentTimelineDuration: segmentTimelineDuration,
+                    LiveRecordingPrefixPath:
+                        gracefulShortRecordingPrefixPath,
+                    LiveRecordingPath: resolvedStoppedLiveRecordingPath,
+                    LiveRecordingExpectedDuration:
+                        resolvedStoppedLiveRecordingDuration,
+                    LiveRecordingFastPathEligible:
+                        resolvedStoppedLiveRecordingPath is not null,
+                    LiveRecordingNeedsCfrNormalization:
+                        promotedGracefulShortRecording ||
+                        mergesGracefulShortRecordingParts,
+                    SegmentDurationSeconds:
+                        FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds);
+            }
+        }
+
+        if (detachRecordingBuffer && detachedBuffer is not null)
+        {
+            try
+            {
+                // Publish the exact direct-output identity before StopCore
+                // returns and before the journal writes its detached terminal
+                // record. If the process dies between those two durable writes,
+                // startup can still recover the continuous output (and both
+                // parts of a legacy short recording) with its exact metadata.
+                _ = await PersistRecordingRecoveryStateAsync(
+                        detachedBuffer,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or
+                    ArgumentException or NotSupportedException or SecurityException)
+            {
+                // Stop must still release capture resources. StopAndSave writes
+                // the state again before finalization; a generic Stop retains
+                // the central journal and reports this durability degradation.
+                EnqueueDiagnostic(
+                    $"Recorder could not persist its exact stopped state before returning: " +
+                    exception.GetBaseException().Message);
             }
         }
 
         if (recordingRecoveryJournal is not null)
         {
             var journalClosed = await recordingRecoveryJournal.CloseAsync(
-                    detached: detachRecordingBuffer && detachedBuffer is not null)
+                    detached: detachRecordingBuffer && detachedBuffer is not null,
+                    segmentTimelineDuration:
+                        detachedBuffer?.SegmentTimelineDuration)
                 .ConfigureAwait(false);
             _recordingRecoveryJournal = null;
             var journalFailure = recordingRecoveryJournal.WriterFailure;
@@ -3439,7 +6164,43 @@ public sealed class ReplayBufferService : IAsyncDisposable
                         : $"Recorder recovery journal stopped early: {journalFailure.GetBaseException().Message}");
             }
 
-            if (deleteBuffer || !detachRecordingBuffer)
+            if (deleteBuffer && _sessionMode == CaptureSessionMode.Recording)
+            {
+                if (!journalClosed || journalFailure is not null)
+                {
+                    // Never remove the only source after a locator writer
+                    // failed: the next launch must still be able to recover it.
+                    deleteBuffer = false;
+                    EnqueueDiagnostic(
+                        "Recorder preserved its working directory because recovery metadata did not close durably.");
+                }
+                else
+                {
+                    try
+                    {
+                        await RecordingRecoveryJournal.MarkDiscardedAsync(
+                                _recordingRecoveryRoot,
+                                recordingRecoveryJournal.JournalPath,
+                                recordingRecoveryJournal.SessionId,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (
+                        exception is IOException or UnauthorizedAccessException or
+                            InvalidDataException or InvalidOperationException or
+                            ArgumentException or NotSupportedException or SecurityException)
+                    {
+                        deleteBuffer = false;
+                        EnqueueDiagnostic(
+                            "Recorder preserved its working directory because a durable cleanup terminal could not be written: " +
+                            exception.GetBaseException().Message);
+                    }
+                }
+            }
+
+            if (deleteBuffer ||
+                !detachRecordingBuffer &&
+                _sessionMode != CaptureSessionMode.Recording)
             {
                 RecordingRecoveryJournal.TryDeleteJournal(
                     recordingRecoveryJournal.JournalPath);
@@ -3464,6 +6225,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
 
         _segmentDirectory = null;
         _activeBufferRoot = null;
+        _liveRecordingPath = null;
+        Volatile.Write(ref _liveRecordingFastPathEligible, 0);
         if (deleteBuffer)
         {
             TryDeleteBufferDirectory(oldSegmentDirectory, oldBufferRoot);
@@ -3715,7 +6478,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 var captureProcessUptime = Stopwatch.GetElapsedTime(captureStarted);
                 if (ShouldScheduleCaptureRefresh(
                         strategy.CaptureBackend,
-                        captureProcessUptime))
+                        captureProcessUptime,
+                        configuration.SessionMode,
+                        Volatile.Read(ref _liveRecordingFastPathEligible) != 0))
                 {
                     _ = QueueScheduledCaptureRefresh(
                         process.Id,
@@ -3782,6 +6547,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                             ResolveCaptureCadenceForegroundContext(
                                 strategy.CaptureBackend,
                                 envelope.ForegroundContext);
+                        cadenceForegroundContext =
+                            ResolveAgedRecorderCadenceForegroundContext(
+                                configuration.SessionMode,
+                                strategy.CaptureBackend,
+                                captureProcessUptime,
+                                cadenceForegroundContext);
                         var isInitialNativeLowImpactProfile =
                             isWindowsGraphicsCapture &&
                             !outputRequiresScaling &&
@@ -4245,9 +7016,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
             RefreshSegmentIndexLocked();
             available = TimeSpan.FromSeconds(
                 (long)_completedTrustedRecordingSegments *
-                FfmpegArgumentBuilder.SegmentSeconds);
+                FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds);
             bytes = _bufferBytes;
         }
+
+        // Recorder keeps both recovery MKVs and a directly publishable MP4.
+        // Include both direct parts so long sessions report their real on-disk
+        // footprint instead of appearing to use roughly half of it.
+        var directRecordingBytes = GetDirectRecordingArtifactsLengthSafely(
+            _segmentDirectory);
+        bytes = bytes > long.MaxValue - directRecordingBytes
+            ? long.MaxValue
+            : bytes + directRecordingBytes;
 
         var state = Volatile.Read(ref _isSaving) != 0
             ? ReplayState.Saving
@@ -4504,6 +7284,32 @@ public sealed class ReplayBufferService : IAsyncDisposable
         selectedGeneration >= 0 &&
         selectedGeneration != blockedGeneration;
 
+    private void InvalidateLiveRecordingFastPath(string diagnostic)
+    {
+        if (Interlocked.Exchange(ref _liveRecordingFastPathEligible, 0) == 0)
+        {
+            return;
+        }
+
+        if (_recordingRecoveryJournal is { } journal &&
+            !journal.RecordLiveOutputInvalidated())
+        {
+            EnqueueDiagnostic(
+                "Recorder recovery could not journal the live-output invalidation; recovery segments remain authoritative.");
+        }
+
+        EnqueueDiagnostic($"Recorder live-output fast path was disabled: {diagnostic}");
+        RecordCaptureRuntimeEvent(
+            "recording_live_output_invalidated",
+            _captureProcess,
+            detail: diagnostic,
+            includeResourceSnapshots: false);
+    }
+
+    internal void InvalidateLiveRecordingFastPathForTesting() =>
+        InvalidateLiveRecordingFastPath(
+            "Integration smoke forced recovery-segment finalization.");
+
     internal static CaptureRecoveryReason SelectCadenceRecoveryReason(
         bool outputRequiresScaling,
         CapturePerformanceProfile performanceProfile,
@@ -4531,16 +7337,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 starvationKind);
         }
 
-        // A custom/stretched fullscreen candidate is necessarily heuristic:
-        // Win32 can expose the game's pre-stretch client rectangle. In the
-        // initial native low-impact profile, content cadence may safely request
-        // one boundary-aligned priority/queue promotion. Once scaling or the
-        // resilient profile is active, only objective graph throughput/gap
-        // evidence may invalidate and restart capture.
-        return !outputRequiresScaling &&
-               performanceProfile == CapturePerformanceProfile.LowImpact
-            ? CaptureRecoveryReason.SourceProfilePromotion
-            : null;
+        // A custom/stretched fullscreen candidate is heuristic because Win32
+        // can expose the pre-stretch client rectangle. Keep ordinary cadence
+        // ambiguity non-destructive, but 8 seconds below 10% of the requested
+        // unique frame rate (or a sustained post-healthy collapse) is strong
+        // evidence of the exact WGC failure seen in real Apex/Minecraft files.
+        // The session-wide two-attempt budget still prevents restart loops.
+        if (!outputRequiresScaling &&
+            performanceProfile == CapturePerformanceProfile.LowImpact)
+        {
+            return CaptureRecoveryReason.SourceProfilePromotion;
+        }
+
+        return starvationKind is
+            CaptureStarvationKind.Severe or
+            CaptureStarvationKind.ModerateDegradation
+                ? CaptureRecoveryReason.SourceStarvation
+                : null;
     }
 
     internal static bool IsContentCadenceAssessment(
@@ -4569,15 +7382,40 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
             : foregroundContext;
 
+    internal static CaptureForegroundContext
+        ResolveAgedRecorderCadenceForegroundContext(
+            CaptureSessionMode sessionMode,
+            DesktopCaptureBackend captureBackend,
+            TimeSpan processUptime,
+            CaptureForegroundContext foregroundContext)
+    {
+        _ = sessionMode;
+        _ = captureBackend;
+        _ = processUptime;
+
+        // Process age and recent input are not proof that a windowed WGC
+        // source should be changing every frame. Promoting that heuristic to
+        // "fullscreen" made a healthy long, mostly-static desktop recording
+        // look like a stalled game and could invalidate its direct MP4. Keep
+        // cadence recovery destructive only when the foreground probe has
+        // objective fullscreen/custom-resolution evidence of its own.
+        return foregroundContext;
+    }
+
     internal static bool ShouldSuppressNonObjectiveCaptureCadence(
         bool usedCustomFullscreenFallback,
         bool outputRequiresScaling,
         CapturePerformanceProfile performanceProfile,
-        bool deferredRecoveryIsPending) =>
-        deferredRecoveryIsPending ||
-        usedCustomFullscreenFallback &&
-        (outputRequiresScaling ||
-         performanceProfile == CapturePerformanceProfile.Resilient);
+        bool deferredRecoveryIsPending)
+    {
+        _ = usedCustomFullscreenFallback;
+        _ = outputRequiresScaling;
+        _ = performanceProfile;
+        // Continue collecting custom/stretched cadence so the high-confidence
+        // severe and post-healthy lanes above can act. Only a pending recovery
+        // suppresses new duplicate-driven assessments.
+        return deferredRecoveryIsPending;
+    }
 
     internal static bool CanRefreshCaptureBackend(
         DesktopCaptureBackend captureBackend) =>
@@ -4753,6 +7591,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         _bufferBytes = 0;
         _nextSegmentNumber = 0;
         _activeCaptureGeneration = 0;
+        _activeCaptureGenerationStartSegmentNumber = -1;
         _completedTrustedRecordingSegments = 0;
         _recordingTailInvalidatedGeneration = -1;
         _recordingTailInvalidatedThroughSegmentNumber = -1;
@@ -4769,12 +7608,21 @@ public sealed class ReplayBufferService : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(firstSegmentNumber));
         }
 
+        var isInitialRecorderGeneration =
+            _sessionMode == CaptureSessionMode.Recording &&
+            _activeCaptureGeneration == 0 &&
+            _segments.Count == 0 &&
+            firstSegmentNumber == 0;
+        _activeCaptureGenerationStartSegmentNumber = firstSegmentNumber;
         _activeCaptureGeneration = checked(_activeCaptureGeneration + 1);
-        // The first segment of a new WGC process can contain a delayed first
-        // video frame while audio already begins at zero. Never concatenate
-        // that startup segment into a user clip; the next closed segment proves
-        // the replacement process has reached its steady two-second cadence.
-        _quarantinedGenerationHeadSegmentNumber = firstSegmentNumber;
+        // Global audio/video setts now rebases the initial Recorder graph to
+        // zero before both tee branches, so its first recovery segment is a
+        // valid Start boundary. Replacement generations still quarantine one
+        // head segment: a restarted WGC source may need a frame before its new
+        // graph reaches steady cadence.
+        _quarantinedGenerationHeadSegmentNumber = isInitialRecorderGeneration
+            ? -1
+            : firstSegmentNumber;
     }
 
     internal static bool ShouldRetainCompletedSegments(
@@ -4797,6 +7645,45 @@ public sealed class ReplayBufferService : IAsyncDisposable
         segmentNumber >= 0 &&
         segmentNumber != quarantinedGenerationHeadSegmentNumber;
 
+    internal static TimeSpan? ResolveGracefulRecordingTailDuration(
+        long outputTimeMicroseconds,
+        int tailSegmentNumber,
+        int generationStartSegmentNumber,
+        int segmentDurationSeconds,
+        int framesPerSecond)
+    {
+        if (outputTimeMicroseconds <= 0 ||
+            tailSegmentNumber < generationStartSegmentNumber ||
+            generationStartSegmentNumber < 0 ||
+            segmentDurationSeconds is < 1 or > 300 ||
+            framesPerSecond is < 1 or > 240)
+        {
+            return null;
+        }
+
+        var completedGenerationSegments =
+            tailSegmentNumber - generationStartSegmentNumber;
+        var tailSeconds = outputTimeMicroseconds / 1_000_000d -
+                          (long)completedGenerationSegments *
+                          segmentDurationSeconds;
+        var minimumFrameSeconds = 1d / framesPerSecond;
+        // FFmpeg progress can lead the video packet that closes the Matroska
+        // segment by a small audio/frame interval. Accept only that bounded
+        // clock skew, then clamp to the real segment boundary.
+        var maximumClockSkewSeconds = Math.Max(0.25, 2d / framesPerSecond);
+        if (!double.IsFinite(tailSeconds) ||
+            tailSeconds < minimumFrameSeconds / 2d ||
+            tailSeconds > segmentDurationSeconds + maximumClockSkewSeconds)
+        {
+            return null;
+        }
+
+        return TimeSpan.FromSeconds(Math.Clamp(
+            tailSeconds,
+            minimumFrameSeconds,
+            segmentDurationSeconds));
+    }
+
     private void InvalidateRetainedCaptureGenerationLocked()
     {
         if (_sessionMode == CaptureSessionMode.Recording)
@@ -4804,7 +7691,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             // Replay can discard its complete rolling generation. A long
             // recording must retain the known-good history and remove only the
             // most recent safety window around the observed stall/transition.
-            _ = InvalidateRecordingTailOnceLocked(maximumSegments: 12);
+            _ = InvalidateRecordingTailOnceLocked(
+                GetRecordingInvalidationSegmentCount());
             return;
         }
 
@@ -4877,6 +7765,10 @@ public sealed class ReplayBufferService : IAsyncDisposable
         return !sameGeneration || invalidated > 0;
     }
 
+    internal static int GetRecordingInvalidationSegmentCount() =>
+        (int)Math.Ceiling(
+            24d / FfmpegArgumentBuilder.RecordingRecoverySegmentSeconds);
+
     private static long GetFileLengthSafely(string path)
     {
         try
@@ -4897,11 +7789,22 @@ public sealed class ReplayBufferService : IAsyncDisposable
     /// on container duration inserts a visible video gap at every segment join.
     /// </summary>
     internal static IReadOnlyList<string> BuildConcatManifestLines(
-        IEnumerable<string> segmentPaths)
+        IEnumerable<string> segmentPaths) =>
+        BuildConcatManifestLines(
+            segmentPaths,
+            FfmpegArgumentBuilder.SegmentSeconds);
+
+    internal static IReadOnlyList<string> BuildConcatManifestLines(
+        IEnumerable<string> segmentPaths,
+        int segmentDurationSeconds)
     {
         ArgumentNullException.ThrowIfNull(segmentPaths);
+        if (segmentDurationSeconds is < 1 or > 300)
+        {
+            throw new ArgumentOutOfRangeException(nameof(segmentDurationSeconds));
+        }
 
-        var duration = FfmpegArgumentBuilder.SegmentSeconds.ToString(
+        var duration = segmentDurationSeconds.ToString(
             "0.000000",
             CultureInfo.InvariantCulture);
         var lines = new List<string>();
@@ -4913,6 +7816,30 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         return lines;
+    }
+
+    internal static IReadOnlyList<string> BuildShortRecordingConcatManifestLines(
+        string prefixPath,
+        string remainderPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prefixPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(remainderPath);
+        var prefixDuration = FfmpegArgumentBuilder.SegmentSeconds.ToString(
+            "0.000000",
+            CultureInfo.InvariantCulture);
+        return
+        [
+            $"file '{EscapeConcatPath(prefixPath)}'",
+            $"duration {prefixDuration}",
+            $"file '{EscapeConcatPath(remainderPath)}'"
+        ];
+    }
+
+    internal static IReadOnlyList<string> BuildSingleRecordingConcatManifestLines(
+        string mediaPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaPath);
+        return [$"file '{EscapeConcatPath(mediaPath)}'"];
     }
 
     private static async Task<string> PersistRecordingRecoveryStateAsync(
@@ -4929,13 +7856,63 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var concatTemporaryPath = concatPath + $".{Guid.NewGuid():N}.tmp";
         try
         {
+            var segmentRanges = BuildRecordingSegmentRanges(
+                detachedBuffer.SessionDirectory,
+                detachedBuffer.SegmentPaths);
+            var segmentLengths = detachedBuffer.SegmentPaths
+                .Select(path => GetFileLengthSafely(path))
+                .ToArray();
+            if (segmentLengths.Any(length => length <= 0) ||
+                segmentLengths.Aggregate(
+                    0L,
+                    static (total, length) => checked(total + length)) !=
+                detachedBuffer.SegmentBytes)
+            {
+                throw new IOException(
+                    "Recorder recovery segments changed before their exact state could be persisted.");
+            }
+
+            var recoverySessionId = detachedBuffer.RecoverySessionId;
+            if (!Guid.TryParseExact(recoverySessionId, "N", out _) ||
+                !RecordingRecoveryJournal.TryGetSessionMarkerId(
+                    detachedBuffer.SessionDirectory,
+                    out var markerSessionId) ||
+                !string.Equals(
+                    recoverySessionId,
+                    markerSessionId,
+                    StringComparison.Ordinal))
+            {
+                recoverySessionId = null;
+            }
+
+            var stateVersion = recoverySessionId is null ? 2 : 3;
             var state = new RecordingRecoveryState(
-                Version: 1,
+                Version: stateVersion,
                 SessionDirectory: detachedBuffer.SessionDirectory,
-                SegmentPaths: detachedBuffer.SegmentPaths,
+                SegmentPaths: null,
                 SegmentBytes: detachedBuffer.SegmentBytes,
                 FramesPerSecond: detachedBuffer.FramesPerSecond,
-                HasAudio: detachedBuffer.HasAudio);
+                HasAudio: detachedBuffer.HasAudio,
+                LiveRecordingPrefixPath:
+                    detachedBuffer.LiveRecordingPrefixPath,
+                LiveRecordingPath: detachedBuffer.LiveRecordingPath,
+                LiveRecordingExpectedDurationSeconds:
+                    detachedBuffer.LiveRecordingExpectedDuration?.TotalSeconds,
+                LiveRecordingFastPathEligible:
+                    detachedBuffer.LiveRecordingFastPathEligible,
+                LiveRecordingNeedsCfrNormalization:
+                    detachedBuffer.LiveRecordingNeedsCfrNormalization,
+                LiveRecordingRecoveryPath:
+                    detachedBuffer.LiveRecordingRecoveryPath,
+                SegmentRanges: segmentRanges,
+                SegmentLengths: stateVersion == 3
+                    ? segmentLengths
+                    : null,
+                RecoverySessionId: recoverySessionId,
+                SegmentTimelineDurationSeconds:
+                    detachedBuffer.SegmentTimelineDuration?.TotalSeconds,
+                SegmentDurationSeconds:
+                    detachedBuffer.SegmentDurationSeconds);
             await File.WriteAllTextAsync(
                     stateTemporaryPath,
                     JsonSerializer.Serialize(state),
@@ -4944,10 +7921,11 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 .ConfigureAwait(false);
             File.Move(stateTemporaryPath, statePath, overwrite: true);
 
-            await File.WriteAllLinesAsync(
+            await WriteConcatManifestAsync(
                     concatTemporaryPath,
-                    BuildConcatManifestLines(detachedBuffer.SegmentPaths),
-                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                    detachedBuffer.SegmentPaths,
+                    detachedBuffer.SegmentDurationSeconds,
+                    detachedBuffer.SegmentTimelineDuration,
                     cancellationToken)
                 .ConfigureAwait(false);
             File.Move(concatTemporaryPath, concatPath, overwrite: true);
@@ -4960,12 +7938,169 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
+    private static IReadOnlyList<RecordingSegmentRange>
+        BuildRecordingSegmentRanges(
+            string sessionDirectory,
+            IReadOnlyList<string> segmentPaths)
+    {
+        var ranges = new List<RecordingSegmentRange>();
+        var sessionPrefix = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(sessionDirectory)) + Path.DirectorySeparatorChar;
+        var rangeStart = -1;
+        var rangeEnd = -1;
+        foreach (var candidate in segmentPaths)
+        {
+            var path = Path.GetFullPath(candidate);
+            if (!path.StartsWith(sessionPrefix, StringComparison.OrdinalIgnoreCase) ||
+                !TryParseSegmentNumber(Path.GetFileName(path), out var segmentNumber))
+            {
+                throw new InvalidDataException(
+                    "Recorder recovery contains a non-canonical segment path.");
+            }
+
+            var expectedPath = Path.Combine(
+                sessionDirectory,
+                $"segment-{segmentNumber:D9}.mkv");
+            if (!string.Equals(path, expectedPath, StringComparison.OrdinalIgnoreCase) ||
+                segmentNumber <= rangeEnd)
+            {
+                throw new InvalidDataException(
+                    "Recorder recovery contains duplicate, unordered, or unsafe segments.");
+            }
+
+            if (rangeStart < 0)
+            {
+                rangeStart = rangeEnd = segmentNumber;
+            }
+            else if (segmentNumber == rangeEnd + 1)
+            {
+                rangeEnd = segmentNumber;
+            }
+            else
+            {
+                ranges.Add(new RecordingSegmentRange(rangeStart, rangeEnd));
+                rangeStart = rangeEnd = segmentNumber;
+            }
+        }
+
+        if (rangeStart >= 0)
+        {
+            ranges.Add(new RecordingSegmentRange(rangeStart, rangeEnd));
+        }
+
+        return ranges;
+    }
+
+    private static bool TryParseSegmentNumber(
+        string fileName,
+        out int segmentNumber)
+    {
+        const string prefix = "segment-";
+        const string suffix = ".mkv";
+        segmentNumber = -1;
+        return fileName.Length == prefix.Length + 9 + suffix.Length &&
+               fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+               fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) &&
+               int.TryParse(
+                   fileName.AsSpan(prefix.Length, 9),
+                   NumberStyles.None,
+                   CultureInfo.InvariantCulture,
+                   out segmentNumber);
+    }
+
+    private static async Task WriteConcatManifestAsync(
+        string path,
+        IReadOnlyList<string> segmentPaths,
+        int segmentDurationSeconds,
+        TimeSpan? segmentTimelineDuration,
+        CancellationToken cancellationToken)
+    {
+        if (segmentDurationSeconds is < 1 or > 300)
+        {
+            throw new ArgumentOutOfRangeException(nameof(segmentDurationSeconds));
+        }
+
+        var finalSegmentDurationSeconds = (double)segmentDurationSeconds;
+        if (segmentTimelineDuration is { } timelineDuration)
+        {
+            var precedingDurationSeconds = checked(
+                (long)Math.Max(0, segmentPaths.Count - 1) *
+                segmentDurationSeconds);
+            finalSegmentDurationSeconds =
+                timelineDuration.TotalSeconds - precedingDurationSeconds;
+            if (segmentPaths.Count == 0 ||
+                !double.IsFinite(finalSegmentDurationSeconds) ||
+                finalSegmentDurationSeconds <= 0 ||
+                finalSegmentDurationSeconds > segmentDurationSeconds)
+            {
+                throw new InvalidDataException(
+                    "Recorder recovery contains an invalid segment timeline duration.");
+            }
+        }
+
+        await using var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var writer = new StreamWriter(
+            stream,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            bufferSize: 64 * 1024,
+            leaveOpen: false);
+        var fullDuration = segmentDurationSeconds.ToString(
+            "0.000000",
+            CultureInfo.InvariantCulture);
+        var finalDuration = finalSegmentDurationSeconds.ToString(
+            "0.000000",
+            CultureInfo.InvariantCulture);
+        for (var index = 0; index < segmentPaths.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var segmentPath = segmentPaths[index];
+            ArgumentException.ThrowIfNullOrWhiteSpace(segmentPath);
+            await writer.WriteLineAsync(
+                    $"file '{EscapeConcatPath(segmentPath)}'")
+                .ConfigureAwait(false);
+            if (segmentTimelineDuration is not null &&
+                index == segmentPaths.Count - 1 &&
+                finalSegmentDurationSeconds < segmentDurationSeconds)
+            {
+                await writer.WriteLineAsync($"outpoint {finalDuration}")
+                    .ConfigureAwait(false);
+            }
+            await writer.WriteLineAsync(
+                    $"duration {(index == segmentPaths.Count - 1 ? finalDuration : fullDuration)}")
+                .ConfigureAwait(false);
+        }
+
+        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task PumpDiagnosticsAsync(Process process)
     {
         while (await process.StandardError.ReadLineAsync().ConfigureAwait(false) is { } line)
         {
+            if (IsDirectRecordingTeeFailureDiagnostic(line))
+            {
+                // The direct MP4 is an optional tee branch. Recovery segments
+                // remain authoritative if that branch falls behind or fails.
+                // Never publish a file after its FIFO dropped encoded packets.
+                InvalidateLiveRecordingFastPath(line);
+            }
+
             EnqueueDiagnostic(line);
         }
+    }
+
+    internal static bool IsDirectRecordingTeeFailureDiagnostic(string line)
+    {
+        ArgumentNullException.ThrowIfNull(line);
+        return line.Contains("FIFO queue full", StringComparison.OrdinalIgnoreCase) ||
+               line.Contains("Slave muxer #1", StringComparison.OrdinalIgnoreCase) &&
+               line.Contains("fail", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task PumpCaptureProgressAsync(
@@ -5024,6 +8159,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
 
         CancellationTokenSource? invalidatedSave = null;
+        var invalidatedRecordingTail = false;
         if (ShouldInvalidateCaptureGeneration(reason))
         {
             lock (_fileGate)
@@ -5033,7 +8169,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     // Preserve hours of known-good media and quarantine only the
                     // recent window surrounding the detected pacing failure.
                     RefreshSegmentIndexLocked();
-                    _ = InvalidateRecordingTailOnceLocked(maximumSegments: 12);
+                    _ = InvalidateRecordingTailOnceLocked(
+                        GetRecordingInvalidationSegmentCount());
+                    invalidatedRecordingTail = true;
                 }
                 else
                 {
@@ -5047,6 +8185,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
                     }
                 }
             }
+        }
+
+        if (invalidatedRecordingTail)
+        {
+            InvalidateLiveRecordingFastPath(
+                $"Capture health invalidated the recent Recorder timeline: {diagnostic}");
         }
 
         try
@@ -6471,11 +9615,14 @@ public sealed class ReplayBufferService : IAsyncDisposable
         TimeSpan expectedDuration,
         int expectedFramesPerSecond,
         bool expectedAudio,
-        out string failure)
+        out string failure,
+        TimeSpan? durationToleranceOverride = null)
     {
         failure = string.Empty;
         if (expectedDuration <= TimeSpan.Zero ||
-            expectedFramesPerSecond is < 1 or > 240)
+            expectedFramesPerSecond is < 1 or > 240 ||
+            durationToleranceOverride is { } invalidTolerance &&
+            invalidTolerance <= TimeSpan.Zero)
         {
             failure = "The expected clip timeline is invalid.";
             return false;
@@ -6539,7 +9686,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
 
             var frameTolerance = Math.Max(0.05, 2d / expectedFramesPerSecond);
-            var durationTolerance = Math.Max(0.15, 3d / expectedFramesPerSecond);
+            var durationTolerance = durationToleranceOverride?.TotalSeconds ??
+                                    Math.Max(0.15, 3d / expectedFramesPerSecond);
             if (Math.Abs(videoStart) > frameTolerance)
             {
                 failure = string.Create(
@@ -6569,7 +9717,9 @@ public sealed class ReplayBufferService : IAsyncDisposable
             if (TryReadProbeLong(video.Value, "nb_frames", out var frameCount))
             {
                 var expectedFrameCount = expectedDuration.TotalSeconds * expectedFramesPerSecond;
-                var frameCountTolerance = Math.Max(3d, expectedFramesPerSecond * 0.25);
+                var frameCountTolerance = Math.Max(
+                    Math.Max(3d, expectedFramesPerSecond * 0.25),
+                    durationTolerance * expectedFramesPerSecond);
                 if (Math.Abs(frameCount - expectedFrameCount) > frameCountTolerance)
                 {
                     failure = string.Create(
@@ -6722,7 +9872,138 @@ public sealed class ReplayBufferService : IAsyncDisposable
         int expectedFramesPerSecond,
         bool expectedAudio,
         CancellationToken cancellationToken,
+        TimeSpan? timeoutOverride = null,
+        TimeSpan? durationToleranceOverride = null)
+    {
+        var output = await ReadExportProbeAsync(
+                ffprobePath,
+                mediaPath,
+                cancellationToken,
+                timeoutOverride)
+            .ConfigureAwait(false);
+
+        if (!TryValidateExportProbe(
+                output,
+                expectedDuration,
+                expectedFramesPerSecond,
+                expectedAudio,
+                out var failure,
+                durationToleranceOverride))
+        {
+            throw new MediaTimelineValidationException(
+                $"ClipForge rejected a clip with a broken media timeline. {failure}");
+        }
+    }
+
+    private static async Task<TimeSpan> ValidateRecoveredExportAsync(
+        string ffprobePath,
+        string mediaPath,
+        TimeSpan minimumTrustedDuration,
+        int expectedFramesPerSecond,
+        bool expectedAudio,
+        CancellationToken cancellationToken,
         TimeSpan? timeoutOverride = null)
+    {
+        var output = await ReadExportProbeAsync(
+                ffprobePath,
+                mediaPath,
+                cancellationToken,
+                timeoutOverride)
+            .ConfigureAwait(false);
+        if (!TryReadPrimaryVideoDuration(output, out var recoveredDuration) ||
+            recoveredDuration <= TimeSpan.Zero)
+        {
+            throw new InvalidDataException(
+                "ClipForge could not determine the repaired recording timeline.");
+        }
+
+        if (!RecoveredOutputCoversTrustedTimeline(
+                recoveredDuration,
+                minimumTrustedDuration))
+        {
+            throw new InvalidDataException(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The repaired live output is only {recoveredDuration.TotalSeconds:0.###}s, " +
+                    $"shorter than the {minimumTrustedDuration.TotalSeconds:0.###}s trusted recovery timeline."));
+        }
+
+        if (!TryValidateExportProbe(
+                output,
+                recoveredDuration,
+                expectedFramesPerSecond,
+                expectedAudio,
+                out var failure,
+                durationToleranceOverride: TimeSpan.FromSeconds(0.5)))
+        {
+            throw new InvalidDataException(
+                $"ClipForge rejected a repaired recording with a broken media timeline. {failure}");
+        }
+
+        return recoveredDuration;
+    }
+
+    internal static bool RecoveredOutputCoversTrustedTimeline(
+        TimeSpan recoveredDuration,
+        TimeSpan minimumTrustedDuration) =>
+        recoveredDuration > TimeSpan.Zero &&
+        (minimumTrustedDuration <= TimeSpan.Zero ||
+         recoveredDuration + TimeSpan.FromSeconds(0.5) >=
+            minimumTrustedDuration);
+
+    private static bool TryReadPrimaryVideoDuration(
+        string probeJson,
+        out TimeSpan duration)
+    {
+        duration = TimeSpan.Zero;
+        try
+        {
+            using var document = JsonDocument.Parse(probeJson, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 16
+            });
+            if (!document.RootElement.TryGetProperty("streams", out var streams) ||
+                streams.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (var stream in streams.EnumerateArray())
+            {
+                if (stream.ValueKind != JsonValueKind.Object ||
+                    !stream.TryGetProperty("codec_type", out var codecType) ||
+                    !string.Equals(
+                        codecType.GetString(),
+                        "video",
+                        StringComparison.Ordinal) ||
+                    !TryReadProbeSeconds(stream, "duration", out var seconds) ||
+                    seconds <= 0 ||
+                    seconds > TimeSpan.MaxValue.TotalSeconds)
+                {
+                    continue;
+                }
+
+                duration = TimeSpan.FromSeconds(seconds);
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception exception) when (
+            exception is JsonException or InvalidOperationException or
+                FormatException or OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task<string> ReadExportProbeAsync(
+        string ffprobePath,
+        string mediaPath,
+        CancellationToken cancellationToken,
+        TimeSpan? timeoutOverride)
     {
         using var process = CreateProcess(
             ffprobePath,
@@ -6762,7 +10043,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted,
                 TaskScheduler.Default);
-            throw new InvalidDataException("Clip validation timed out.");
+            throw new TimeoutException("Clip validation timed out.");
         }
         catch
         {
@@ -6785,22 +10066,13 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var error = await errorTask.ConfigureAwait(false);
         if (process.ExitCode != 0)
         {
-            throw new InvalidDataException(
+            throw new IOException(
                 string.IsNullOrWhiteSpace(error)
                     ? "The generated clip could not be read back by ClipForge."
                     : $"The generated clip could not be validated. {error}");
         }
 
-        if (!TryValidateExportProbe(
-                output,
-                expectedDuration,
-                expectedFramesPerSecond,
-                expectedAudio,
-                out var failure))
-        {
-            throw new InvalidDataException(
-                $"ClipForge rejected a clip with a broken media timeline. {failure}");
-        }
+        return output;
     }
 
     private static async Task RunExportProcessAsync(
@@ -6935,11 +10207,99 @@ public sealed class ReplayBufferService : IAsyncDisposable
         var error = await errorTask.ConfigureAwait(false);
         if (process.ExitCode != 0)
         {
-            throw new InvalidOperationException(
+            throw new RecordingAssemblyException(
                 string.IsNullOrWhiteSpace(error)
                     ? "The capture engine could not assemble the recording."
                     : $"The capture engine could not assemble the recording. {error}");
         }
+    }
+
+    internal static async Task<string> CopyRecordingOutputAsync(
+        string sourcePath,
+        string outputPath,
+        CancellationToken cancellationToken,
+        string? expectedSourceFingerprint = null)
+    {
+        const int copyBufferBytes = 1024 * 1024;
+        await using var source = new FileStream(
+            sourcePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            copyBufferBytes,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var expectedLength = source.Length;
+        if (expectedLength <= 0)
+        {
+            throw new InvalidDataException(
+                "Recorder's validated live output became empty before it could be copied.");
+        }
+
+        // Keep this read handle open until the copied payload is checked. It
+        // denies both writes and replacement of the validated source for the
+        // entire potentially long cross-volume copy.
+        var sourceFingerprint =
+            RecordingRecoveryJournal.ComputeOutputFingerprint(sourcePath);
+        if (expectedSourceFingerprint is not null &&
+            !string.Equals(
+                sourceFingerprint,
+                expectedSourceFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new IOException(
+                "Recorder's validated live output changed before it could be copied.");
+        }
+        var sourceContentFingerprint =
+            RecordingRecoveryJournal.ComputeOutputContentSampleFingerprint(
+                sourcePath);
+
+        await using (var output = new FileStream(
+                         outputPath,
+                         FileMode.CreateNew,
+                         FileAccess.Write,
+                         FileShare.None,
+                         copyBufferBytes,
+                         FileOptions.Asynchronous |
+                         FileOptions.SequentialScan |
+                         FileOptions.WriteThrough))
+        {
+            await source.CopyToAsync(
+                    output,
+                    copyBufferBytes,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            output.Flush(flushToDisk: true);
+            if (output.Length != expectedLength)
+            {
+                throw new IOException(
+                    "Recorder's cross-volume copy did not preserve the complete live output.");
+            }
+        }
+
+        using var copiedOutput = new FileStream(
+            outputPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 4096,
+            FileOptions.RandomAccess);
+        if (copiedOutput.Length != expectedLength ||
+            !string.Equals(
+                sourceContentFingerprint,
+                RecordingRecoveryJournal.ComputeOutputContentSampleFingerprint(
+                    outputPath),
+                StringComparison.Ordinal))
+        {
+            throw new IOException(
+                "Recorder's copied live output did not match the validated source. " +
+                "The source session was preserved.");
+        }
+
+        // Return the new file's identity, not the source file's identity. This
+        // token remains stable across the destination's final atomic rename
+        // and detects an edited/replaced partial before commit or cleanup.
+        return RecordingRecoveryJournal.ComputeOutputFingerprint(outputPath);
     }
 
     internal static long? TryGetAvailableFreeSpace(string path)
@@ -6947,6 +10307,18 @@ public sealed class ReplayBufferService : IAsyncDisposable
         try
         {
             var fullPath = Path.GetFullPath(path);
+            if (OperatingSystem.IsWindows() &&
+                GetDiskFreeSpaceExW(
+                    fullPath,
+                    out var availableBytes,
+                    out _,
+                    out _))
+            {
+                return availableBytes > long.MaxValue
+                    ? long.MaxValue
+                    : (long)availableBytes;
+            }
+
             if (fullPath.StartsWith(@"\\", StringComparison.Ordinal))
             {
                 return null;
@@ -7069,28 +10441,35 @@ public sealed class ReplayBufferService : IAsyncDisposable
         return new Process { StartInfo = startInfo };
     }
 
-    private static async Task StopProcessGracefullyAsync(
+    private static async Task<bool> StopProcessGracefullyAsync(
         Process process,
-        TimeSpan? gracefulTimeout = null)
+        TimeSpan? gracefulTimeout = null,
+        Task<bool>? earlyStopSignal = null)
     {
-        if (process.HasExited)
+        var signalAlreadySent = false;
+        if (earlyStopSignal is not null)
         {
-            return;
+            try
+            {
+                signalAlreadySent = await earlyStopSignal.ConfigureAwait(false);
+            }
+            catch
+            {
+                // BeginRecordingStopRequest normally converts signal failures to
+                // false. Keep this helper defensive and retry below if a future
+                // signal implementation faults unexpectedly.
+            }
         }
 
-        try
+        if (process.HasExited)
         {
-            using var signalTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
-            await process.StandardInput.WriteLineAsync("q")
-                .WaitAsync(signalTimeout.Token)
-                .ConfigureAwait(false);
-            await process.StandardInput.FlushAsync(signalTimeout.Token).ConfigureAwait(false);
+            return process.ExitCode == 0;
         }
-        catch (Exception exception) when (
-            exception is IOException or InvalidOperationException or ObjectDisposedException or
-            OperationCanceledException)
+
+        if (!signalAlreadySent)
         {
-            // The process may have already closed its control stream.
+            _ = await SignalProcessGracefulStopAsync(process)
+                .ConfigureAwait(false);
         }
 
         using var timeout = new CancellationTokenSource(
@@ -7098,6 +10477,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         try
         {
             await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            return process.ExitCode == 0;
         }
         catch (OperationCanceledException)
         {
@@ -7113,6 +10493,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 // provides the final kill-on-close boundary. Never wait forever
                 // while holding ClipForge's save and lifecycle gates.
             }
+
+            return false;
         }
     }
 
@@ -7159,7 +10541,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         // MainWindow creates this service only after primary single-instance
         // ownership is established, so pre-existing sessions in this Windows
         // session are crash residue.
-        CleanupStaleBuffers(cancellationToken);
+        CleanupStaleBuffers(_bufferRoot, cancellationToken);
         if (cancellationToken.IsCancellationRequested)
         {
             return;
@@ -7197,10 +10579,12 @@ public sealed class ReplayBufferService : IAsyncDisposable
         }
     }
 
-    private void CleanupStaleBuffers(CancellationToken cancellationToken)
+    private void CleanupStaleBuffers(
+        string bufferRoot,
+        CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested ||
-            !IsSafeBufferRootPath(_bufferRoot))
+            !IsSafeBufferRootPath(bufferRoot))
         {
             return;
         }
@@ -7211,7 +10595,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         try
         {
             foreach (var directoryPath in Directory.EnumerateDirectories(
-                         _bufferRoot,
+                         bufferRoot,
                          "session-*",
                          SearchOption.TopDirectoryOnly))
             {
@@ -7231,6 +10615,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
                 // work/time limits. A later launch continues any residue instead
                 // of making Start Replay wait on an unbounded recursive delete.
                 TryDeleteCurrentSessionResidue(
+                    bufferRoot,
                     directoryPath,
                     startedAt,
                     ref filesDeleted,
@@ -7254,6 +10639,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
         elapsed < CurrentSessionCleanupTimeBudget;
 
     private void TryDeleteCurrentSessionResidue(
+        string bufferRoot,
         string directoryPath,
         long startedAt,
         ref int filesDeleted,
@@ -7269,8 +10655,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             var directory = new DirectoryInfo(Path.GetFullPath(directoryPath));
             directory.Refresh();
             if (!directory.Exists ||
-                !IsSafeBufferDirectoryPath(
-                    _bufferRoot,
+                    !IsSafeBufferDirectoryPath(
+                        bufferRoot,
                     directory.FullName,
                     directory.Attributes))
             {
@@ -7320,7 +10706,7 @@ public sealed class ReplayBufferService : IAsyncDisposable
             directory.Refresh();
             if (directory.Exists &&
                 IsSafeBufferDirectoryPath(
-                    _bufferRoot,
+                    bufferRoot,
                     directory.FullName,
                     directory.Attributes) &&
                 !Directory.EnumerateFileSystemEntries(
@@ -8480,6 +11866,338 @@ public sealed class ReplayBufferService : IAsyncDisposable
         return true;
     }
 
+    internal static bool ArePathsOnSameVolume(string leftPath, string rightPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(leftPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(rightPath);
+        try
+        {
+            if (OperatingSystem.IsWindows() &&
+                TryGetVolumeIdentity(leftPath, out var leftVolume) &&
+                TryGetVolumeIdentity(rightPath, out var rightVolume))
+            {
+                return leftVolume.Equals(
+                    rightVolume,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+
+            var leftRoot = Path.GetPathRoot(Path.GetFullPath(leftPath));
+            var rightRoot = Path.GetPathRoot(Path.GetFullPath(rightPath));
+            return !string.IsNullOrWhiteSpace(leftRoot) &&
+                   leftRoot.Equals(rightRoot, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetVolumeIdentity(
+        string path,
+        out string volumeIdentity)
+    {
+        volumeIdentity = string.Empty;
+        try
+        {
+            var existingPath = Path.GetFullPath(path);
+            if (File.Exists(existingPath))
+            {
+                existingPath = Path.GetDirectoryName(existingPath) ?? existingPath;
+            }
+            while (!Directory.Exists(existingPath))
+            {
+                var parent = Path.GetDirectoryName(existingPath);
+                if (string.IsNullOrWhiteSpace(parent) ||
+                    parent.Equals(existingPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                existingPath = parent;
+            }
+
+            var volumePath = new StringBuilder(MaximumFinalPathCharacters);
+            if (!GetVolumePathNameW(
+                    existingPath,
+                    volumePath,
+                    volumePath.Capacity))
+            {
+                return false;
+            }
+
+            var volumeName = new StringBuilder(128);
+            volumeIdentity = GetVolumeNameForVolumeMountPointW(
+                    volumePath.ToString(),
+                    volumeName,
+                    volumeName.Capacity)
+                ? volumeName.ToString()
+                : volumePath.ToString();
+            return !string.IsNullOrWhiteSpace(volumeIdentity);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsSafeRecordingSaveDestination(
+        string saveDirectory,
+        string bufferRoot,
+        string sessionDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(saveDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(bufferRoot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionDirectory);
+        try
+        {
+            var destination = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(saveDirectory));
+            var normalizedBufferRoot = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(bufferRoot));
+            var normalizedSession = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(sessionDirectory));
+            return IsSafeBufferRootPath(destination) &&
+                   TryResolvePhysicalDirectoryPath(
+                       destination,
+                       out var physicalDestination) &&
+                   TryResolvePhysicalDirectoryPath(
+                       normalizedBufferRoot,
+                       out var physicalBufferRoot) &&
+                   TryResolvePhysicalDirectoryPath(
+                       normalizedSession,
+                       out var physicalSession) &&
+                   !IsSameOrDescendantPath(
+                       physicalDestination,
+                       physicalBufferRoot) &&
+                   !IsSameOrDescendantPath(
+                       physicalDestination,
+                       physicalSession);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryResolvePhysicalDirectoryPath(
+        string path,
+        out string physicalPath)
+    {
+        physicalPath = string.Empty;
+        if (!OperatingSystem.IsWindows() ||
+            string.IsNullOrWhiteSpace(path) ||
+            !Path.IsPathFullyQualified(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalized = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(path));
+            var attributes = File.GetAttributes(normalized);
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                return false;
+            }
+
+            using var handle = CreateFileW(
+                ToExtendedLengthPath(normalized),
+                FileReadAttributes,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagOpenReparsePoint | FileFlagBackupSemantics,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                return false;
+            }
+
+            var resolved = new StringBuilder(MaximumFinalPathCharacters);
+            var length = GetFinalPathNameByHandleW(
+                handle,
+                resolved,
+                resolved.Capacity,
+                FileNameNormalized);
+            if (length == 0 || length >= resolved.Capacity)
+            {
+                return false;
+            }
+
+            var value = resolved.ToString();
+            if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            {
+                value = @"\\" + value[8..];
+            }
+            else if (value.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+            {
+                value = value[4..];
+            }
+
+            physicalPath = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(value));
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static string ToExtendedLengthPath(string path)
+    {
+        if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
+        {
+            return path;
+        }
+
+        return path.StartsWith(@"\\", StringComparison.Ordinal)
+            ? @"\\?\UNC\" + path[2..]
+            : @"\\?\" + path;
+    }
+
+    private static bool IsSameOrDescendantPath(
+        string candidate,
+        string directory)
+    {
+        if (candidate.Equals(directory, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var prefix = directory.TrimEnd(
+            Path.DirectorySeparatorChar,
+            Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void QueueCommittedRecordingCleanup(
+        DetachedRecordingBuffer detachedBuffer,
+        string committedOutputPath,
+        long committedOutputLength,
+        string committedOutputFingerprint)
+    {
+        if (!IsSafeRecordingSaveDestination(
+                Path.GetDirectoryName(Path.GetFullPath(committedOutputPath))!,
+                detachedBuffer.BufferRoot,
+                detachedBuffer.SessionDirectory))
+        {
+            EnqueueDiagnostic(
+                "Recorder kept its working directory because the committed output could not be proven outside it.");
+            return;
+        }
+
+        lock (_recordingCleanupGate)
+        {
+            // A long session can contain tens of thousands of files. Serialize
+            // completed-session deletions so they cannot saturate the drive in
+            // parallel after their MP4s are already visible in the library.
+            _recordingCleanupTask = _recordingCleanupTask.ContinueWith(
+                _ =>
+                {
+                    if (!RecordingRecoveryJournal.HasMatchingOutputIdentity(
+                            committedOutputPath,
+                            committedOutputLength,
+                            committedOutputFingerprint))
+                    {
+                        EnqueueDiagnostic(
+                            "Recorder kept its recovery source because the committed output changed before background cleanup.");
+                        return;
+                    }
+
+                    if (TryDeleteBufferDirectory(
+                            detachedBuffer.SessionDirectory,
+                            detachedBuffer.BufferRoot))
+                    {
+                        RecordingRecoveryJournal.TryDeleteJournal(
+                            detachedBuffer.RecoveryJournalPath);
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
+        }
+    }
+
+    private static long GetDirectRecordingArtifactsLengthSafely(
+        string? sessionDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(sessionDirectory))
+        {
+            return 0;
+        }
+
+        var basePath = Path.Combine(sessionDirectory, LiveRecordingFileName);
+        var total = GetFileLengthSafely(basePath);
+        for (var partNumber = 0; partNumber <= 1; partNumber++)
+        {
+            var partLength = GetFileLengthSafely(
+                FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                    basePath,
+                    partNumber));
+            total = total > long.MaxValue - partLength
+                ? long.MaxValue
+                : total + partLength;
+        }
+
+        return total;
+    }
+
+    private static void TryDeleteDirectRecordingArtifacts(
+        string? sessionDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(sessionDirectory))
+        {
+            return;
+        }
+
+        var basePath = Path.Combine(sessionDirectory, LiveRecordingFileName);
+        TryDeleteFile(basePath);
+        for (var partNumber = 0; partNumber <= 1; partNumber++)
+        {
+            TryDeleteFile(FfmpegArgumentBuilder.GetDirectRecordingPartPath(
+                basePath,
+                partNumber));
+        }
+    }
+
+    private static bool IsCanonicalContinuousLiveRecordingPath(
+        string sessionDirectory,
+        string? candidatePath)
+    {
+        if (string.IsNullOrWhiteSpace(sessionDirectory) ||
+            string.IsNullOrWhiteSpace(candidatePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(candidatePath),
+                Path.GetFullPath(Path.Combine(
+                    sessionDirectory,
+                    LiveRecordingFileName)),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or
+                ArgumentException or NotSupportedException or SecurityException)
+        {
+            return false;
+        }
+    }
+
     private bool TryDeleteBufferDirectory(string? path, string? bufferRoot = null)
     {
         bufferRoot ??= _activeBufferRoot ?? _bufferRoot;
@@ -8501,7 +12219,8 @@ public sealed class ReplayBufferService : IAsyncDisposable
             }
         }
         catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            exception is IOException or UnauthorizedAccessException or ArgumentException or
+                NotSupportedException or SecurityException)
         {
             // A later startup can retry stale session cleanup.
         }
@@ -8796,6 +12515,23 @@ public sealed class ReplayBufferService : IAsyncDisposable
         bool IsTrusted,
         bool IsCountedForRecording = false);
 
+    private sealed record RecordingStopBoundary(
+        int SessionIdentity,
+        string SessionDirectory,
+        IReadOnlyDictionary<string, long> ClosedSegments,
+        string? OpenSegmentPath,
+        long OpenSegmentLength,
+        int OpenSegmentNumber,
+        int OpenSegmentGenerationId,
+        int OpenSegmentGenerationStartNumber,
+        CaptureProgressSample? CaptureProgress,
+        Process? CaptureProcess);
+
+    private sealed record RecordingStopRequest(
+        int SessionIdentity,
+        Process CaptureProcess,
+        Task<bool> SignalTask);
+
     private sealed record DetachedRecordingBuffer(
         string SessionDirectory,
         string BufferRoot,
@@ -8807,20 +12543,49 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string? RecoverySessionId = null,
         bool SourceAvailable = true,
         int MissingSegmentCount = 0,
-        bool RecoveryWasDetached = true);
+        bool RecoveryWasDetached = true,
+        TimeSpan? SegmentTimelineDuration = null,
+        string? LiveRecordingPrefixPath = null,
+        string? LiveRecordingPath = null,
+        TimeSpan? LiveRecordingExpectedDuration = null,
+        bool LiveRecordingFastPathEligible = false,
+        bool LiveRecordingNeedsCfrNormalization = false,
+        string? LiveRecordingRecoveryPath = null,
+        int SegmentDurationSeconds = FfmpegArgumentBuilder.SegmentSeconds);
 
     private sealed record RecordingRecoveryState(
         int Version,
         string SessionDirectory,
-        IReadOnlyList<string> SegmentPaths,
+        IReadOnlyList<string>? SegmentPaths,
         long SegmentBytes,
         int FramesPerSecond,
-        bool HasAudio);
+        bool HasAudio,
+        string? LiveRecordingPrefixPath = null,
+        string? LiveRecordingPath = null,
+        double? LiveRecordingExpectedDurationSeconds = null,
+        bool LiveRecordingFastPathEligible = false,
+        bool LiveRecordingNeedsCfrNormalization = false,
+        string? LiveRecordingRecoveryPath = null,
+        IReadOnlyList<RecordingSegmentRange>? SegmentRanges = null,
+        IReadOnlyList<long>? SegmentLengths = null,
+        string? RecoverySessionId = null,
+        double? SegmentTimelineDurationSeconds = null,
+        int? SegmentDurationSeconds = null);
+
+    private readonly record struct RecordingSegmentRange(
+        int FirstSegmentNumber,
+        int LastSegmentNumber);
 
     private sealed class RetryableCaptureLaunchException(
         string message,
         Exception innerException)
         : Exception(message, innerException);
+
+    private sealed class MediaTimelineValidationException(string message)
+        : Exception(message);
+
+    private sealed class RecordingAssemblyException(string message)
+        : Exception(message);
 
     internal readonly record struct WindowsSessionCleanupCandidate(
         string Path,
@@ -8832,6 +12597,45 @@ public sealed class ReplayBufferService : IAsyncDisposable
         string NextSuffix,
         int EnumeratedCount,
         int InspectedCount);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(
+        SafeFileHandle hFile,
+        StringBuilder lpszFilePath,
+        int cchFilePath,
+        uint dwFlags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumePathNameW(
+        string lpszFileName,
+        StringBuilder lpszVolumePathName,
+        int cchBufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeNameForVolumeMountPointW(
+        string lpszVolumeMountPoint,
+        StringBuilder lpszVolumeName,
+        int cchBufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetDiskFreeSpaceExW(
+        string lpDirectoryName,
+        out ulong lpFreeBytesAvailableToCaller,
+        out ulong lpTotalNumberOfBytes,
+        out ulong lpTotalNumberOfFreeBytes);
 }
 
 internal readonly struct ReplayThreadPoolHopAwaitable

@@ -54,6 +54,7 @@ internal static class CaptureForegroundContextProbe
                 TryGetWindowMonitor(
                     window,
                     out var liveMonitor,
+                    out var liveWorkArea,
                     out var monitorDeviceName) &&
                 string.Equals(
                     monitorDeviceName,
@@ -81,8 +82,19 @@ internal static class CaptureForegroundContextProbe
             var anchoredToMonitor =
                 Math.Abs(bounds.Left - monitor.Left) <= 8 &&
                 Math.Abs(bounds.Top - monitor.Top) <= 8;
+            var anchoredToWorkArea =
+                Math.Abs(bounds.Left - liveWorkArea.Left) <= 8 &&
+                Math.Abs(bounds.Top - liveWorkArea.Top) <= 8 &&
+                Math.Abs(bounds.Right - liveWorkArea.Right) <= 8 &&
+                Math.Abs(bounds.Bottom - liveWorkArea.Bottom) <= 8;
+            var usesWorkAreaFullscreen = IsWorkAreaFullscreenCandidate(
+                coverage,
+                monitorMatches,
+                borderless,
+                anchoredToWorkArea);
             var usedCustomFullscreenFallback =
                 coverage < 0.98 &&
+                !usesWorkAreaFullscreen &&
                 IsFullscreenCandidate(
                     coverage,
                     monitorMatches,
@@ -95,6 +107,7 @@ internal static class CaptureForegroundContextProbe
             var isFullscreen =
                 monitorMatches &&
                 coverage >= 0.98 ||
+                usesWorkAreaFullscreen ||
                 usedCustomFullscreenFallback;
             return new CaptureForegroundContext(
                 isFullscreen,
@@ -139,6 +152,20 @@ internal static class CaptureForegroundContextProbe
                hasCustomAspect &&
                capturedDisplayCoverage >= 0.50;
     }
+
+    internal static bool IsWorkAreaFullscreenCandidate(
+        double capturedDisplayCoverage,
+        bool monitorMatches,
+        bool isBorderless,
+        bool isAnchoredToWorkArea) =>
+        monitorMatches &&
+        isBorderless &&
+        isAnchoredToWorkArea &&
+        // A maximized borderless game normally occupies the monitor work area
+        // when the taskbar is visible (for example 0.972 on a 1440p display).
+        // This is materially stronger evidence than merely lowering the 0.98
+        // fullscreen threshold for every maximized desktop application.
+        capturedDisplayCoverage is >= 0.90 and < 0.98;
 
     private static bool TryGetWindowBounds(IntPtr window, out NativeRect bounds)
     {
@@ -238,9 +265,11 @@ internal static class CaptureForegroundContextProbe
     private static bool TryGetWindowMonitor(
         IntPtr window,
         out NativeRect bounds,
+        out NativeRect workArea,
         out string? deviceName)
     {
         bounds = default;
+        workArea = default;
         deviceName = null;
         var monitor = MonitorFromWindow(window, MonitorDefaultToNearest);
         if (monitor == IntPtr.Zero)
@@ -258,6 +287,7 @@ internal static class CaptureForegroundContextProbe
         }
 
         bounds = info.Monitor;
+        workArea = info.Work;
         deviceName = info.DeviceName;
         return bounds.Right > bounds.Left && bounds.Bottom > bounds.Top;
     }

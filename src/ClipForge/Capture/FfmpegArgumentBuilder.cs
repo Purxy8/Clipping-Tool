@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using ClipForge.Models;
 
 namespace ClipForge.Capture;
@@ -6,6 +7,20 @@ namespace ClipForge.Capture;
 internal static class FfmpegArgumentBuilder
 {
     internal const int SegmentSeconds = 2;
+    // Recorder recovery does not need Instant Replay's two-second trim
+    // granularity. Ten-second closed MKVs reduce a 24-hour session from 43,200
+    // files to 8,640 while limiting unclean-exit fallback loss to the currently
+    // open ten-second segment. This does not affect the live MP4's exact Stop.
+    internal const int RecordingRecoverySegmentSeconds = 10;
+    // Keep Recorder's publishable MP4 permanently fragmented. A flat MP4 either
+    // has to rewrite the complete media payload at Stop or reserve tens of MiB
+    // of zero-filled index space up front. Thirty-second fragments keep a
+    // representative 12-hour/60 FPS/AAC recording at only 1,441 fragments:
+    // Windows Media Foundation opened and sought it in under one second, while
+    // FFmpeg still closes it with metadata-only work and can repair it after an
+    // unclean exit. Closed Matroska recovery segments remain authoritative.
+    internal const int DirectRecordingFragmentDurationMicroseconds = 30_000_000;
+    internal const int DirectRecordingFifoQueuePackets = 512;
     internal const int VideoInputQueuePackets = 2;
     internal const int ScaledVideoInputQueuePackets = 4;
     internal const int CompatibilityVideoInputQueuePackets = 8;
@@ -28,7 +43,8 @@ internal static class FfmpegArgumentBuilder
         VideoEncodingStrategy encodingStrategy,
         string segmentDirectory,
         int segmentStartNumber = 0,
-        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact)
+        CapturePerformanceProfile performanceProfile = CapturePerformanceProfile.LowImpact,
+        string? directRecordingPath = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(audioInputs);
@@ -37,6 +53,14 @@ internal static class FfmpegArgumentBuilder
         if (segmentStartNumber < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(segmentStartNumber));
+        }
+
+        if (directRecordingPath is not null &&
+            string.IsNullOrWhiteSpace(directRecordingPath))
+        {
+            throw new ArgumentException(
+                "The direct recording path cannot be empty.",
+                nameof(directRecordingPath));
         }
 
         if (configuration.FramesPerSecond is < 1 or > 240)
@@ -116,7 +140,33 @@ internal static class FfmpegArgumentBuilder
         }
 
         var keyFrameInterval = checked(configuration.FramesPerSecond * SegmentSeconds);
+        var outputSegmentSeconds = GetOutputSegmentSeconds(
+            configuration.SessionMode);
         AddEncoderArguments(arguments, encodingStrategy);
+        if (directRecordingPath is not null)
+        {
+            // The tee muxer cannot infer the child muxers' global-header
+            // requirement before the encoder opens. Both Matroska and MP4 need
+            // the codec configuration up front, so make that contract explicit.
+            arguments.AddRange(["-flags", "+global_header"]);
+        }
+
+        // Normalize encoded packet clocks before either the Replay segment
+        // muxer or Recorder tee sees them. AAC encoder priming and a WGC frame
+        // held while its pool starts can otherwise stretch the opening video
+        // packet even though the remainder reports perfect CFR. Capture video
+        // has no B-frames, so packet order is presentation order.
+        var cfrPacketTimestamps =
+            $"ts=N/({Invariant(configuration.FramesPerSecond)}*TB):" +
+            $"duration=1/({Invariant(configuration.FramesPerSecond)}*TB)";
+        var audioPacketTimestamps =
+            "ts=N*1024/(SR*TB):duration=1024/(SR*TB)";
+        arguments.AddRange(["-bsf:v", $"setts={cfrPacketTimestamps}"]);
+        if (audioInputs.Count > 0)
+        {
+            arguments.AddRange(["-bsf:a", $"setts={audioPacketTimestamps}"]);
+        }
+
         arguments.AddRange(
         [
             "-fps_mode", "cfr",
@@ -132,19 +182,149 @@ internal static class FfmpegArgumentBuilder
         }
 
         var segmentTimeDelta = 1d / (2 * configuration.FramesPerSecond);
-        arguments.AddRange(
-        [
-            "-f", "segment",
-            "-segment_time", Invariant(SegmentSeconds),
-            "-segment_time_delta", segmentTimeDelta.ToString("0.########", CultureInfo.InvariantCulture),
-            "-reset_timestamps", "1",
-            "-segment_format", "matroska",
-            "-segment_start_number", Invariant(segmentStartNumber),
-            "-y",
-            Path.Combine(segmentDirectory, "segment-%09d.mkv")
-        ]);
+        var segmentTimeDeltaArgument =
+            segmentTimeDelta.ToString("0.########", CultureInfo.InvariantCulture);
+        if (directRecordingPath is null)
+        {
+            arguments.AddRange(
+            [
+                "-f", "segment",
+                "-segment_time", Invariant(outputSegmentSeconds),
+                "-segment_time_delta", segmentTimeDeltaArgument,
+                "-reset_timestamps", "1",
+                "-segment_format", "matroska",
+                "-segment_start_number", Invariant(segmentStartNumber),
+                "-y",
+                Path.Combine(segmentDirectory, "segment-%09d.mkv")
+            ]);
+        }
+        else
+        {
+            var segmentPattern = EscapeTeeOutputPath(
+                Path.Combine(segmentDirectory, "segment-%09d.mkv"),
+                "%09d");
+            var recordingPath = EscapeTeeLiteralOutputPath(
+                directRecordingPath);
+            // The publishable Recorder output is one continuous fragmented MP4
+            // from Start through Stop. Splitting off a two-second warmup either
+            // dropped the beginning of every long recording or required a full
+            // 40-GB rewrite to put it back. A bounded FIFO still isolates this
+            // optional writer from the authoritative recovery MKVs, while the
+            // permanent fMP4 closes with metadata-only work and can be renamed
+            // atomically on the normal same-volume path.
+            var teeOutput =
+                $"[f=segment:onfail=abort:segment_time={outputSegmentSeconds}:" +
+                $"segment_time_delta={segmentTimeDeltaArgument}:reset_timestamps=1:" +
+                $"segment_format=matroska:segment_start_number={segmentStartNumber}]" +
+                $"{segmentPattern}|" +
+                "[f=mp4:onfail=ignore:use_fifo=1:" +
+                $"fifo_options=queue_size={DirectRecordingFifoQueuePackets}\\\\:" +
+                "drop_pkts_on_overflow=1:" +
+                "movflags=+empty_moov+default_base_moof:" +
+                $"frag_duration={DirectRecordingFragmentDurationMicroseconds}:" +
+                "flush_packets=1]" +
+                recordingPath;
+            arguments.AddRange(["-y", "-f", "tee", teeOutput]);
+        }
 
         return arguments;
+    }
+
+    internal static int GetOutputSegmentSeconds(CaptureSessionMode sessionMode) =>
+        sessionMode switch
+        {
+            CaptureSessionMode.InstantReplay => SegmentSeconds,
+            CaptureSessionMode.Recording => RecordingRecoverySegmentSeconds,
+            _ => throw new ArgumentOutOfRangeException(nameof(sessionMode))
+        };
+
+    private static string EscapeTeeOutputPath(
+        string path,
+        string muxerFormatToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentException.ThrowIfNullOrWhiteSpace(muxerFormatToken);
+        var tokenIndex = path.LastIndexOf(
+            muxerFormatToken,
+            StringComparison.Ordinal);
+        if (tokenIndex < 0)
+        {
+            throw new ArgumentException(
+                "The tee output path did not contain its muxer format token.",
+                nameof(path));
+        }
+
+        var escaped = new StringBuilder(path.Length + 8);
+        for (var index = 0; index < path.Length; index++)
+        {
+            if (index == tokenIndex)
+            {
+                escaped.Append(muxerFormatToken);
+                index += muxerFormatToken.Length - 1;
+                continue;
+            }
+
+            escaped.Append(path[index] switch
+            {
+                '\\' => '/',
+                '\'' => "\\'",
+                // The segment muxer treats every percent sign as a filename
+                // template introducer. Doubling literal signs preserves valid
+                // user directories such as "100%-captures" while the one
+                // generated frame-number token above remains active.
+                '%' => "%%",
+                _ => path[index].ToString()
+            });
+        }
+
+        return escaped.ToString();
+    }
+
+    private static string EscapeTeeLiteralOutputPath(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        var escaped = new StringBuilder(path.Length + 4);
+        foreach (var character in path)
+        {
+            escaped.Append(character switch
+            {
+                '\\' => '/',
+                '\'' => "\\'",
+                _ => character.ToString()
+            });
+        }
+
+        return escaped.ToString();
+    }
+
+    internal static string GetDirectRecordingPartPattern(string directRecordingPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directRecordingPath);
+        return BuildDirectRecordingPartPath(directRecordingPath, "%01d");
+    }
+
+    internal static string GetDirectRecordingPartPath(
+        string directRecordingPath,
+        int partNumber)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directRecordingPath);
+        if (partNumber < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(partNumber));
+        }
+
+        return BuildDirectRecordingPartPath(
+            directRecordingPath,
+            partNumber.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static string BuildDirectRecordingPartPath(
+        string directRecordingPath,
+        string partName)
+    {
+        var extension = Path.GetExtension(directRecordingPath);
+        var partExtension = $".part-{partName}{extension}";
+        return Path.ChangeExtension(directRecordingPath, partExtension);
     }
 
     public static IReadOnlyList<string> BuildEncoderProbeArguments(
@@ -376,12 +556,72 @@ internal static class FfmpegArgumentBuilder
 
     public static IReadOnlyList<string> BuildRecordingConcatArguments(
         string manifestPath,
-        string outputPath)
+        string outputPath,
+        TimeSpan? maximumDuration = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(manifestPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        if (maximumDuration is { } invalidDuration &&
+            invalidDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumDuration));
+        }
 
-        return
+        List<string> arguments =
+        [
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", manifestPath
+        ];
+        if (maximumDuration is { } duration)
+        {
+            // The last graceful recovery file may contain the bounded delay
+            // between the user's click and FFmpeg consuming q. Cap the muxed
+            // output at the click-time timeline instead of publishing those
+            // post-click packets.
+            arguments.AddRange(["-t", FormatTimestamp(duration)]);
+        }
+
+        arguments.AddRange(
+        [
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", Invariant(DirectRecordingFragmentDurationMicroseconds),
+            "-f", "mp4",
+            "-y",
+            outputPath
+        ]);
+        return arguments;
+    }
+
+    public static IReadOnlyList<string> BuildShortRecordingConcatArguments(
+        string manifestPath,
+        string outputPath,
+        int framesPerSecond,
+        bool hasAudio)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(manifestPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        if (framesPerSecond is < 1 or > 240)
+        {
+            throw new ArgumentOutOfRangeException(nameof(framesPerSecond));
+        }
+
+        // WGC can hold its first frame slightly longer while the frame pool is
+        // starting. Both capture encoders disable B-frames, so packet order is
+        // presentation order and the H.264 setts bitstream filter can normalize
+        // this tiny startup clip to the requested CFR without decoding or
+        // re-encoding a frame.
+        var cfrPacketTimestamps =
+            $"ts=N/({Invariant(framesPerSecond)}*TB):" +
+            $"duration=1/({Invariant(framesPerSecond)}*TB)";
+        List<string> arguments =
         [
             "-hide_banner",
             "-loglevel", "warning",
@@ -392,7 +632,54 @@ internal static class FfmpegArgumentBuilder
             "-map", "0:v:0",
             "-map", "0:a?",
             "-c", "copy",
+            "-bsf:v", $"setts={cfrPacketTimestamps}"
+        ];
+        if (hasAudio)
+        {
+            // AAC frames contain 1024 samples. Rebuild the packet cadence across
+            // the legacy two-part seam so the MP4 muxer never has to clamp an
+            // overlapping DTS into a 21-microsecond packet (an audible click).
+            arguments.AddRange([
+                "-bsf:a",
+                "setts=ts=N*1024/(SR*TB):duration=1024/(SR*TB)"
+            ]);
+        }
+
+        arguments.AddRange(
+        [
             "-avoid_negative_ts", "make_zero",
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", Invariant(DirectRecordingFragmentDurationMicroseconds),
+            "-f", "mp4",
+            "-y",
+            outputPath
+        ]);
+        return arguments;
+    }
+
+    public static IReadOnlyList<string> BuildRecordingRecoveryArguments(
+        string inputPath,
+        string outputPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+
+        return
+        [
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-fflags", "+discardcorrupt",
+            "-protocol_whitelist", "file",
+            "-i", inputPath,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c", "copy",
+            "-shortest",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+empty_moov+default_base_moof",
+            "-frag_duration", Invariant(DirectRecordingFragmentDurationMicroseconds),
+            "-f", "mp4",
             "-y",
             outputPath
         ];
@@ -611,16 +898,42 @@ internal static class FfmpegArgumentBuilder
 
         if (output.RequiresScaling)
         {
-            // Resolve the aspect-preserving dimensions before FFmpeg starts. WGC's
-            // point sampler is deliberately used for the live replay path: it does
-            // less shader work than bilinear scaling and preserves more headroom
-            // while a fullscreen game owns most of the GPU. The exact output path
-            // is exercised by the runtime graphics-capture probe, which falls back
-            // to a transfer or GDI when the selected adapter cannot sustain it.
-            // Recorder locks the encoded geometry for the complete session.
-            // Exclusive-fullscreen custom resolutions are resampled by WGC to
-            // this original canvas, so every 30-minute generation remains
-            // stream-copy compatible at finalization.
+            // Long-session evidence showed gfxcapture's internal fixed-size
+            // surface pool collapsing to 0.5-6 unique FPS while its CFR output
+            // still reported 60 FPS. Capture native WGC surfaces on NVIDIA,
+            // cross the API boundary through bounded system memory, then scale
+            // on CUDA. This graph is runtime-probed and kept the production
+            // encoder at real time on the affected adapter/driver.
+            if (encodingStrategy.Encoder == VideoEncoderKind.NvidiaNvenc &&
+                !encodingStrategy.RequiresSystemMemoryTransfer)
+            {
+                return filter +
+                    ":width=-2:height=-2:resize_mode=crop:scale_mode=point" +
+                    ",hwdownload,format=bgra,hwupload_cuda" +
+                    $",scale_cuda=w={output.Width}:h={output.Height}" +
+                    ":format=bgra:interp_algo=nearest";
+            }
+
+            if (encodingStrategy.RequiresSystemMemoryTransfer)
+            {
+                // The independently probed compatibility candidate must remain
+                // usable when CUDA interop is unavailable. Native capture plus
+                // fast software scaling costs more CPU but avoids the failing
+                // fixed-size WGC pool and feeds a normal system-memory format.
+                var outputPixelFormat = encodingStrategy.Encoder ==
+                    VideoEncoderKind.SoftwareX264
+                        ? "yuv420p"
+                        : "nv12";
+                return filter +
+                    ":width=-2:height=-2:resize_mode=crop:scale_mode=point" +
+                    ",hwdownload,format=bgra" +
+                    $",scale={output.Width}:{output.Height}:flags=fast_bilinear" +
+                    $",format={outputPixelFormat}";
+            }
+
+            // QSV/AMF can consume the scaled D3D11 surface directly. Their
+            // exact graph remains capability-probed; health monitoring moves
+            // away from it if measured cadence later collapses.
             filter += $":width={output.Width}:height={output.Height}" +
                       ":resize_mode=scale:scale_mode=point";
         }

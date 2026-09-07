@@ -528,7 +528,7 @@ public partial class LibraryWindow : Window
                 return;
             }
 
-            var clips = await _clipLibraryService.GetRecentClipsAsync(
+            var refreshBatch = await _clipLibraryService.GetRecentClipRefreshBatchAsync(
                 _saveDirectory,
                 count: InitialClipLimit,
                 includeThumbnails: true,
@@ -546,6 +546,13 @@ public partial class LibraryWindow : Window
                 return;
             }
 
+            var clips = ClipLibraryService.MergeWithCurrentValidatedCache(
+                _saveDirectory,
+                refreshBatch.Clips,
+                ClipList.Items.OfType<ClipLibraryItem>().ToArray(),
+                InitialClipLimit,
+                _activeFilter,
+                refreshBatch.UnattemptedCandidates);
             var selectedPath = preferredPath ?? _currentClip?.FullPath;
             ClipList.ItemsSource = clips;
             ClipCountText.Text = clips.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
